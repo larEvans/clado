@@ -1,0 +1,81 @@
+//@version=5
+strategy("Mean Reversion — BB + RSI", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// ─── Inputs ───────────────────────────────────────────────────────────────────
+grp1 = "Bollinger Bands"
+bbLen  = input.int(20,  "BB Period",     minval=5,  maxval=50,  group=grp1)
+bbMult = input.float(2.0, "BB Std Dev", minval=0.5, maxval=4.0, step=0.25, group=grp1)
+
+grp2 = "RSI Filter"
+rsiLen        = input.int(14, "RSI Period",    minval=2,  maxval=50,  group=grp2)
+rsiOversold   = input.int(35, "RSI Oversold",  minval=10, maxval=45,  group=grp2)
+rsiOverbought = input.int(65, "RSI Overbought",minval=55, maxval=90,  group=grp2)
+
+grp3 = "Risk"
+atrLen      = input.int(14,  "ATR Period",   minval=5, maxval=50, group=grp3)
+maxHold     = input.int(15,  "Max Hold Bars",minval=3, maxval=60, group=grp3)
+
+// ─── Indicators ───────────────────────────────────────────────────────────────
+[bbUpper, bbMiddle, bbLower] = ta.bb(close, bbLen, bbMult)
+rsi = ta.rsi(close, rsiLen)
+atr = ta.atr(atrLen)
+
+// ─── Signals ──────────────────────────────────────────────────────────────────
+longSignal  = close < bbLower and rsi < rsiOversold
+shortSignal = close > bbUpper and rsi > rsiOverbought
+
+// ─── Strategy entries ─────────────────────────────────────────────────────────
+var int barsInTrade = 0
+if strategy.position_size != 0
+    barsInTrade += 1
+else
+    barsInTrade := 0
+
+if longSignal and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long",
+      stop  = bbLower - atr,
+      limit = bbMiddle)
+
+if shortSignal and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short",
+      stop  = bbUpper + atr,
+      limit = bbMiddle)
+
+// Timeout exit
+if barsInTrade >= maxHold and strategy.position_size != 0
+    strategy.close_all(comment="Timeout")
+
+// ─── Plots ────────────────────────────────────────────────────────────────────
+bbUpPlot  = plot(bbUpper,  "Upper Band", color=color.new(color.red,   20), linewidth=1)
+bbMidPlot = plot(bbMiddle, "Middle (Mean)", color=color.new(color.gray,0), linewidth=1, style=plot.style_circles)
+bbLowPlot = plot(bbLower,  "Lower Band", color=color.new(color.green, 20), linewidth=1)
+
+fill(bbUpPlot, bbMidPlot, color=color.new(color.red,   90), title="Upper Zone")
+fill(bbMidPlot,bbLowPlot, color=color.new(color.green, 90), title="Lower Zone")
+
+// Signal markers
+plotshape(longSignal,  title="Buy (Oversold)",  style=shape.labelup,   location=location.belowbar, color=color.green, text="MR Buy",  textcolor=color.white, size=size.small)
+plotshape(shortSignal, title="Sell (Overbought)",style=shape.labeldown, location=location.abovebar, color=color.red,   text="MR Sell", textcolor=color.white, size=size.small)
+
+// ─── RSI subplot ──────────────────────────────────────────────────────────────
+rsiPlot = plot(rsi, "RSI", color=color.purple, display=display.pane)
+hline(rsiOversold,   "Oversold",   color=color.green, linestyle=hline.style_dashed)
+hline(rsiOverbought, "Overbought", color=color.red,   linestyle=hline.style_dashed)
+hline(50,            "50",         color=color.gray,  linestyle=hline.style_dotted)
+
+// BB width indicator (volatility compression signal)
+bbWidth = (bbUpper - bbLower) / bbMiddle * 100
+bgcolor(bbWidth < ta.sma(bbWidth, 20) * 0.7 ? color.new(color.blue, 93) : na, title="BB Squeeze")
+
+// ─── Info table ───────────────────────────────────────────────────────────────
+if barstate.islast
+    t = table.new(position.top_right, 1, 1, bgcolor=color.new(color.navy, 20), border_color=color.new(color.white, 60), border_width=1)
+    zone = close < bbLower ? "OVERSOLD" : close > bbUpper ? "OVERBOUGHT" : "NEUTRAL"
+    zoneColor = close < bbLower ? color.green : close > bbUpper ? color.red : color.gray
+    table.cell(t, 0, 0,
+      "Zone: " + zone + "\nRSI: " + str.tostring(math.round(rsi, 1)) +
+      "\nBB Width: " + str.tostring(math.round(bbWidth, 2)) + "%" +
+      "\nMid: $" + str.tostring(math.round(bbMiddle, 2)),
+      text_color=zoneColor, text_size=size.small)

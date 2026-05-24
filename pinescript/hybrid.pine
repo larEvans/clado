@@ -1,0 +1,156 @@
+// @version=5
+// Hybrid — ORB + VWAP + EMA Triple-Confirmation
+// Entry only when all three align: 15-min ORB breakout + VWAP + EMA(9/21)
+indicator("Hybrid ORB + VWAP + EMA", overlay=true, max_labels_count=200)
+
+// ── Inputs ────────────────────────────────────────────────────────────────────
+orbMins     = input.int(15,  "ORB Window (minutes)", minval=5, maxval=60)
+rrRatio     = input.float(2.0, "R:R Ratio",          step=0.25)
+volMult     = input.float(1.3, "Volume Multiplier",  step=0.1)
+fastLen     = input.int(9,   "Fast EMA",             minval=3,  maxval=50)
+slowLen     = input.int(21,  "Slow EMA",             minval=5,  maxval=100)
+volMaPeriod = input.int(20,  "Volume MA Period",     minval=5,  maxval=50)
+showTable   = input.bool(true, "Show Info Table")
+
+// ── Session helpers ───────────────────────────────────────────────────────────
+nyseOpen  = timestamp("America/New_York", year, month, dayofmonth, 9, 30, 0)
+orbEndMs  = nyseOpen + orbMins * 60 * 1000
+newSession = ta.change(time("D"))
+
+// ── ORB range ─────────────────────────────────────────────────────────────────
+var float orbHigh = na
+var float orbLow  = na
+var bool  orbLocked = false
+
+if newSession
+    orbHigh  := na
+    orbLow   := na
+    orbLocked := false
+
+inORBWindow = time >= nyseOpen and time < orbEndMs
+
+if inORBWindow
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow  := na(orbLow)  ? low  : math.min(orbLow,  low)
+
+if time >= orbEndMs and not orbLocked and not na(orbHigh)
+    orbLocked := true
+
+// Draw ORB box
+var box orbBox = na
+if ta.change(orbLocked) and orbLocked
+    orbBox := box.new(bar_index - orbMins, orbHigh, bar_index, orbLow,
+                      border_color=color.new(color.orange, 30),
+                      bgcolor=color.new(color.orange, 85), border_width=1)
+
+// Extend ORB lines through the session
+plot(orbLocked and not inORBWindow ? orbHigh : na, "ORB High", color.new(color.orange, 20), 1, plot.style_linebr)
+plot(orbLocked and not inORBWindow ? orbLow  : na, "ORB Low",  color.new(color.orange, 20), 1, plot.style_linebr)
+
+// ── Indicators ────────────────────────────────────────────────────────────────
+
+// VWAP — reset each session
+var float cumTPV = 0.0
+var float cumVol = 0.0
+
+if newSession
+    cumTPV := 0.0
+    cumVol := 0.0
+
+if time >= nyseOpen
+    cumTPV := cumTPV + ((high + low + close) / 3) * volume
+    cumVol := cumVol + volume
+
+vwap = cumVol > 0 ? cumTPV / cumVol : na
+
+// EMAs
+ema9  = ta.ema(close, fastLen)
+ema21 = ta.ema(close, slowLen)
+
+// Volume MA
+volMA = ta.sma(volume, volMaPeriod)
+
+plot(vwap, "VWAP",   color.new(#ff9800, 0), 2)
+plot(ema9,  "EMA9",  color.new(#42a5f5, 0), 1)
+plot(ema21, "EMA21", color.new(#ef5350, 0), 1)
+fill(plot(ema9, display=display.none), plot(ema21, display=display.none),
+     color = ema9 > ema21 ? color.new(color.teal, 85) : color.new(color.red, 85))
+
+// ── Signal conditions ─────────────────────────────────────────────────────────
+postORB  = time >= orbEndMs and orbLocked and not na(orbHigh)
+volOK    = volume >= volMA * volMult
+emaLong  = ema9 > ema21
+emaShort = ema9 < ema21
+
+orbRange = na(orbHigh) or na(orbLow) ? na : orbHigh - orbLow
+rangePct = close > 0 and not na(orbRange) ? (orbRange / close) * 100 : na
+rangeOK  = not na(rangePct) and rangePct < 1.5
+
+// Long: above ORB high + above VWAP + EMA bullish + volume
+longSignal  = postORB and close > orbHigh and close > vwap and emaLong  and volOK and rangeOK
+// Short: below ORB low + below VWAP + EMA bearish + volume
+shortSignal = postORB and close < orbLow  and close < vwap and emaShort and volOK and rangeOK
+
+// One entry per session
+var bool tradedToday = false
+if newSession
+    tradedToday := false
+
+longEntry  = longSignal  and not tradedToday
+shortEntry = shortSignal and not tradedToday
+if longEntry or shortEntry
+    tradedToday := true
+
+// ── Plot signals ──────────────────────────────────────────────────────────────
+plotshape(longEntry,  "Long Entry",  shape.triangleup,   location.belowbar, color.new(color.lime, 0),   size=size.normal)
+plotshape(shortEntry, "Short Entry", shape.triangledown,  location.abovebar, color.new(color.red,  0),   size=size.normal)
+
+// Entry labels with stop/target
+orbR = na(orbRange) ? 0.0 : orbRange
+if longEntry
+    stop   = orbLow
+    target = orbHigh + orbR * rrRatio
+    label.new(bar_index, low - orbR * 0.3,
+              text = "LONG\nT: " + str.tostring(target, "#.##") + "\nS: " + str.tostring(stop, "#.##"),
+              color=color.new(color.lime, 10), textcolor=color.white, style=label.style_label_up, size=size.small)
+
+if shortEntry
+    stop   = orbHigh
+    target = orbLow - orbR * rrRatio
+    label.new(bar_index, high + orbR * 0.3,
+              text = "SHORT\nT: " + str.tostring(target, "#.##") + "\nS: " + str.tostring(stop, "#.##"),
+              color=color.new(color.red, 10), textcolor=color.white, style=label.style_label_down, size=size.small)
+
+// ── Background: ORB window ────────────────────────────────────────────────────
+bgcolor(inORBWindow ? color.new(color.orange, 92) : na, title="ORB Window")
+
+// ── Info table ────────────────────────────────────────────────────────────────
+if showTable
+    var table t = table.new(position.top_right, 2, 6,
+                             bgcolor=color.new(color.black, 70), border_color=color.new(color.gray, 50), border_width=1)
+    muted = color.new(color.gray, 20)
+    green = color.new(color.lime, 0)
+    red   = color.new(color.red, 0)
+
+    table.cell(t, 0, 0, "Hybrid ORB+VWAP+EMA", text_color=color.orange, text_size=size.small, bgcolor=color.new(color.orange, 85))
+    table.cell(t, 1, 0, timeframe.period,        text_color=color.orange, text_size=size.small, bgcolor=color.new(color.orange, 85))
+
+    table.cell(t, 0, 1, "ORB High", text_color=muted, text_size=size.small)
+    table.cell(t, 1, 1, not na(orbHigh) ? str.tostring(orbHigh, "#.##") : "—",
+               text_color=color.orange, text_size=size.small)
+
+    table.cell(t, 0, 2, "ORB Low", text_color=muted, text_size=size.small)
+    table.cell(t, 1, 2, not na(orbLow) ? str.tostring(orbLow, "#.##") : "—",
+               text_color=color.orange, text_size=size.small)
+
+    table.cell(t, 0, 3, "VWAP", text_color=muted, text_size=size.small)
+    table.cell(t, 1, 3, not na(vwap) ? str.tostring(vwap, "#.##") : "—",
+               text_color = close > vwap ? green : red, text_size=size.small)
+
+    table.cell(t, 0, 4, "EMA Trend", text_color=muted, text_size=size.small)
+    table.cell(t, 1, 4, ema9 > ema21 ? "BULLISH" : "BEARISH",
+               text_color = ema9 > ema21 ? green : red, text_size=size.small)
+
+    table.cell(t, 0, 5, "Volume", text_color=muted, text_size=size.small)
+    table.cell(t, 1, 5, volOK ? "STRONG" : "weak",
+               text_color = volOK ? green : muted, text_size=size.small)

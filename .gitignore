@@ -2,3 +2,5 @@
 *.log
 safety-check-log.json
 node_modules/
+.webull-token.json
+.webull-device.json

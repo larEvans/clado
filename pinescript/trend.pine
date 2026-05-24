@@ -1,0 +1,75 @@
+//@version=5
+strategy("EMA Trend Following (9/21)", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// ─── Inputs ───────────────────────────────────────────────────────────────────
+grp1 = "EMA Settings"
+fastLen  = input.int(9,  "Fast EMA",       minval=2,  maxval=50,  group=grp1)
+slowLen  = input.int(21, "Slow EMA",       minval=5,  maxval=200, group=grp1)
+
+grp2 = "Volume Filter"
+volMaLen = input.int(20,  "Volume MA Period", minval=5, maxval=50, group=grp2)
+volMult  = input.float(1.1, "Volume Multiplier", minval=1.0, maxval=3.0, step=0.1, group=grp2)
+
+grp3 = "Risk Management"
+atrLen   = input.int(14, "ATR Period",   minval=5, maxval=50,  group=grp3)
+atrMult  = input.float(1.5, "ATR Stop Multiplier", minval=0.5, maxval=5.0, step=0.1, group=grp3)
+rrRatio  = input.float(2.0, "R:R Ratio",  minval=1.0, maxval=5.0, step=0.5, group=grp3)
+
+// ─── Indicators ───────────────────────────────────────────────────────────────
+fastEMA = ta.ema(close, fastLen)
+slowEMA = ta.ema(close, slowLen)
+volMA   = ta.sma(volume, volMaLen)
+atr     = ta.atr(atrLen)
+
+// ─── Signals ──────────────────────────────────────────────────────────────────
+highVol    = volume >= volMA * volMult
+crossUp    = ta.crossover(fastEMA, slowEMA)  and highVol
+crossDown  = ta.crossunder(fastEMA, slowEMA) and highVol
+
+bullZone = fastEMA > slowEMA
+bearZone = fastEMA < slowEMA
+
+// ─── Strategy entries ─────────────────────────────────────────────────────────
+if crossUp
+    stopLoss   = close - atr * atrMult
+    takeProfit = close + atr * atrMult * rrRatio
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=stopLoss, limit=takeProfit)
+
+if crossDown
+    stopLoss   = close + atr * atrMult
+    takeProfit = close - atr * atrMult * rrRatio
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=stopLoss, limit=takeProfit)
+
+// Exit on opposite cross
+if bullZone and ta.crossunder(fastEMA, slowEMA)
+    strategy.close("Long", comment="Cross Exit")
+if bearZone and ta.crossover(fastEMA, slowEMA)
+    strategy.close("Short", comment="Cross Exit")
+
+// ─── Plots ────────────────────────────────────────────────────────────────────
+fastPlot = plot(fastEMA, "Fast EMA (9)",  color=color.new(color.yellow, 0), linewidth=2)
+slowPlot = plot(slowEMA, "Slow EMA (21)", color=color.new(color.blue,   0), linewidth=2)
+
+fill(fastPlot, slowPlot,
+  color=bullZone ? color.new(color.green, 85) : color.new(color.red, 85),
+  title="EMA Zone")
+
+// Signal shapes
+plotshape(crossUp,   title="Long Signal",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.normal)
+plotshape(crossDown, title="Short Signal", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.normal)
+
+// Volume bar coloring
+barcolor(highVol and bullZone ? color.new(color.green, 50) :
+         highVol and bearZone ? color.new(color.red,   50) : na)
+
+// ─── Info table ───────────────────────────────────────────────────────────────
+if barstate.islast
+    t = table.new(position.top_right, 1, 1, bgcolor=color.new(color.navy, 20), border_color=color.new(color.white, 60), border_width=1)
+    trend = bullZone ? "BULLISH ▲" : "BEARISH ▼"
+    trendColor = bullZone ? color.green : color.red
+    volOk = highVol ? "✓ HIGH VOL" : "low vol"
+    table.cell(t, 0, 0,
+      "EMA Trend: " + trend + "\n" + "Vol Filter: " + volOk + "\nATR: $" + str.tostring(math.round(atr, 2)),
+      text_color=trendColor, text_size=size.small)

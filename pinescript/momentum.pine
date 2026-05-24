@@ -1,0 +1,80 @@
+//@version=5
+strategy("Momentum — MACD + RSI", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// ─── Inputs ───────────────────────────────────────────────────────────────────
+grp1 = "MACD"
+macdFast = input.int(12, "Fast Length", minval=2,  maxval=50,  group=grp1)
+macdSlow = input.int(26, "Slow Length", minval=5,  maxval=200, group=grp1)
+macdSig  = input.int(9,  "Signal",      minval=2,  maxval=50,  group=grp1)
+
+grp2 = "RSI Filter"
+rsiLen = input.int(14, "RSI Period", minval=2, maxval=50, group=grp2)
+rsiMin = input.int(50, "RSI Min for Longs",  minval=40, maxval=70, group=grp2)
+rsiMax = input.int(50, "RSI Max for Shorts", minval=30, maxval=60, group=grp2)
+
+grp3 = "Risk"
+atrLen  = input.int(14,   "ATR Period",       minval=5,   maxval=50,  group=grp3)
+atrMult = input.float(2.0,"ATR Stop Mult",    minval=0.5, maxval=5.0, step=0.1, group=grp3)
+rrRatio = input.float(2.0,"R:R Ratio",        minval=1.0, maxval=5.0, step=0.5, group=grp3)
+
+// ─── Indicators ───────────────────────────────────────────────────────────────
+[macdLine, signalLine, hist] = ta.macd(close, macdFast, macdSlow, macdSig)
+rsi = ta.rsi(close, rsiLen)
+atr = ta.atr(atrLen)
+ema200 = ta.ema(close, 200)
+
+// ─── Signals ──────────────────────────────────────────────────────────────────
+macdCrossUp   = ta.crossover(hist, 0)  and rsi >= rsiMin
+macdCrossDown = ta.crossunder(hist, 0) and rsi <= rsiMax
+
+// ─── Strategy entries ─────────────────────────────────────────────────────────
+if macdCrossUp and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long",
+      stop  = close - atr * atrMult,
+      limit = close + atr * atrMult * rrRatio)
+
+if macdCrossDown and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short",
+      stop  = close + atr * atrMult,
+      limit = close - atr * atrMult * rrRatio)
+
+// MACD flip exit
+if strategy.position_size > 0 and ta.crossunder(hist, 0)
+    strategy.close("Long", comment="MACD Flip")
+if strategy.position_size < 0 and ta.crossover(hist, 0)
+    strategy.close("Short", comment="MACD Flip")
+
+// ─── Overlay plots ────────────────────────────────────────────────────────────
+plot(ema200, "EMA 200", color=color.new(color.orange, 30), linewidth=2)
+
+// Signal markers
+plotshape(macdCrossUp,   title="Long",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.normal)
+plotshape(macdCrossDown, title="Short", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.normal)
+
+// Background: above/below EMA200
+bgcolor(close > ema200 ? color.new(color.green, 96) : color.new(color.red, 96), title="EMA200 Zone")
+
+// ─── MACD subplot ─────────────────────────────────────────────────────────────
+plot(macdLine,  "MACD",   color=color.blue,  display=display.pane)
+plot(signalLine,"Signal", color=color.orange,display=display.pane)
+plot(hist, "Histogram", style=plot.style_histogram,
+  color=hist >= 0 ? (hist > hist[1] ? color.green : color.new(color.green,50)) :
+                    (hist < hist[1] ? color.red   : color.new(color.red,50)),
+  display=display.pane)
+hline(0, "Zero", color=color.gray, linestyle=hline.style_dashed, display=display.pane)
+
+// RSI line
+plot(rsi, "RSI", color=color.purple, display=display.pane)
+
+// ─── Info table ───────────────────────────────────────────────────────────────
+if barstate.islast
+    t = table.new(position.top_right, 1, 1, bgcolor=color.new(color.navy, 20), border_color=color.new(color.white, 60), border_width=1)
+    mom = hist > 0 ? "BULLISH ▲" : "BEARISH ▼"
+    momColor = hist > 0 ? color.green : color.red
+    table.cell(t, 0, 0,
+      "Momentum: " + mom + "\nMACD: " + str.tostring(math.round(macdLine, 3)) +
+      "\nRSI: " + str.tostring(math.round(rsi, 1)) +
+      "\nATR: $" + str.tostring(math.round(atr, 2)),
+      text_color=momColor, text_size=size.small)

@@ -1,0 +1,11 @@
+node_modules/
+.env
+.webull-token.json
+.webull-device.json
+safety-check-log.json
+trade-history.json
+learned-params.json
+hermes-insights.json
+bot-state.json
+trades.csv
+*.log

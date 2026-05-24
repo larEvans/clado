@@ -1,0 +1,55 @@
+{
+  "watchlist": ["SPY", "QQQ"],
+  "default_timeframe": "1m",
+
+  "strategy": {
+    "name": "Opening Range Breakout (ORB)",
+    "description": "Trade the break of the first 15 minutes of the NYSE session. Long when price breaks above the ORB high with VWAP and volume confirmation. Short when price breaks below the ORB low. Stop at the opposite side of the range. 2:1 target."
+  },
+
+  "parameters": {
+    "orb_minutes": 15,
+    "rr_ratio": 2.0,
+    "max_trade_hour_et": 11,
+    "volume_multiplier": 2.0,
+    "vol_ma_period": 20
+  },
+
+  "indicators": {
+    "orb_high": "High of the first 15 minutes after 9:30 AM ET — breakout level for longs",
+    "orb_low": "Low of the first 15 minutes after 9:30 AM ET — breakdown level for shorts",
+    "vwap": "Session VWAP — only trade in the direction price is relative to VWAP",
+    "volume": "Breakout bar volume must be 2x the 20-period average — confirms conviction"
+  },
+
+  "entry_rules": {
+    "long": [
+      "Current time is after 9:45 AM ET (ORB window closed) and before 11:00 AM ET",
+      "Price closes above the ORB high",
+      "Price is above VWAP",
+      "Volume on the breakout bar is at least 2x the 20-period average"
+    ],
+    "short": [
+      "Current time is after 9:45 AM ET (ORB window closed) and before 11:00 AM ET",
+      "Price closes below the ORB low",
+      "Price is below VWAP",
+      "Volume on the breakout bar is at least 2x the 20-period average"
+    ]
+  },
+
+  "exit_rules": [
+    "Stop loss: opposite side of the opening range (ORB low for longs, ORB high for shorts)",
+    "Take profit: entry + (range size × 2) for 2:1 R:R",
+    "Time stop: exit any open position by 3:45 PM ET regardless of P&L"
+  ],
+
+  "risk_rules": [
+    "Risk maximum 1% of portfolio per trade",
+    "Maximum trade size capped by MAX_TRADE_SIZE_USD in .env",
+    "Only 1 ORB trade per day per symbol — the first signal is the trade",
+    "Do not trade if the opening range is wider than 1% of price — too wide, risk/reward breaks down",
+    "Paper trade first — validate on at least 20 sessions before going live"
+  ],
+
+  "notes": "Best on 1m or 5m charts. SPY and QQQ are the most liquid and give the cleanest ORB setups. Avoid earnings days and FOMC announcement days."
+}
