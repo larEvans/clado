@@ -21,7 +21,7 @@ grp3         = "Risk"
 rrRatio      = input.float(2.0,"R:R Target Ratio",    minval=1.0,maxval=5.0,group=grp3, step=0.5)
 stopPct      = input.float(1.5,"Stop % from VWAP",    minval=0.1,maxval=5.0,group=grp3, step=0.1)
 
-// ─── Indicators ───────────────────────────────────────────────────────────────
+// ─── Indicators ──────────────────────────────────────────────────────────────
 ema8     = ta.ema(close, emaPeriod)
 vwapVal  = ta.vwap(hlc3)
 rsi3     = ta.rsi(close, rsiPeriod)

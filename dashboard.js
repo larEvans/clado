@@ -12,6 +12,7 @@ import { meta as trendMeta }    from "./strategies/trend.js";
 import { meta as meanrevMeta }  from "./strategies/meanrev.js";
 import { meta as momentumMeta } from "./strategies/momentum.js";
 import { meta as hybridMeta }  from "./strategies/hybrid.js";
+import { meta as reversalMeta } from "./strategies/reversal.js";
 import { fetchChain, fetchExpiryDates, fetchContracts, getLiveOptionsParams } from "./options.js";
 import { AlpacaStream } from "./stream.js";
 import { loadAllLearning } from "./learner.js";
@@ -133,9 +134,10 @@ app.get("/api/bot-log", (req, res) => {
 // Hybrid is the only active strategy. Pass ?all=1 to see the full catalog
 // (or set ACTIVE_STRATEGIES=orb,vwap,... in the environment to whitelist others).
 app.get("/api/strategies", (req, res) => {
-  const all = [hybridMeta, orbMeta, vwapMeta, trendMeta, meanrevMeta, momentumMeta];
+  const all = [hybridMeta, reversalMeta, vwapMeta, orbMeta, trendMeta, meanrevMeta, momentumMeta];
   if (req.query?.all === "1") return res.json(all);
-  const whitelist = (process.env.ACTIVE_STRATEGIES || "hybrid")
+  // Hybrid + Reversal + VWAP are active by default. Override with ACTIVE_STRATEGIES env.
+  const whitelist = (process.env.ACTIVE_STRATEGIES || "hybrid,reversal,vwap")
     .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
   const active = all
     .filter(m => whitelist.includes(m.id))
@@ -240,6 +242,8 @@ app.get("/api/pinescript/:id", (req, res) => {
   const files = {
     orb:              "pinescript/orb.pine",
     vwap:             "pinescript/vwap.pine",
+    hybrid:           "pinescript/hybrid.pine",
+    reversal:         "pinescript/reversal.pine",
     "options-overlay": "pinescript/options-overlay.pine",
   };
   const file  = files[req.params.id];
@@ -444,8 +448,8 @@ app.get("/api/bot-status", (req, res) => {
 
 // ─── Backtest optimization loop ───────────────────────────────────────────────
 
-const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m" };
-const STRATEGY_META = { orb: orbMeta, vwap: vwapMeta, trend: trendMeta, meanrev: meanrevMeta, momentum: momentumMeta, hybrid: hybridMeta };
+const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m", reversal: "5m" };
+const STRATEGY_META = { orb: orbMeta, vwap: vwapMeta, trend: trendMeta, meanrev: meanrevMeta, momentum: momentumMeta, hybrid: hybridMeta, reversal: reversalMeta };
 
 function findBestIteration(iters) {
   return iters.reduce((bestI, iter, i) => {

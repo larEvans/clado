@@ -13,6 +13,7 @@ import { meta as trendMeta }   from "./strategies/trend.js";
 import { meta as meanrevMeta } from "./strategies/meanrev.js";
 import { meta as momentumMeta } from "./strategies/momentum.js";
 import { meta as hybridMeta }  from "./strategies/hybrid.js";
+import { meta as reversalMeta } from "./strategies/reversal.js";
 
 // ─── Market data ──────────────────────────────────────────────────────────────
 
@@ -717,6 +718,151 @@ function runMomentumBacktest(allCandles, params = {}, opts = {}) {
   return trades;
 }
 
+// ─── Reversal Backtest — RSI divergence + ATR trailing stop ──────────────────
+
+function runReversalBacktest(allCandles, params = {}, opts = {}) {
+  const {
+    rsiPeriod     = 14,
+    atrPeriod     = 14,
+    atrMult       = 1.5,
+    trailMult     = 1.0,
+    rrRatio       = 2.0,
+    swingLookback = 10,
+    breakEvenR    = 1.0,
+    confirmCandle = true,
+  } = { ...reversalMeta.params, ...params };
+  const { mode = "stock", iv = 0.18, dteDays = 7, numContracts = 1, strikeInterval = 1 } = opts;
+
+  const closes = allCandles.map(c => c.close);
+  const rsi    = rsiArray(closes, rsiPeriod);
+  const atr    = atrArray(allCandles, atrPeriod);
+  const trades = [];
+  let openTrade = null;
+
+  const warmup = Math.max(rsiPeriod, atrPeriod, swingLookback) + 2;
+
+  for (let i = warmup; i < allCandles.length; i++) {
+    const bar   = allCandles[i];
+    const price = bar.close;
+
+    // ── Exit management with dynamic trailing stop ───────────────────────────
+    if (openTrade) {
+      const { side, entry, target, atrAtEntry } = openTrade;
+      const a = atr[i] || atrAtEntry;
+      const trailDist = a * trailMult;
+      const initRisk  = Math.abs(entry - openTrade.initialStop);
+
+      // Move stop in the direction of profit
+      if (side === "buy") {
+        const newStop = price - trailDist;
+        if (newStop > openTrade.stop) openTrade.stop = newStop;
+        // After breakEvenR profit, never let stop fall below entry
+        const rProfit = (price - entry) / initRisk;
+        if (rProfit >= breakEvenR && openTrade.stop < entry) openTrade.stop = entry;
+      } else {
+        const newStop = price + trailDist;
+        if (newStop < openTrade.stop) openTrade.stop = newStop;
+        const rProfit = (entry - price) / initRisk;
+        if (rProfit >= breakEvenR && openTrade.stop > entry) openTrade.stop = entry;
+      }
+
+      let exitPrice = null, exitReason = null;
+      if (side === "buy") {
+        if (bar.low  <= openTrade.stop) { exitPrice = openTrade.stop; exitReason = "trail-stop"; }
+        else if (bar.high >= target)    { exitPrice = target;         exitReason = "target"; }
+      } else {
+        if (bar.high >= openTrade.stop) { exitPrice = openTrade.stop; exitReason = "trail-stop"; }
+        else if (bar.low  <= target)    { exitPrice = target;         exitReason = "target"; }
+      }
+
+      if (exitPrice) {
+        const pnlUSD = side === "buy" ? exitPrice - entry : entry - exitPrice;
+        const pnlR   = initRisk > 0 ? pnlUSD / initRisk : 0;
+        const date   = new Date(bar.time).toISOString().slice(0, 10);
+
+        let optResult = {};
+        if (mode === "options" && openTrade.entryPremium != null) {
+          const elapsed     = (bar.time - openTrade.entryTime) / 86400000;
+          const exitPremium = optionPremium(exitPrice, openTrade.optionStrike, Math.max(openTrade.entryDTE - elapsed, 0.01), iv, openTrade.optionType);
+          const optPnL      = (exitPremium - openTrade.entryPremium) * 100 * numContracts;
+          optResult = { optionType: openTrade.optionType, optionStrike: openTrade.optionStrike, entryPremium: openTrade.entryPremium, exitPremium, optionsPnL: optPnL, optionsPnLPct: openTrade.entryPremium > 0 ? ((exitPremium - openTrade.entryPremium) / openTrade.entryPremium) * 100 : 0, optionDTE: openTrade.entryDTE };
+        }
+
+        trades.push({
+          date, entryTime: openTrade.entryTime, exitTime: bar.time,
+          side, entry, stop: openTrade.initialStop, trailStop: openTrade.stop, target, exit: exitPrice, exitReason,
+          pnlR, pnlPct: (pnlUSD / entry) * 100,
+          stopSource: "atr-trail",
+          ...optResult,
+        });
+        openTrade = null;
+      }
+      if (openTrade) continue;
+    }
+
+    if (openTrade) continue;
+    if (!rsi[i] || !atr[i]) continue;
+
+    // ── Entry: detect RSI divergence vs prior swing ──────────────────────────
+    const lb       = swingLookback;
+    const window   = allCandles.slice(i - lb, i + 1);
+    const rsiWin   = rsi.slice(i - lb, i + 1);
+    if (window.length < lb || rsiWin.some(v => v == null)) continue;
+
+    // Lowest low and highest high in the lookback window (excluding the current bar)
+    let lowIdx = 0, highIdx = 0;
+    for (let k = 1; k < window.length - 1; k++) {
+      if (window[k].low  < window[lowIdx].low)   lowIdx  = k;
+      if (window[k].high > window[highIdx].high) highIdx = k;
+    }
+
+    const curLow  = window[window.length - 1].low;
+    const curHigh = window[window.length - 1].high;
+    const curRsi  = rsiWin[rsiWin.length - 1];
+
+    // Bullish divergence: current bar made a lower low BUT RSI higher than the prior swing low's RSI
+    const bullishDiv = curLow < window[lowIdx].low && curRsi > rsiWin[lowIdx] && curRsi < 50;
+    // Bearish divergence: current bar made a higher high BUT RSI lower than the prior swing high's RSI
+    const bearishDiv = curHigh > window[highIdx].high && curRsi < rsiWin[highIdx] && curRsi > 50;
+
+    const prevClose = allCandles[i - 1].close;
+    const confirmL  = !confirmCandle || price > prevClose;
+    const confirmS  = !confirmCandle || price < prevClose;
+
+    if (bullishDiv && confirmL) {
+      const initRisk    = atr[i] * atrMult;
+      const initialStop = price - initRisk;
+      const target      = price + initRisk * rrRatio;
+
+      let optInfo = {};
+      if (mode === "options") {
+        const optionStrike = atmStrike(price, strikeInterval);
+        const entryPremium = optionPremium(price, optionStrike, dteDays, iv, "call");
+        optInfo = { optionType: "call", optionStrike, entryPremium, entryDTE: dteDays };
+      }
+
+      openTrade = { side: "buy", entry: price, initialStop, stop: initialStop, target, entryTime: bar.time, atrAtEntry: atr[i], ...optInfo };
+      continue;
+    }
+
+    if (bearishDiv && confirmS) {
+      const initRisk    = atr[i] * atrMult;
+      const initialStop = price + initRisk;
+      const target      = price - initRisk * rrRatio;
+
+      let optInfo = {};
+      if (mode === "options") {
+        const optionStrike = atmStrike(price, strikeInterval);
+        const entryPremium = optionPremium(price, optionStrike, dteDays, iv, "put");
+        optInfo = { optionType: "put", optionStrike, entryPremium, entryDTE: dteDays };
+      }
+
+      openTrade = { side: "sell", entry: price, initialStop, stop: initialStop, target, entryTime: bar.time, atrAtEntry: atr[i], ...optInfo };
+    }
+  }
+  return trades;
+}
+
 // ─── Hybrid Backtest — ORB + VWAP + EMA triple confirmation ──────────────────
 
 function runHybridBacktest(allCandles, params = {}, opts = {}) {
@@ -1000,7 +1146,7 @@ export function calcMetrics(trades, mode = "stock") {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export async function runBacktest(strategyId, symbol, opts = {}) {
-  const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m" };
+  const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m", reversal: "5m" };
   const timeframe  = TIMEFRAMES[strategyId] || "1H";
   console.log(`Backtesting ${strategyId.toUpperCase()} on ${symbol} (${timeframe}) — mode: ${opts.mode || "stock"}`);
   const candles = opts._candles || await fetchCandles(symbol, timeframe);
@@ -1014,6 +1160,7 @@ export async function runBacktest(strategyId, symbol, opts = {}) {
   else if (strategyId === "meanrev")  trades = runMeanRevBacktest(candles, params, opts);
   else if (strategyId === "momentum") trades = runMomentumBacktest(candles, params, opts);
   else if (strategyId === "hybrid")   trades = runHybridBacktest(candles, params, opts);
+  else if (strategyId === "reversal") trades = runReversalBacktest(candles, params, opts);
   else throw new Error(`Unknown strategy: ${strategyId}`);
 
   const metrics = calcMetrics(trades, opts.mode || "stock");

@@ -22,7 +22,7 @@ import { getDefaultParams, loadLearnedParams, recordTradeClosed, runLearner } fr
 import { pickStop } from "./backtest.js";
 
 const SYMBOL      = (process.env.SYMBOL   || "SPY").toUpperCase();
-const STRATEGY    = (process.env.STRATEGY || "orb").toLowerCase();
+const STRATEGY    = (process.env.STRATEGY || "hybrid").toLowerCase();
 const TRADE_USD   = parseFloat(process.env.MAX_TRADE_SIZE_USD || "200");
 const IS_PAPER    = process.env.PAPER_TRADING !== "false";
 const ALPACA_BASE = process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets";

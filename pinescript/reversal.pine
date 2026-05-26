@@ -1,0 +1,96 @@
+// Reversal + Dynamic Stop — RSI divergence entries with ATR trailing stop
+// Matches bot logic in strategies/reversal.js
+//@version=5
+strategy("Reversal + Dynamic Stop", overlay=true,
+  default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+  commission_type=strategy.commission.percent, commission_value=0.05,
+  initial_capital=10000)
+
+// ─── Inputs ──────────────────────────────────────────────────────────────────
+grpI         = "Indicators"
+rsiPeriod    = input.int(14,  "RSI Period",         minval=2,   maxval=50,  group=grpI)
+atrPeriod    = input.int(14,  "ATR Period",         minval=2,   maxval=50,  group=grpI)
+swingLB      = input.int(10,  "Swing Lookback",     minval=4,   maxval=40,  group=grpI)
+
+grpR         = "Risk / Stops"
+atrMult      = input.float(1.5,"Initial Stop × ATR",minval=0.5, maxval=4.0, group=grpR, step=0.1)
+trailMult    = input.float(1.0,"Trail × ATR",       minval=0.3, maxval=3.0, group=grpR, step=0.1)
+rrRatio      = input.float(2.0,"R:R Ratio",         minval=1.0, maxval=5.0, group=grpR, step=0.25)
+beR          = input.float(1.0,"Lock B/E after R",  minval=0.5, maxval=3.0, group=grpR, step=0.25)
+confirm      = input.bool(true,"Require Confirmation Candle", group=grpR)
+
+// ─── Indicators ──────────────────────────────────────────────────────────────
+rsi    = ta.rsi(close, rsiPeriod)
+atrV   = ta.atr(atrPeriod)
+
+// Prior swing low/high within the lookback window (excluding current bar)
+priorLow      = ta.lowest(low[1],  swingLB)
+priorHigh     = ta.highest(high[1], swingLB)
+priorLowRsi   = ta.lowest(rsi[1],  swingLB)
+priorHighRsi  = ta.highest(rsi[1], swingLB)
+
+// ─── Divergence detection ────────────────────────────────────────────────────
+bullishDiv = low  < priorLow  and rsi > priorLowRsi  and rsi < 50
+bearishDiv = high > priorHigh and rsi < priorHighRsi and rsi > 50
+
+confirmL   = not confirm or close > close[1]
+confirmS   = not confirm or close < close[1]
+
+longSig    = bullishDiv and confirmL and strategy.position_size == 0
+shortSig   = bearishDiv and confirmS and strategy.position_size == 0
+
+// ─── Dynamic-stop state ──────────────────────────────────────────────────────
+var float entryPx     = na
+var float initStop    = na
+var float trailStop   = na
+var float tgt         = na
+
+if longSig
+    entryPx   := close
+    initStop  := close - atrV * atrMult
+    trailStop := initStop
+    tgt       := close + (atrV * atrMult) * rrRatio
+    strategy.entry("Rev Long", strategy.long)
+
+if shortSig
+    entryPx   := close
+    initStop  := close + atrV * atrMult
+    trailStop := initStop
+    tgt       := close - (atrV * atrMult) * rrRatio
+    strategy.entry("Rev Short", strategy.short)
+
+// Ratchet the trailing stop each bar
+if strategy.position_size > 0
+    candidate = close - atrV * trailMult
+    if candidate > trailStop
+        trailStop := candidate
+    // Lock to break-even after beR R of profit
+    initRisk = entryPx - initStop
+    rProfit  = (close - entryPx) / initRisk
+    if rProfit >= beR and trailStop < entryPx
+        trailStop := entryPx
+    strategy.exit("Rev Long X",  "Rev Long",  stop=trailStop, limit=tgt)
+
+if strategy.position_size < 0
+    candidate = close + atrV * trailMult
+    if candidate < trailStop
+        trailStop := candidate
+    initRisk = initStop - entryPx
+    rProfit  = (entryPx - close) / initRisk
+    if rProfit >= beR and trailStop > entryPx
+        trailStop := entryPx
+    strategy.exit("Rev Short X", "Rev Short", stop=trailStop, limit=tgt)
+
+// ─── Plots ────────────────────────────────────────────────────────────────────
+plot(strategy.position_size != 0 ? trailStop : na, "Trail Stop", color.new(color.red,    0), 2, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? tgt       : na, "Target",     color.new(color.green,  0), 2, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? entryPx   : na, "Entry",      color.new(color.yellow, 0), 1, style=plot.style_linebr)
+
+plotshape(longSig,  "Long Reversal",  shape.triangleup,   location.belowbar, color.green, size=size.small)
+plotshape(shortSig, "Short Reversal", shape.triangledown, location.abovebar, color.red,   size=size.small)
+
+// RSI pane
+rsiPlot = plot(rsi, "RSI", color.new(color.purple, 0), 2, display=display.pane)
+hline(70, "OB",  color.new(color.red,   50), hline.style_dashed)
+hline(30, "OS",  color.new(color.green, 50), hline.style_dashed)
+hline(50, "Mid", color.new(color.gray,  70), hline.style_dotted)
