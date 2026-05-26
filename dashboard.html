@@ -160,6 +160,7 @@
 <div class="tabs">
   <div class="tab active" data-tab="account">Account</div>
   <div class="tab" data-tab="strategies">Strategies & Backtest</div>
+  <div class="tab" data-tab="signals">Daily Signals</div>
   <div class="tab" data-tab="chart">Chart</div>
   <div class="tab" data-tab="options">Options Chain</div>
 </div>
@@ -388,6 +389,38 @@
   </div>
 </div>
 
+<!-- ══ DAILY SIGNALS PANEL ═══════════════════════════════════════════════════ -->
+<div id="tab-signals" class="panel">
+
+  <!-- Controls -->
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px 20px;display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap">
+    <div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:.6px">Date</div>
+      <input id="ds-date" type="date" class="inp" style="width:170px">
+    </div>
+    <div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:.6px">Strategy</div>
+      <select id="ds-strategy" class="inp" style="width:200px">
+        <option value="hybrid" selected>Hybrid</option>
+        <option value="hybrid10">Hybrid-10 + Overnight</option>
+        <option value="hybrid-reversal">Hybrid + Reversal</option>
+        <option value="reversal">Reversal</option>
+        <option value="vwap">VWAP</option>
+      </select>
+    </div>
+    <div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:.6px">Symbols (optional override)</div>
+      <input id="ds-symbols" type="text" class="inp" style="width:280px" placeholder="leave blank to use Alpaca watchlist">
+    </div>
+    <button class="btn btn-primary" onclick="runDailySignals()">Generate Signals</button>
+  </div>
+
+  <!-- Summary + results -->
+  <div id="ds-loading" style="display:none;text-align:center;color:var(--muted);padding:40px"><span class="spin">⟳</span> Computing daily signals…</div>
+  <div id="ds-summary" style="display:none;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 18px;display:none;flex-direction:row;gap:24px;flex-wrap:wrap;font-size:13px"></div>
+  <div id="ds-results" style="display:flex;flex-direction:column;gap:14px"></div>
+</div>
+
 <!-- ══ CHART PANEL ════════════════════════════════════════════════════════════ -->
 <div id="tab-chart" class="panel">
 
@@ -559,6 +592,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
     if (tab.dataset.tab === 'strategies') loadStrategies();
     if (tab.dataset.tab === 'options')    initOptionsTab();
+    if (tab.dataset.tab === 'signals')    initDailySignals();
     if (tab.dataset.tab === 'chart')      initChartTab();
   });
 });
@@ -1601,6 +1635,90 @@ async function deployToAlpaca() {
     el.style.display = '';
   } finally {
     btn.disabled = false; btn.textContent = 'Deploy to Alpaca';
+  }
+}
+
+// ─── Daily Signals tab ────────────────────────────────────────────────────────
+function initDailySignals() {
+  const dateEl = document.getElementById('ds-date');
+  if (!dateEl.value) dateEl.value = new Date().toISOString().slice(0, 10);
+}
+
+async function runDailySignals() {
+  const date     = document.getElementById('ds-date').value || new Date().toISOString().slice(0, 10);
+  const strategy = document.getElementById('ds-strategy').value || 'hybrid';
+  const symbols  = (document.getElementById('ds-symbols').value || '').trim();
+
+  document.getElementById('ds-loading').style.display = '';
+  document.getElementById('ds-summary').style.display = 'none';
+  document.getElementById('ds-results').innerHTML = '';
+
+  try {
+    const qs = new URLSearchParams({ date, strategy });
+    if (symbols) qs.set('symbols', symbols);
+    const data = await fetch('/api/daily-signals?' + qs).then(r => r.json());
+    document.getElementById('ds-loading').style.display = 'none';
+    if (data.error) {
+      document.getElementById('ds-results').innerHTML = `<div style="color:var(--red);padding:14px">${data.error}</div>`;
+      return;
+    }
+
+    // Summary chips
+    const sum = document.getElementById('ds-summary');
+    sum.style.display = 'flex';
+    sum.innerHTML = `
+      <div><strong>${data.date}</strong> · ${data.strategy.toUpperCase()}</div>
+      <div><span style="color:var(--muted)">Symbols:</span> <strong>${data.count}</strong></div>
+      <div><span style="color:var(--muted)">Trades taken:</span> <strong>${data.tookTrade}</strong></div>
+      <div><span style="color:var(--muted)">Winners:</span> <strong class="pos">${data.winners}</strong> / <strong class="neg">${data.tookTrade - data.winners}</strong></div>
+    `;
+
+    // Per-symbol cards
+    const cardsHtml = data.results.map(r => {
+      const t = r.trade;
+      if (!t) {
+        return `
+          <div class="section" style="padding:14px 18px">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:14px">
+              <div><strong style="font-size:15px">${r.symbol}</strong> <span style="color:var(--muted);font-size:12px">· no setup</span></div>
+              <span class="badge" style="background:rgba(100,116,139,.15);color:#94a3b8;padding:3px 9px;border-radius:4px;font-size:11px">SKIP</span>
+            </div>
+            <div style="color:var(--muted);font-size:13px;margin-top:8px;line-height:1.5">${r.narrative}</div>
+          </div>`;
+      }
+      const sideCls = t.side === 'buy' ? 'pos' : 'neg';
+      const pnl     = t.pnlPct ?? 0;
+      const pnlCls  = pnl > 0 ? 'pos' : 'neg';
+      const verdict = pnl > 0 ? 'WIN' : 'LOSS';
+      const vBg     = pnl > 0 ? 'background:rgba(34,197,94,.15);color:#86efac' : 'background:rgba(239,68,68,.15);color:#fca5a5';
+      return `
+        <div class="section" style="padding:14px 18px">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap">
+            <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+              <strong style="font-size:15px">${r.symbol}</strong>
+              <span class="${sideCls}" style="font-weight:600">${t.side.toUpperCase()}</span>
+              <span style="color:var(--muted);font-size:12px">entry $${(t.entry ?? 0).toFixed(2)} → exit ${t.exit != null ? '$'+t.exit.toFixed(2) : 'OPEN'}</span>
+              ${t.stopSource === 'order-block' ? '<span style="font-size:10px;color:#a78bfa;background:rgba(139,92,246,.12);padding:2px 6px;border-radius:3px">OB Stop</span>' : ''}
+              ${t.stopSource === 'atr-trail' ? '<span style="font-size:10px;color:#fbbf24;background:rgba(251,191,36,.12);padding:2px 6px;border-radius:3px">Trail Stop</span>' : ''}
+              ${t.forced ? '<span style="font-size:10px;color:var(--muted);background:rgba(100,116,139,.12);padding:2px 6px;border-radius:3px">Forced</span>' : ''}
+              ${t.heldOvernight ? '<span style="font-size:10px;color:#7dd3fc;background:rgba(56,189,248,.12);padding:2px 6px;border-radius:3px">Overnight</span>' : ''}
+            </div>
+            <div style="display:flex;gap:10px;align-items:center">
+              <span class="${pnlCls}" style="font-weight:700;font-size:14px">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</span>
+              <span style="${vBg};padding:3px 9px;border-radius:4px;font-size:11px;font-weight:600">${verdict}</span>
+            </div>
+          </div>
+          <div style="margin-top:10px;font-size:13px;line-height:1.55;color:#cbd5e1">${r.narrative}</div>
+          <div style="margin-top:8px;font-size:11px;color:var(--muted);font-family:monospace">
+            stop $${(t.stop ?? 0).toFixed(2)} · target $${(t.target ?? 0).toFixed(2)} · exit reason: ${t.exitReason || '—'}
+          </div>
+        </div>`;
+    }).join('');
+
+    document.getElementById('ds-results').innerHTML = cardsHtml || '<div style="color:var(--muted);padding:20px">No results</div>';
+  } catch (e) {
+    document.getElementById('ds-loading').style.display = 'none';
+    document.getElementById('ds-results').innerHTML = `<div style="color:var(--red);padding:14px">Error: ${e.message}</div>`;
   }
 }
 

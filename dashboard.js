@@ -448,6 +448,123 @@ app.get("/api/bot-status", (req, res) => {
   });
 });
 
+// ─── Daily Signals ─────────────────────────────────────────────────────────────
+//
+// Runs the chosen strategy on each watchlist symbol for ONE trading day and
+// returns the entry / exit / market-structure narrative for each. Default
+// strategy is hybrid (force-daily on so every symbol shows something).
+
+function structureNarrative(trade, ctx) {
+  if (!trade) {
+    return `${ctx.symbol}: no qualifying setup. ${ctx.reason || "Triple-confirmation conditions never aligned during the session window."}`;
+  }
+  const { side, entry, stop, target, exit, exitReason, pnlPct, orderBlock, stopSource, entrySignal, forced } = trade;
+  const dir = side === "buy" ? "LONG" : "SHORT";
+
+  // Entry framing
+  let entryStory;
+  if (entrySignal === "reversal-div") {
+    entryStory = `${dir} entry on ${ctx.symbol} at $${entry.toFixed(2)} triggered by RSI divergence — price printed a ${side === "buy" ? "lower low while RSI made a higher low" : "higher high while RSI made a lower high"}, then a confirmation candle in our direction.`;
+  } else if (forced) {
+    entryStory = `${dir} entry on ${ctx.symbol} at $${entry.toFixed(2)} was a forced-daily entry — the strict triple-confirmation never fired so the bot took the first post-ORB bar in the direction of session VWAP (lower probability than a normal setup).`;
+  } else {
+    entryStory = `${dir} entry on ${ctx.symbol} at $${entry.toFixed(2)} triggered when price ${side === "buy" ? "broke above the opening range high" : "broke below the opening range low"} with all three filters aligned: ${side === "buy" ? "price above session VWAP, EMA(9) > EMA(21), volume ≥ 1.3× avg" : "price below VWAP, EMA(9) < EMA(21), volume ≥ 1.3× avg"}.`;
+  }
+
+  // Stop framing
+  let stopStory;
+  if (stopSource === "order-block" && orderBlock) {
+    stopStory = `Stop placed at $${stop.toFixed(2)}, sitting just beyond the most recent ${orderBlock.side} order block (${orderBlock.side === "bullish" ? "the last down-candle before the morning impulse, which broke its high by " : "the last up-candle before the morning impulse, which broke its low by "}${orderBlock.impulsePct.toFixed(2)}%). This is the liquidity zone smart money positioned before pushing price ${side === "buy" ? "up" : "down"} — losing it invalidates the move.`;
+  } else if (stopSource === "atr-trail") {
+    stopStory = `Stop began at $${trade.stop.toFixed(2)} (ATR-based) and trailed dynamically as price moved in our favor, locking to break-even after 1R of profit.`;
+  } else {
+    stopStory = `Stop placed at $${stop.toFixed(2)}, on the opposite side of the opening range — a break here would mean the ORB is no longer a valid pivot.`;
+  }
+
+  // Exit framing
+  let exitStory;
+  if (exit == null) {
+    exitStory = `Trade is still OPEN. Target at $${target?.toFixed(2)}, stop at $${stop.toFixed(2)}.`;
+  } else if (exitReason === "target") {
+    exitStory = `EXIT: HIT TARGET at $${exit.toFixed(2)} (+${pnlPct?.toFixed(2)}%). Price extended through the projected 2R move — the breakout had follow-through and momentum players piled in.`;
+  } else if (exitReason === "near-target") {
+    exitStory = `EXIT: NEAR-TARGET LOCK at $${exit.toFixed(2)} (+${pnlPct?.toFixed(2)}%). Price wicked into the top 95% of the planned move; we closed early to avoid giving back the win.`;
+  } else if (exitReason === "stop" || exitReason === "trail-stop" || exitReason === "overnight-stop") {
+    const tag = exitReason === "stop" ? "STOPPED OUT" : exitReason === "trail-stop" ? "TRAILING STOP HIT" : "OVERNIGHT STOP HIT";
+    exitStory = `EXIT: ${tag} at $${exit.toFixed(2)} (${pnlPct?.toFixed(2)}%). Price ${side === "buy" ? "reclaimed and broke below" : "rejected and pushed above"} the invalidation level — the structure that justified the entry was lost.`;
+  } else if (exitReason === "time" || exitReason === "next-session-close") {
+    exitStory = `EXIT: ${exitReason.toUpperCase().replace(/_/g, " ")} at $${exit.toFixed(2)} (${pnlPct?.toFixed(2)}%). Target wasn't reached during the session — momentum stalled, often a sign of weak follow-through and a candidate to skip in similar conditions.`;
+  } else if (exitReason === "bias_flip") {
+    exitStory = `EXIT: BIAS FLIP at $${exit.toFixed(2)} (${pnlPct?.toFixed(2)}%). Price crossed back through VWAP and the EMA against our direction — the bullish/bearish thesis broke.`;
+  } else {
+    exitStory = `EXIT: ${exitReason} at $${exit.toFixed(2)} (${pnlPct?.toFixed(2)}%).`;
+  }
+
+  return `${entryStory} ${stopStory} ${exitStory}`;
+}
+
+app.get("/api/daily-signals", async (req, res) => {
+  try {
+    const date     = req.query?.date || new Date().toISOString().slice(0, 10);
+    const strategy = (req.query?.strategy || "hybrid").toLowerCase();
+    const meta     = STRATEGY_META[strategy];
+    if (!meta) return res.status(400).json({ error: `Unknown strategy: ${strategy}` });
+
+    // Resolve watchlist
+    let symbols;
+    if (req.query?.symbols) {
+      symbols = String(req.query.symbols).split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+    } else {
+      try {
+        const lists = await alpaca("/v2/watchlists");
+        if (lists?.length) {
+          const detail = await alpaca(`/v2/watchlists/${lists[0].id}`);
+          symbols = (detail.assets || []).map(a => a.symbol).filter(Boolean);
+        }
+      } catch {}
+      if (!symbols?.length) symbols = [process.env.SYMBOL || "SPY"];
+    }
+
+    const tf = TIMEFRAMES[strategy] || "5m";
+    const baseOpts = {
+      mode:       "stock",
+      forceDaily: strategy === "hybrid" || strategy === "hybrid10", // ensure a trade per symbol per day
+      params:     { ...(meta.params || {}) },
+    };
+
+    console.log(`[DailySignals] ${strategy} on ${symbols.length} symbols for ${date}`);
+
+    const results = await Promise.all(symbols.map(async symbol => {
+      try {
+        const r = await runBacktest(strategy, symbol, { ...baseOpts });
+        const trades = (r.trades || []).filter(t => t.date === date || (t.entryTime && new Date(t.entryTime).toISOString().slice(0, 10) === date));
+        const trade  = trades[0] || null;
+        return {
+          symbol,
+          date,
+          trade,
+          narrative: structureNarrative(trade, { symbol, reason: trade ? null : "no setup" }),
+        };
+      } catch (e) {
+        return { symbol, date, trade: null, narrative: `${symbol}: data error — ${e.message}` };
+      }
+    }));
+
+    const tookTrade = results.filter(r => r.trade).length;
+    const winners   = results.filter(r => r.trade && (r.trade.pnlPct ?? 0) > 0).length;
+
+    res.json({
+      date, strategy, symbols, count: symbols.length,
+      tookTrade, winners,
+      results,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("[DailySignals] Error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── Backtest optimization loop ───────────────────────────────────────────────
 
 const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m", reversal: "5m", "hybrid-reversal": "5m", hybrid10: "5m" };
