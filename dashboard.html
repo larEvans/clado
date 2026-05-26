@@ -345,6 +345,29 @@
             <tbody id="iter-tbody"></tbody>
           </table>
         </div>
+
+        <!-- ── Optimized trade list (best iteration) ───────────────────────── -->
+        <div id="opt-trades-wrap" style="display:none">
+          <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center">
+            <span>★ Best Iteration — Trades <span id="opt-trades-summary" style="color:var(--text);font-weight:500;margin-left:8px"></span></span>
+            <span id="opt-trades-tag" style="font-size:10px;color:var(--muted)"></span>
+          </div>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr>
+                <th>Date</th>
+                <th>Side</th>
+                <th>Entry</th>
+                <th>Exit</th>
+                <th>P&amp;L %</th>
+                <th>Exit Reason</th>
+                <th>Hermes Verdict</th>
+              </tr></thead>
+              <tbody id="opt-trades-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
         <!-- Deploy section -->
         <div id="deploy-section" style="display:none" class="deploy-box">
           <div style="font-size:14px;font-weight:600">Deploy Optimized Strategy to Alpaca</div>
@@ -1381,7 +1404,17 @@ async function runOptimize(stratId) {
   area.scrollIntoView({ behavior: 'smooth' });
 
   try {
-    const body = { strategy: stratId, symbol, iterations: 5, mode };
+    const body = {
+      strategy:        stratId,
+      symbol,
+      iterations:      5,
+      mode,
+      saveToHistory:   true,
+      forceDaily:      stratId === 'hybrid',
+      useLiveOptions:  mode === 'options',
+      targetReturnPct: 70,
+      maxIterations:   25,
+    };
     if (mode === 'options') Object.assign(body, { iv, dte, contracts });
 
     const result = await fetch('/api/backtest/optimize', {
@@ -1452,8 +1485,66 @@ function renderOptimizationResult(result) {
       </tr>`;
   }).join('');
 
+  // Render the best iteration's actual trade list with Hermes verdicts.
+  renderOptimizedTrades(result);
+
   // Pre-select the best iteration for deploy
   selectIteration(bestIteration);
+}
+
+function renderOptimizedTrades(result) {
+  const wrap   = document.getElementById('opt-trades-wrap');
+  const tbody  = document.getElementById('opt-trades-tbody');
+  const trades = Array.isArray(result.bestTrades) ? result.bestTrades : [];
+
+  if (!trades.length) {
+    wrap.style.display = '';
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">No trades generated in best iteration</td></tr>';
+    document.getElementById('opt-trades-summary').textContent = '';
+    document.getElementById('opt-trades-tag').textContent = '';
+    return;
+  }
+
+  const wins  = trades.filter(t => (t.pnlPct ?? 0) > 0).length;
+  const total = trades.length;
+  const sumPct = trades.reduce((s, t) => s + (t.pnlPct || 0), 0);
+  document.getElementById('opt-trades-summary').textContent =
+    `${wins}/${total} winners · cum ${sumPct >= 0 ? '+' : ''}${sumPct.toFixed(2)}%`;
+  const tag = [];
+  if (result.targetReached)  tag.push(`🎯 hit ${result.targetReturnPct}% target`);
+  if (result.savedToHistory) tag.push(`${result.savedToHistory} saved to history`);
+  if (result.liveOptionsEnv && result.liveOptionsEnv.source === 'alpaca')
+    tag.push(`live IV ${(result.liveOptionsEnv.iv*100).toFixed(1)}% / DTE ${result.liveOptionsEnv.dteDays}d`);
+  document.getElementById('opt-trades-tag').textContent = tag.join(' · ');
+
+  // Show most recent first
+  const rows = trades.slice().reverse().slice(0, 100).map(t => {
+    const pnl     = t.pnlPct ?? 0;
+    const pnlCls  = pnl > 0 ? 'pos' : 'neg';
+    const verdict = t.verdict || (pnl > 0 ? 'GOOD' : 'BAD');
+    const vCls    = verdict === 'GOOD' ? 'pos' : 'neg';
+    const reasons = Array.isArray(t.verdictReasons) ? t.verdictReasons.join(' · ') : (t.verdictText || '');
+    const date    = t.date || (t.entryTime ? new Date(t.entryTime).toISOString().slice(0,10) : '—');
+    const entry   = t.entry ?? t.entryPrice;
+    const exit    = t.exit  ?? t.exitPrice;
+    const side    = (t.side || '').toUpperCase();
+    const sideCls = side === 'BUY' ? 'pos' : 'neg';
+    return `
+      <tr>
+        <td>${date}</td>
+        <td class="${sideCls}">${side}</td>
+        <td>${entry != null ? fmtUSD(entry) : '—'}</td>
+        <td>${exit  != null ? fmtUSD(exit)  : '—'}</td>
+        <td class="${pnlCls}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</td>
+        <td style="color:var(--muted);font-size:11px">${t.exitReason || '—'}${t.forced ? ' · forced' : ''}</td>
+        <td style="max-width:340px">
+          <span class="${vCls}" style="font-weight:600;font-size:11px">${verdict}</span>
+          <div style="font-size:11px;color:var(--muted);line-height:1.4">${reasons}</div>
+        </td>
+      </tr>`;
+  }).join('');
+  tbody.innerHTML = rows;
+  wrap.style.display = '';
 }
 
 function selectIteration(iterNum) {

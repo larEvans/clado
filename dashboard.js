@@ -512,6 +512,19 @@ app.post("/api/backtest/optimize", async (req, res) => {
       console.log(`[Optimize] Appended ${savedCount} best-iteration trades to trade-history.json`);
     }
 
+    // Annotate the best iteration's trades with Hermes per-trade verdicts so
+    // the dashboard can render an "optimized trade list" with reasons inline.
+    const bestTradesRaw = (iterResults[bestIdx].trades || []).map(t => ({
+      ...t,
+      strategy,
+      symbol,
+      side: t.side,
+      entryPrice: t.entry,
+      exitPrice:  t.exit,
+      // explainTrades expects pnlPct present on the trade
+    }));
+    const bestTradesAnnotated = explainTrades(bestTradesRaw).slice(-200);
+
     // Strip the trades array off iterations before returning (keep payload small)
     const output = {
       strategy,
@@ -520,6 +533,8 @@ app.post("/api/backtest/optimize", async (req, res) => {
       bestIteration: bestIdx + 1,
       bestParams:    iterResults[bestIdx].params,
       bestReturnPct: iterResults[bestIdx].returnPct,
+      bestTrades:    bestTradesAnnotated,
+      bestMetrics:   iterResults[bestIdx].metrics,
       targetReturnPct: targetPct,
       targetReached,
       savedToHistory:  savedCount,
