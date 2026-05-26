@@ -36,6 +36,7 @@ async function alpaca(path) {
 
 app.use(express.json());
 app.use(express.static(__dirname));
+app.get("/", (req, res) => res.sendFile(join(__dirname, "dashboard.html")));
 
 // ─── Alpaca proxy ─────────────────────────────────────────────────────────────
 
