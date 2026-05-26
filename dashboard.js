@@ -68,8 +68,46 @@ app.get("/api/strategies", (req, res) => {
 
 // ─── Backtest ─────────────────────────────────────────────────────────────────
 
+// Convert backtest trades into the live trade-history record shape.
+function backtestTradesToHistory(trades, strategy, symbol, { source = "backtest" } = {}) {
+  return (trades || []).map(t => ({
+    symbol,
+    strategy,
+    side:        t.side,
+    entryPrice:  t.entry,
+    exitPrice:   t.exit,
+    pnlPct:      +(t.pnlPct || 0).toFixed(4),
+    pnlR:        t.pnlR != null ? +t.pnlR.toFixed(3) : null,
+    win:         (t.pnlPct || 0) > 0,
+    entryTime:   t.entryTime ? new Date(t.entryTime).toISOString() : null,
+    exitTime:    t.exitTime  ? new Date(t.exitTime).toISOString()  : null,
+    exitReason:  t.exitReason,
+    forced:      !!t.forced,
+    source,
+    // Options fields (present when mode === "options")
+    optionType:    t.optionType    || null,
+    optionStrike:  t.optionStrike  || null,
+    entryPremium:  t.entryPremium  != null ? +t.entryPremium.toFixed(4)  : null,
+    exitPremium:   t.exitPremium   != null ? +t.exitPremium.toFixed(4)   : null,
+    optionsPnL:    t.optionsPnL    != null ? +t.optionsPnL.toFixed(2)    : null,
+    optionsPnLPct: t.optionsPnLPct != null ? +t.optionsPnLPct.toFixed(4) : null,
+    recordedAt: new Date().toISOString(),
+  }));
+}
+
+function appendToTradeHistory(records) {
+  if (!records || records.length === 0) return 0;
+  const histFile = join(__dirname, "trade-history.json");
+  let history = [];
+  try { if (existsSync(histFile)) history = JSON.parse(readFileSync(histFile, "utf8")); } catch {}
+  history.push(...records);
+  if (history.length > 2000) history = history.slice(-2000);
+  writeFileSync(histFile, JSON.stringify(history, null, 2));
+  return records.length;
+}
+
 app.post("/api/backtest", async (req, res) => {
-  const { strategy, symbol, mode, iv, dte, contracts, strikeInterval } = req.body;
+  const { strategy, symbol, mode, iv, dte, contracts, strikeInterval, forceDaily, saveToHistory } = req.body;
   if (!strategy || !symbol) return res.status(400).json({ error: "strategy and symbol required" });
   try {
     const opts = {
@@ -78,9 +116,19 @@ app.post("/api/backtest", async (req, res) => {
       dteDays:        parseInt(dte)         || 7,
       numContracts:   parseInt(contracts)   || 1,
       strikeInterval: parseFloat(strikeInterval) || 1,
+      forceDaily:     !!forceDaily,
     };
-    console.log(`Running backtest: ${strategy} on ${symbol} [${opts.mode}]`);
+    console.log(`Running backtest: ${strategy} on ${symbol} [${opts.mode}]${opts.forceDaily ? " forceDaily" : ""}`);
     const results = await runBacktest(strategy, symbol, opts);
+
+    // forceDaily implies the user wants every session's trade in order history.
+    if (saveToHistory || forceDaily) {
+      const recs = backtestTradesToHistory(results.trades, strategy, symbol, { source: forceDaily ? "backtest-forced" : "backtest" });
+      const n = appendToTradeHistory(recs);
+      results.savedToHistory = n;
+      console.log(`[Backtest] Appended ${n} trades to trade-history.json`);
+    }
+
     res.json(results);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -255,8 +303,32 @@ function findBestIteration(iters) {
   }, 0);
 }
 
+// Pull a numeric "total return %" out of a metrics object so we can compare
+// against a target (e.g. 70%). Prefers options PnL when in options mode.
+function metricsToReturnPct(metrics, mode) {
+  if (mode === "options" && metrics?.optionsMetrics) {
+    const total = parseFloat((metrics.optionsMetrics.totalPnL || "0").replace(/[$,]/g, ""));
+    const cost  = parseFloat((metrics.optionsMetrics.totalEntryPremium || "0").replace(/[$,]/g, ""));
+    if (cost > 0) return (total / cost) * 100;
+    return total; // fall back to raw dollars if we can't compute cost basis
+  }
+  // Stock mode: convert "+3.45R" → R-multiple as percent-of-risk
+  const raw = (metrics?.totalReturnR || "0").replace("R", "").replace("+", "");
+  const r = parseFloat(raw) || 0;
+  // Assume each R ≈ 1% of account risk per trade; treat R-multiple as percentage.
+  return r;
+}
+
 app.post("/api/backtest/optimize", async (req, res) => {
-  const { strategy, symbol, iterations = 5, mode, iv, dte, contracts, strikeInterval } = req.body;
+  const {
+    strategy, symbol,
+    iterations    = 5,
+    mode, iv, dte, contracts, strikeInterval,
+    forceDaily    = false,
+    saveToHistory = false,
+    targetReturnPct,        // e.g. 70 → keep iterating until total return reaches 70%
+    maxIterations,          // hard cap when targetReturnPct is set (default 25)
+  } = req.body;
   if (!strategy || !symbol) return res.status(400).json({ error: "strategy and symbol required" });
 
   const meta = STRATEGY_META[strategy];
@@ -269,10 +341,15 @@ app.post("/api/backtest/optimize", async (req, res) => {
     dteDays:        parseInt(dte)         || 7,
     numContracts:   parseInt(contracts)   || 1,
     strikeInterval: parseFloat(strikeInterval) || 1,
+    forceDaily:     !!forceDaily,
   };
 
-  const iterCount = Math.min(Math.max(parseInt(iterations) || 5, 2), 8);
-  console.log(`[Optimize] ${strategy.toUpperCase()} on ${symbol} — ${iterCount} iterations`);
+  const targetPct = targetReturnPct != null ? parseFloat(targetReturnPct) : null;
+  const hardCap   = Math.min(Math.max(parseInt(maxIterations) || 25, 2), 50);
+  const baseIters = Math.min(Math.max(parseInt(iterations) || 5, 2), 8);
+  // When a target is set, we let the loop run up to hardCap; otherwise stick to baseIters.
+  const loopCap   = targetPct != null ? hardCap : baseIters;
+  console.log(`[Optimize] ${strategy.toUpperCase()} on ${symbol} — up to ${loopCap} iterations${targetPct != null ? `, target ${targetPct}%` : ""}${forceDaily ? ", forceDaily" : ""}`);
 
   try {
     // Fetch candles once; share across all iterations to avoid rate-limiting
@@ -281,8 +358,9 @@ app.post("/api/backtest/optimize", async (req, res) => {
 
     let currentParams = { ...meta.params };
     const iterResults = [];
+    let targetReached = false;
 
-    for (let i = 0; i < iterCount; i++) {
+    for (let i = 0; i < loopCap; i++) {
       const result = await runBacktest(strategy, symbol, { ...baseOpts, params: currentParams, _candles: candles });
       const { candles: _c, equityCurve: _e, trades, ...metrics } = result;
 
@@ -294,16 +372,27 @@ app.post("/api/backtest/optimize", async (req, res) => {
         }
       }
 
+      const returnPct = metricsToReturnPct(metrics, baseOpts.mode);
       iterResults.push({
         num: i + 1,
         params:         { ...currentParams },
         metrics,
+        trades:         trades || [],   // keep so we can save best to history
         tradeCount:     (trades || []).length,
+        returnPct:      +returnPct.toFixed(2),
         paramChanges,
         hermesReasoning: "",
       });
 
-      if (i < iterCount - 1) {
+      console.log(`[Optimize] Iter ${i + 1}: ${(trades||[]).length} trades, return ${returnPct.toFixed(2)}%`);
+
+      if (targetPct != null && returnPct >= targetPct) {
+        console.log(`[Optimize] 🎯 Target ${targetPct}% reached at iter ${i + 1} (got ${returnPct.toFixed(2)}%)`);
+        targetReached = true;
+        break;
+      }
+
+      if (i < loopCap - 1) {
         const suggestion = await suggestParamChanges(strategy, currentParams, trades || [], i + 1);
         iterResults[i].hermesReasoning = suggestion.reasoning;
         currentParams = { ...currentParams, ...suggestion.changes };
@@ -312,12 +401,29 @@ app.post("/api/backtest/optimize", async (req, res) => {
     }
 
     const bestIdx = findBestIteration(iterResults);
+
+    // Optionally append the best iteration's trades to live order history.
+    let savedCount = 0;
+    if (saveToHistory || forceDaily) {
+      const recs = backtestTradesToHistory(
+        iterResults[bestIdx].trades, strategy, symbol,
+        { source: forceDaily ? "optimize-forced" : "optimize" }
+      );
+      savedCount = appendToTradeHistory(recs);
+      console.log(`[Optimize] Appended ${savedCount} best-iteration trades to trade-history.json`);
+    }
+
+    // Strip the trades array off iterations before returning (keep payload small)
     const output = {
       strategy,
       symbol,
-      iterations:    iterResults,
+      iterations:    iterResults.map(({ trades: _t, ...rest }) => rest),
       bestIteration: bestIdx + 1,
       bestParams:    iterResults[bestIdx].params,
+      bestReturnPct: iterResults[bestIdx].returnPct,
+      targetReturnPct: targetPct,
+      targetReached,
+      savedToHistory:  savedCount,
       optimizedAt:   new Date().toISOString(),
     };
 

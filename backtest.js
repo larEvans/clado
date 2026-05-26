@@ -643,7 +643,7 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
     emaPeriod     = 9,
     emaSlowPeriod = 21,
   } = { ...hybridMeta.params, ...params };
-  const { mode = "stock", iv = 0.18, dteDays = 7, numContracts = 1, strikeInterval = 1 } = opts;
+  const { mode = "stock", iv = 0.18, dteDays = 7, numContracts = 1, strikeInterval = 1, forceDaily = false } = opts;
 
   // Pre-compute EMAs across all candles (warm up with full history for accuracy)
   const closes       = allCandles.map(c => c.close);
@@ -769,6 +769,58 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
       }
     }
 
+    // ── Force-daily fallback ─────────────────────────────────────────────
+    // If no triple-confirmation trade fired and forceDaily=true, enter at the
+    // first post-ORB bar's close in the direction of the break vs ORB midpoint
+    // (or VWAP if available). Stop/target follow the standard ORB geometry.
+    if (forceDaily && !tradeEntered && postOrb.length > 0) {
+      const firstBar = postOrb[0];
+      const refVwap  = sessionVWAP([...orbCandles, firstBar]) ?? ((orb.orbHigh + orb.orbLow) / 2);
+      const price    = firstBar.close;
+      const side     = price >= refVwap ? "buy" : "sell";
+      const stop     = side === "buy" ? orb.orbLow  : orb.orbHigh;
+      const target   = side === "buy"
+        ? orb.orbHigh + orb.orbRange * rrRatio
+        : orb.orbLow  - orb.orbRange * rrRatio;
+
+      let optInfo = {};
+      if (mode === "options") {
+        const optionType   = side === "buy" ? "call" : "put";
+        const optionStrike = atmStrike(price, strikeInterval);
+        const entryPremium = optionPremium(price, optionStrike, dteDays, iv, optionType);
+        optInfo = { optionType, optionStrike, entryPremium, entryDTE: dteDays };
+      }
+      openTrade    = { side, entry: price, stop, target, entryTime: firstBar.time, forced: true, ...optInfo };
+      tradeEntered = true;
+
+      // Walk remaining bars to find stop/target/session-end exit
+      for (let j = 1; j < postOrb.length && openTrade; j++) {
+        const bar = postOrb[j];
+        let exitPrice = null, exitReason = null;
+        if (side === "buy") {
+          if (bar.low  <= stop)   { exitPrice = stop;   exitReason = "stop";   }
+          if (bar.high >= target) { exitPrice = target; exitReason = "target"; }
+        } else {
+          if (bar.high >= stop)   { exitPrice = stop;   exitReason = "stop";   }
+          if (bar.low  <= target) { exitPrice = target; exitReason = "target"; }
+        }
+        if (!exitPrice && bar.time >= sessEnd) { exitPrice = bar.close; exitReason = "time"; }
+        if (exitPrice) {
+          const risk   = Math.abs(price - stop);
+          const pnlUSD = side === "buy" ? exitPrice - price : price - exitPrice;
+          let optResult = {};
+          if (mode === "options" && openTrade.entryPremium != null) {
+            const elapsed     = (bar.time - openTrade.entryTime) / 86_400_000;
+            const exitPremium = optionPremium(exitPrice, openTrade.optionStrike, Math.max(openTrade.entryDTE - elapsed, 0.01), iv, openTrade.optionType);
+            const optPnL      = (exitPremium - openTrade.entryPremium) * 100 * numContracts;
+            optResult = { optionType: openTrade.optionType, optionStrike: openTrade.optionStrike, entryPremium: openTrade.entryPremium, exitPremium, optionsPnL: optPnL, optionsPnLPct: openTrade.entryPremium > 0 ? ((exitPremium - openTrade.entryPremium) / openTrade.entryPremium) * 100 : 0, optionDTE: openTrade.entryDTE };
+          }
+          trades.push({ date, entryTime: openTrade.entryTime, exitTime: bar.time, side, entry: price, stop, target, exit: exitPrice, exitReason, pnlR: risk > 0 ? pnlUSD / risk : 0, pnlPct: (pnlUSD / price) * 100, forced: true, ...optResult });
+          openTrade = null;
+        }
+      }
+    }
+
     // Close any position still open at session end
     if (openTrade && postOrb.length > 0) {
       const last   = postOrb[postOrb.length - 1];
@@ -784,7 +836,7 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
         optResult = { optionType: openTrade.optionType, optionStrike: openTrade.optionStrike, entryPremium: openTrade.entryPremium, exitPremium, optionsPnL: optPnL, optionsPnLPct: openTrade.entryPremium > 0 ? ((exitPremium - openTrade.entryPremium) / openTrade.entryPremium) * 100 : 0, optionDTE: openTrade.entryDTE };
       }
 
-      trades.push({ date, entryTime, exitTime: last.time, side, entry, stop, target: openTrade.target, exit: last.close, exitReason: "time", pnlR: risk > 0 ? pnlUSD / risk : 0, pnlPct: (pnlUSD / entry) * 100, ...optResult });
+      trades.push({ date, entryTime, exitTime: last.time, side, entry, stop, target: openTrade.target, exit: last.close, exitReason: "time", pnlR: risk > 0 ? pnlUSD / risk : 0, pnlPct: (pnlUSD / entry) * 100, forced: openTrade.forced || false, ...optResult });
     }
   }
 
@@ -828,14 +880,27 @@ export function calcMetrics(trades, mode = "stock") {
 
   // Options aggregate metrics
   if (mode === "options" && trades.some(t => t.optionsPnL != null)) {
-    const optTrades     = trades.filter(t => t.optionsPnL != null);
-    const totalOptPnL   = optTrades.reduce((s,t) => s + (t.optionsPnL||0), 0);
-    const optWins       = optTrades.filter(t => (t.optionsPnL||0) > 0);
-    const avgEntryPrem  = optTrades.reduce((s,t) => s + (t.entryPremium||0), 0) / optTrades.length;
+    const optTrades        = trades.filter(t => t.optionsPnL != null);
+    const totalOptPnL      = optTrades.reduce((s,t) => s + (t.optionsPnL||0), 0);
+    const optWins          = optTrades.filter(t => (t.optionsPnL||0) > 0);
+    const avgEntryPrem     = optTrades.reduce((s,t) => s + (t.entryPremium||0), 0) / optTrades.length;
+    // Total dollars of option premium moved (entry + exit), per-contract premium × 100 shares × contracts
+    // We infer the contracts-per-trade multiplier from the first trade with both entryPremium and optionsPnL.
+    const sample           = optTrades.find(t => t.entryPremium > 0 && t.exitPremium != null);
+    const multiplier       = sample
+      ? Math.round(Math.abs(sample.optionsPnL) / Math.max(Math.abs(sample.exitPremium - sample.entryPremium), 1e-9))
+      : 100;
+    const totalEntryDollars = optTrades.reduce((s,t) => s + (t.entryPremium||0) * multiplier, 0);
+    const totalExitDollars  = optTrades.reduce((s,t) => s + (t.exitPremium ||0) * multiplier, 0);
+    const totalPremiumTraded = totalEntryDollars + totalExitDollars;
     result.optionsMetrics = {
-      totalPnL:    "$" + totalOptPnL.toFixed(2),
-      winRate:     optTrades.length > 0 ? ((optWins.length/optTrades.length)*100).toFixed(1)+"%" : "—",
-      avgPremium:  "$" + avgEntryPrem.toFixed(2) + "/share",
+      totalPnL:             "$" + totalOptPnL.toFixed(2),
+      winRate:              optTrades.length > 0 ? ((optWins.length/optTrades.length)*100).toFixed(1)+"%" : "—",
+      avgPremium:           "$" + avgEntryPrem.toFixed(2) + "/share",
+      totalEntryPremium:    "$" + totalEntryDollars.toFixed(2),
+      totalExitPremium:     "$" + totalExitDollars.toFixed(2),
+      totalPremiumTraded:   "$" + totalPremiumTraded.toFixed(2),
+      contractsTraded:      optTrades.length,
     };
   }
 
@@ -878,8 +943,11 @@ if (process.argv.find(a => a.startsWith("--strategy"))) {
   const modeArg  = process.argv.find(a => a.startsWith("--mode="))?.split("=")[1]     || "stock";
   const ivArg    = parseFloat(process.argv.find(a => a.startsWith("--iv="))?.split("=")[1]  || "18") / 100;
   const dteArg   = parseInt(process.argv.find(a => a.startsWith("--dte="))?.split("=")[1]   || "7");
+  const forceArg = process.argv.find(a => a.startsWith("--force-daily"))
+                   ? (process.argv.find(a => a.startsWith("--force-daily="))?.split("=")[1] !== "false")
+                   : false;
 
-  runBacktest(stratArg, symArg, { mode: modeArg, iv: ivArg, dteDays: dteArg }).then(results => {
+  runBacktest(stratArg, symArg, { mode: modeArg, iv: ivArg, dteDays: dteArg, forceDaily: forceArg }).then(results => {
     const { trades, equityCurve, candles, ...summary } = results;
     console.log("\n══ Backtest Results ══════════════════════════════════\n");
     for (const [k,v] of Object.entries(summary)) {
