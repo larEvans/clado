@@ -219,8 +219,8 @@
       <span>Hermes — AI Trade Analyst</span>
       <div style="display:flex;gap:8px;align-items:center">
         <select id="hermes-strategy" class="inp" style="font-size:12px;padding:4px 8px">
+          <option value="hybrid" selected>Hybrid</option>
           <option value="orb">ORB</option>
-          <option value="hybrid">Hybrid</option>
           <option value="vwap">VWAP</option>
           <option value="trend">Trend</option>
           <option value="meanrev">Mean Rev</option>
@@ -611,13 +611,34 @@ async function loadAll() {
     document.getElementById('orders-today').textContent = `${todayO.filter(o=>o.status==='filled').length} / ${todayO.length}`;
     document.getElementById('orders-badge').textContent = ords.length;
     const tbody = document.getElementById('orders-body');
-    tbody.innerHTML = ords.length === 0
-      ? '<tr><td colspan="7" class="empty">No orders</td></tr>'
-      : ords.slice(0,50).map(o => {
-          const sideCls = o.side==='buy'?'pos':'neg';
-          const notional = o.notional ? ` ($${fmt(o.notional)})` : '';
-          return `<tr><td>${fmtTime(o.submitted_at)}</td><td><strong>${o.symbol}</strong></td><td class="${sideCls}">${o.side?.toUpperCase()}</td><td>${o.type}</td><td>${fmt(o.filled_qty||o.qty,2)}${notional}</td><td>${o.filled_avg_price?fmtUSD(o.filled_avg_price):'—'}</td><td class="status-${o.status}">${o.status}</td></tr>`;
-        }).join('');
+    if (ords.length > 0) {
+      tbody.innerHTML = ords.slice(0,50).map(o => {
+        const sideCls = o.side==='buy'?'pos':'neg';
+        const notional = o.notional ? ` ($${fmt(o.notional)})` : '';
+        return `<tr><td>${fmtTime(o.submitted_at)}</td><td><strong>${o.symbol}</strong></td><td class="${sideCls}">${o.side?.toUpperCase()}</td><td>${o.type}</td><td>${fmt(o.filled_qty||o.qty,2)}${notional}</td><td>${o.filled_avg_price?fmtUSD(o.filled_avg_price):'—'}</td><td class="status-${o.status}">${o.status}</td></tr>`;
+      }).join('');
+    } else {
+      // Fall back to bot trade history (backtest + paper) when there are no live Alpaca orders.
+      try {
+        const bs = await fetch('/api/bot-status').then(r => r.json());
+        const ht = (bs?.recentTrades || []).slice(0, 50);
+        if (ht.length > 0) {
+          document.getElementById('orders-badge').textContent = ht.length;
+          tbody.innerHTML = ht.map(t => {
+            const sideCls = t.side==='buy'?'pos':'neg';
+            const time = t.exitTime || t.entryTime || t.recordedAt;
+            const fillPrice = t.exitPrice ?? t.entryPrice;
+            const pnl = t.pnlPct != null ? `${t.pnlPct >= 0 ? '+' : ''}${t.pnlPct.toFixed(2)}%` : '—';
+            const tag = t.source ? t.source : (t.forced ? 'forced' : 'paper');
+            return `<tr><td>${fmtTime(time)}</td><td><strong>${t.symbol||'—'}</strong></td><td class="${sideCls}">${(t.side||'').toUpperCase()}</td><td>${tag}</td><td>${pnl}</td><td>${fillPrice?fmtUSD(fillPrice):'—'}</td><td class="status-filled">${t.exitReason||'closed'}</td></tr>`;
+          }).join('');
+        } else {
+          tbody.innerHTML = '<tr><td colspan="7" class="empty">No orders or backtest history yet — run a Hybrid backtest in Strategies tab</td></tr>';
+        }
+      } catch {
+        tbody.innerHTML = '<tr><td colspan="7" class="empty">No orders</td></tr>';
+      }
+    }
   }
 
   if (history.status === 'fulfilled' && history.value.equity) {
@@ -728,7 +749,16 @@ async function runBacktest(stratId) {
   document.getElementById('backtest-area').scrollIntoView({ behavior: 'smooth' });
 
   try {
-    const body = { strategy: stratId, symbol, mode };
+    // Hybrid: force a trade every day, save fills into trade-history.json,
+    // and pull today's IV/DTE from Alpaca when running in options mode.
+    const body = {
+      strategy:       stratId,
+      symbol,
+      mode,
+      saveToHistory:  true,
+      forceDaily:     stratId === 'hybrid',
+      useLiveOptions: mode === 'options',
+    };
     if (mode === 'options') Object.assign(body, { iv, dte, contracts });
 
     const results = await fetch('/api/backtest', {

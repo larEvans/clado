@@ -496,10 +496,10 @@ export function deriveWinOnlyFilters(trades) {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-export async function runHermesAnalysis(strategy = "orb") {
+export async function runHermesAnalysis(strategy = "hybrid") {
   // Load trade history
   if (!existsSync(HISTORY_FILE)) {
-    return { error: "No trade history yet — run the bot to generate trades" };
+    return { error: "No trade history yet — run a backtest with 'Save to History' on, or start the bot" };
   }
 
   let history = [];
@@ -507,9 +507,25 @@ export async function runHermesAnalysis(strategy = "orb") {
     return { error: "Could not read trade-history.json" };
   }
 
-  const trades = history.filter(t => t.strategy === strategy).slice(-30);
-  if (trades.length < 5) {
-    return { error: `Need at least 5 ${strategy} trades for analysis (have ${trades.length})` };
+  const trades = history.filter(t => t.strategy === strategy).slice(-100);
+  if (trades.length < 1) {
+    return { error: `No ${strategy} trades found yet — run a backtest of ${strategy} first (it will save trades to history)` };
+  }
+  if (trades.length < 3) {
+    // Sample is too small for AI prompts to be useful — use rule-based.
+    const insights = ruleBasedAnalysis(trades);
+    const result = {
+      ...insights,
+      strategy,
+      source:     "rule-based-small-sample",
+      tradeCount: trades.length,
+      analyzedAt: new Date().toISOString(),
+      note:       `Small sample (${trades.length} trade${trades.length === 1 ? "" : "s"}) — rule-based analysis only. Run more backtests for higher-confidence findings.`,
+    };
+    const all = loadAllInsights();
+    all[strategy] = result;
+    writeFileSync(INSIGHTS_FILE, JSON.stringify(all, null, 2));
+    return result;
   }
 
   const prompt = buildPrompt(trades, strategy);
