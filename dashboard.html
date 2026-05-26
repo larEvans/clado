@@ -358,6 +358,7 @@
                 <th>Date</th>
                 <th>Side</th>
                 <th>Entry</th>
+                <th>Stop</th>
                 <th>Exit</th>
                 <th>P&amp;L %</th>
                 <th>Exit Reason</th>
@@ -1511,6 +1512,7 @@ function renderOptimizedTrades(result) {
   document.getElementById('opt-trades-summary').textContent =
     `${wins}/${total} winners · cum ${sumPct >= 0 ? '+' : ''}${sumPct.toFixed(2)}%`;
   const tag = [];
+  if (result.autoDeployed)   tag.push(`🚀 auto-deployed to bot`);
   if (result.targetReached)  tag.push(`🎯 hit ${result.targetReturnPct}% target`);
   if (result.savedToHistory) tag.push(`${result.savedToHistory} saved to history`);
   if (result.liveOptionsEnv && result.liveOptionsEnv.source === 'alpaca')
@@ -1529,11 +1531,15 @@ function renderOptimizedTrades(result) {
     const exit    = t.exit  ?? t.exitPrice;
     const side    = (t.side || '').toUpperCase();
     const sideCls = side === 'BUY' ? 'pos' : 'neg';
+    const stopTag = t.stopSource === 'order-block'
+      ? '<span style="font-size:9px;color:#a78bfa;background:rgba(139,92,246,.12);padding:1px 5px;border-radius:3px;margin-left:4px">OB</span>'
+      : '';
     return `
       <tr>
         <td>${date}</td>
         <td class="${sideCls}">${side}</td>
         <td>${entry != null ? fmtUSD(entry) : '—'}</td>
+        <td>${t.stop != null ? fmtUSD(t.stop) : '—'}${stopTag}</td>
         <td>${exit  != null ? fmtUSD(exit)  : '—'}</td>
         <td class="${pnlCls}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</td>
         <td style="color:var(--muted);font-size:11px">${t.exitReason || '—'}${t.forced ? ' · forced' : ''}</td>

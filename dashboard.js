@@ -525,6 +525,31 @@ app.post("/api/backtest/optimize", async (req, res) => {
     }));
     const bestTradesAnnotated = explainTrades(bestTradesRaw).slice(-200);
 
+    // Auto-deploy best params to learned-params.json so the live bot picks
+    // them up on the next signal. Set autoDeploy:false to opt out.
+    let autoDeployed = null;
+    if (req.body.autoDeploy !== false) {
+      const learnFile = join(__dirname, "learned-params.json");
+      let learned = {};
+      try { if (existsSync(learnFile)) learned = JSON.parse(readFileSync(learnFile, "utf8")); } catch {}
+      learned[strategy] = {
+        ...(learned[strategy] || {}),
+        params:        iterResults[bestIdx].params,
+        source:        "hermes-auto-deploy",
+        bestReturnPct: iterResults[bestIdx].returnPct,
+        targetReturnPct: targetPct,
+        targetReached,
+        deployedAt:    new Date().toISOString(),
+      };
+      writeFileSync(learnFile, JSON.stringify(learned, null, 2));
+      autoDeployed = {
+        strategy,
+        params:    iterResults[bestIdx].params,
+        returnPct: iterResults[bestIdx].returnPct,
+      };
+      console.log(`[Optimize] 🚀 Auto-deployed best params for ${strategy} → ${JSON.stringify(iterResults[bestIdx].params)}`);
+    }
+
     // Strip the trades array off iterations before returning (keep payload small)
     const output = {
       strategy,
@@ -538,6 +563,7 @@ app.post("/api/backtest/optimize", async (req, res) => {
       targetReturnPct: targetPct,
       targetReached,
       savedToHistory:  savedCount,
+      autoDeployed,
       liveOptionsEnv,
       optimizedAt:   new Date().toISOString(),
     };

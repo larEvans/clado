@@ -114,6 +114,91 @@ function groupByDay(candles) {
     .map(([date, candles]) => ({ date, candles: candles.sort((a,b) => a.time-b.time) }));
 }
 
+// ─── Order Blocks (SMC liquidity zones) ──────────────────────────────────────
+//
+// An "order block" is the last opposite-direction candle before a strong
+// impulse move — the place where smart money got positioned before pushing
+// price the other way. For a LONG entry we want the most recent BULLISH OB:
+// the last DOWN-close candle that was followed by ≥ `impulseBars` consecutive
+// UP-close candles, the last of which broke above the OB's high. For a SHORT
+// we want the mirror: the last UP-close candle followed by ≥ impulseBars down
+// closes that broke below the OB's low.
+//
+// Returns { high, low, time, side } of the order block, or null if none found
+// in the lookback window. Caller places stop just beyond OB low (long) or
+// OB high (short).
+
+export function findOrderBlock(bars, entrySide, opts = {}) {
+  const { lookback = 30, impulseBars = 2, minImpulsePct = 0.15 } = opts;
+  if (!bars || bars.length < impulseBars + 2) return null;
+
+  const start = Math.max(0, bars.length - lookback);
+  const end   = bars.length - impulseBars - 1; // need impulseBars after the OB
+
+  if (entrySide === "buy") {
+    // Walk backwards: find a DOWN candle (close < open) where the next
+    // `impulseBars` are all UP candles and the impulse broke above OB high.
+    for (let i = end; i >= start; i--) {
+      const c = bars[i];
+      if (c.close >= c.open) continue; // need a down candle
+      const obHigh = c.high, obLow = c.low;
+
+      let impulseOK = true;
+      let impulseEnd = bars[Math.min(i + impulseBars, bars.length - 1)];
+      for (let j = 1; j <= impulseBars; j++) {
+        const n = bars[i + j];
+        if (!n || n.close <= n.open) { impulseOK = false; break; }
+      }
+      if (!impulseOK) continue;
+
+      // Must have broken above the OB high during the impulse
+      if (impulseEnd.high <= obHigh) continue;
+      const movePct = ((impulseEnd.high - obHigh) / obHigh) * 100;
+      if (movePct < minImpulsePct) continue;
+
+      return { side: "bullish", high: obHigh, low: obLow, time: c.time, impulsePct: movePct };
+    }
+    return null;
+  }
+
+  if (entrySide === "sell") {
+    for (let i = end; i >= start; i--) {
+      const c = bars[i];
+      if (c.close <= c.open) continue; // need an up candle
+      const obHigh = c.high, obLow = c.low;
+
+      let impulseOK = true;
+      let impulseEnd = bars[Math.min(i + impulseBars, bars.length - 1)];
+      for (let j = 1; j <= impulseBars; j++) {
+        const n = bars[i + j];
+        if (!n || n.close >= n.open) { impulseOK = false; break; }
+      }
+      if (!impulseOK) continue;
+
+      if (impulseEnd.low >= obLow) continue;
+      const movePct = ((obLow - impulseEnd.low) / obLow) * 100;
+      if (movePct < minImpulsePct) continue;
+
+      return { side: "bearish", high: obHigh, low: obLow, time: c.time, impulsePct: movePct };
+    }
+    return null;
+  }
+  return null;
+}
+
+// Helper: pick the stop price for an entry. Returns { stop, source } where
+// source is "order-block" or "orb-fallback".
+export function pickStop(side, entryPrice, bars, orbHigh, orbLow, opts = {}) {
+  const { padPct = 0.05 } = opts;
+  const ob = findOrderBlock(bars, side, opts);
+  if (ob) {
+    const pad = entryPrice * (padPct / 100);
+    if (side === "buy"  && ob.low  < entryPrice) return { stop: ob.low  - pad, source: "order-block", ob };
+    if (side === "sell" && ob.high > entryPrice) return { stop: ob.high + pad, source: "order-block", ob };
+  }
+  return { stop: side === "buy" ? orbLow : orbHigh, source: "orb-fallback", ob: null };
+}
+
 // ─── Indicators ───────────────────────────────────────────────────────────────
 
 function calcEMA(closes, period) {
@@ -705,7 +790,7 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
             optResult = { optionType: openTrade.optionType, optionStrike: openTrade.optionStrike, entryPremium: openTrade.entryPremium, exitPremium, optionsPnL: optPnL, optionsPnLPct: openTrade.entryPremium > 0 ? ((exitPremium - openTrade.entryPremium) / openTrade.entryPremium) * 100 : 0, optionDTE: openTrade.entryDTE };
           }
 
-          trades.push({ date, entryTime, exitTime: bar.time, side, entry, stop, target, exit: exitPrice, exitReason, pnlR, pnlPct: (pnlUSD / entry) * 100, ...optResult });
+          trades.push({ date, entryTime, exitTime: bar.time, side, entry, stop, target, exit: exitPrice, exitReason, pnlR, pnlPct: (pnlUSD / entry) * 100, stopSource: openTrade.stopSource || "orb-fallback", orderBlock: openTrade.orderBlock || null, ...optResult });
           openTrade = null;
         }
         continue;
@@ -733,9 +818,12 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
 
       const price = bar.close;
 
+      // Recent bars for order-block lookback (this session + a bit before)
+      const recentBars = allCandles.slice(Math.max(0, idx - 30), idx + 1);
+
       // LONG: breakout above ORB high + above VWAP + EMA bullish + volume
       if (price > orb.orbHigh && price > vwap && fastEMA > slowEMA && volOK) {
-        const stop   = orb.orbLow;
+        const { stop, source, ob } = pickStop("buy", price, recentBars, orb.orbHigh, orb.orbLow);
         const target = orb.orbHigh + orb.orbRange * rrRatio;
         if (price >= target) continue;
 
@@ -746,14 +834,14 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
           optInfo = { optionType: "call", optionStrike, entryPremium, entryDTE: dteDays };
         }
 
-        openTrade   = { side: "buy",  entry: price, stop, target, entryTime: bar.time, ...optInfo };
+        openTrade   = { side: "buy",  entry: price, stop, target, entryTime: bar.time, stopSource: source, orderBlock: ob, ...optInfo };
         tradeEntered = true;
         continue;
       }
 
       // SHORT: breakdown below ORB low + below VWAP + EMA bearish + volume
       if (price < orb.orbLow && price < vwap && fastEMA < slowEMA && volOK) {
-        const stop   = orb.orbHigh;
+        const { stop, source, ob } = pickStop("sell", price, recentBars, orb.orbHigh, orb.orbLow);
         const target = orb.orbLow - orb.orbRange * rrRatio;
         if (price <= target) continue;
 
@@ -764,7 +852,7 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
           optInfo = { optionType: "put", optionStrike, entryPremium, entryDTE: dteDays };
         }
 
-        openTrade   = { side: "sell", entry: price, stop, target, entryTime: bar.time, ...optInfo };
+        openTrade   = { side: "sell", entry: price, stop, target, entryTime: bar.time, stopSource: source, orderBlock: ob, ...optInfo };
         tradeEntered = true;
       }
     }
@@ -778,7 +866,9 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
       const refVwap  = sessionVWAP([...orbCandles, firstBar]) ?? ((orb.orbHigh + orb.orbLow) / 2);
       const price    = firstBar.close;
       const side     = price >= refVwap ? "buy" : "sell";
-      const stop     = side === "buy" ? orb.orbLow  : orb.orbHigh;
+      const idxFB    = timeToIdx.get(firstBar.time);
+      const recent   = idxFB != null ? allCandles.slice(Math.max(0, idxFB - 30), idxFB + 1) : [...orbCandles, firstBar];
+      const { stop, source: stopSource, ob } = pickStop(side, price, recent, orb.orbHigh, orb.orbLow);
       const target   = side === "buy"
         ? orb.orbHigh + orb.orbRange * rrRatio
         : orb.orbLow  - orb.orbRange * rrRatio;
@@ -790,7 +880,7 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
         const entryPremium = optionPremium(price, optionStrike, dteDays, iv, optionType);
         optInfo = { optionType, optionStrike, entryPremium, entryDTE: dteDays };
       }
-      openTrade    = { side, entry: price, stop, target, entryTime: firstBar.time, forced: true, ...optInfo };
+      openTrade    = { side, entry: price, stop, target, entryTime: firstBar.time, forced: true, stopSource, orderBlock: ob, ...optInfo };
       tradeEntered = true;
 
       // Walk remaining bars to find stop/target/session-end exit
@@ -815,7 +905,7 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
             const optPnL      = (exitPremium - openTrade.entryPremium) * 100 * numContracts;
             optResult = { optionType: openTrade.optionType, optionStrike: openTrade.optionStrike, entryPremium: openTrade.entryPremium, exitPremium, optionsPnL: optPnL, optionsPnLPct: openTrade.entryPremium > 0 ? ((exitPremium - openTrade.entryPremium) / openTrade.entryPremium) * 100 : 0, optionDTE: openTrade.entryDTE };
           }
-          trades.push({ date, entryTime: openTrade.entryTime, exitTime: bar.time, side, entry: price, stop, target, exit: exitPrice, exitReason, pnlR: risk > 0 ? pnlUSD / risk : 0, pnlPct: (pnlUSD / price) * 100, forced: true, ...optResult });
+          trades.push({ date, entryTime: openTrade.entryTime, exitTime: bar.time, side, entry: price, stop, target, exit: exitPrice, exitReason, pnlR: risk > 0 ? pnlUSD / risk : 0, pnlPct: (pnlUSD / price) * 100, forced: true, stopSource: openTrade.stopSource || "orb-fallback", orderBlock: openTrade.orderBlock || null, ...optResult });
           openTrade = null;
         }
       }
@@ -836,7 +926,7 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
         optResult = { optionType: openTrade.optionType, optionStrike: openTrade.optionStrike, entryPremium: openTrade.entryPremium, exitPremium, optionsPnL: optPnL, optionsPnLPct: openTrade.entryPremium > 0 ? ((exitPremium - openTrade.entryPremium) / openTrade.entryPremium) * 100 : 0, optionDTE: openTrade.entryDTE };
       }
 
-      trades.push({ date, entryTime, exitTime: last.time, side, entry, stop, target: openTrade.target, exit: last.close, exitReason: "time", pnlR: risk > 0 ? pnlUSD / risk : 0, pnlPct: (pnlUSD / entry) * 100, forced: openTrade.forced || false, ...optResult });
+      trades.push({ date, entryTime, exitTime: last.time, side, entry, stop, target: openTrade.target, exit: last.close, exitReason: "time", pnlR: risk > 0 ? pnlUSD / risk : 0, pnlPct: (pnlUSD / entry) * 100, forced: openTrade.forced || false, stopSource: openTrade.stopSource || "orb-fallback", orderBlock: openTrade.orderBlock || null, ...optResult });
     }
   }
 

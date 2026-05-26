@@ -19,6 +19,7 @@ import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import { AlpacaStream } from "./stream.js";
 import { getDefaultParams, loadLearnedParams, recordTradeClosed, runLearner } from "./learner.js";
+import { pickStop } from "./backtest.js";
 
 const SYMBOL      = (process.env.SYMBOL   || "SPY").toUpperCase();
 const STRATEGY    = (process.env.STRATEGY || "orb").toLowerCase();
@@ -268,13 +269,20 @@ function evalHybrid(barBuffer) {
   const volMA   = sample.length ? sample.reduce((s, b) => s + b.volume, 0) / sample.length : 0;
   const volOK   = volMA > 0 && cur.volume >= volMA * volMult;
 
+  // Use the last ~30 bars for order-block detection (≈ last 30 minutes intraday)
+  const recentBars = barBuffer.slice(-30);
+
   // Triple-confirmation LONG
   if (price > orbHigh && price > vwap && fast > slow && volOK) {
-    return { side: "buy",  entry: price, stop: orbLow,  target: orbHigh + orbRange * rrRatio, params, orbHigh, orbLow, orbRange };
+    const { stop, source, ob } = pickStop("buy", price, recentBars, orbHigh, orbLow);
+    if (source === "order-block") console.log(`[Hybrid] LONG stop from order block @ ${stop.toFixed(2)} (OB low ${ob.low.toFixed(2)}, impulse ${ob.impulsePct.toFixed(2)}%)`);
+    return { side: "buy",  entry: price, stop, target: orbHigh + orbRange * rrRatio, params, orbHigh, orbLow, orbRange, stopSource: source, orderBlock: ob };
   }
   // Triple-confirmation SHORT
   if (price < orbLow && price < vwap && fast < slow && volOK) {
-    return { side: "sell", entry: price, stop: orbHigh, target: orbLow - orbRange * rrRatio,  params, orbHigh, orbLow, orbRange };
+    const { stop, source, ob } = pickStop("sell", price, recentBars, orbHigh, orbLow);
+    if (source === "order-block") console.log(`[Hybrid] SHORT stop from order block @ ${stop.toFixed(2)} (OB high ${ob.high.toFixed(2)}, impulse ${ob.impulsePct.toFixed(2)}%)`);
+    return { side: "sell", entry: price, stop, target: orbLow - orbRange * rrRatio,  params, orbHigh, orbLow, orbRange, stopSource: source, orderBlock: ob };
   }
   return null;
 }
