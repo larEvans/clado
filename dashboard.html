@@ -131,6 +131,13 @@
   /* ── Bot Status ── */
   .bot-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; padding: 16px; }
   .learn-row td { font-size: 12px; }
+
+  /* ── Optimization UI ── */
+  .btn-hermes { background: #5b21b6; color: #c4b5fd; }
+  .iter-best  { background: rgba(34,197,94,.05); }
+  .iter-best td:first-child { border-left: 3px solid var(--green); }
+  .deploy-box { background: rgba(34,197,94,.05); border: 1px solid rgba(34,197,94,.2); border-radius: 8px; padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; }
+  .params-preview { font-family: 'Cascadia Code','Fira Code',monospace; font-size: 11px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 10px 14px; color: #a5f3fc; white-space: pre; }
 </style>
 </head>
 <body>
@@ -310,6 +317,48 @@
           </tr></thead>
           <tbody id="bt-trades"></tbody>
         </table>
+      </div>
+    </div>
+
+    <!-- ── Hermes optimization results ──────────────────────────────────── -->
+    <div id="optimize-area" style="display:none;display:flex;flex-direction:column;gap:14px">
+      <div id="optimize-loading" style="display:none;text-align:center;color:var(--muted);padding:40px">
+        <span class="spin">⟳</span> Hermes is running optimization iterations… (~30-60s)
+      </div>
+      <div id="optimize-content" style="display:none;display:flex;flex-direction:column;gap:14px">
+        <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;border-bottom:1px solid var(--border);padding-bottom:8px">
+          Hermes Optimization — Iteration Comparison
+        </div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr>
+              <th>#</th>
+              <th>Win Rate</th>
+              <th>Profit Factor</th>
+              <th>Total Return</th>
+              <th>Max Drawdown</th>
+              <th>Trades</th>
+              <th>Param Changes</th>
+              <th>Hermes Reasoning</th>
+              <th></th>
+            </tr></thead>
+            <tbody id="iter-tbody"></tbody>
+          </table>
+        </div>
+        <!-- Deploy section -->
+        <div id="deploy-section" style="display:none" class="deploy-box">
+          <div style="font-size:14px;font-weight:600">Deploy Optimized Strategy to Alpaca</div>
+          <div id="deploy-label" style="font-size:13px;color:var(--muted)"></div>
+          <div id="deploy-params-preview" class="params-preview"></div>
+          <div style="font-size:12px;color:var(--muted)">
+            Saves these params to <code>learned-params.json</code>. The bot will use them on its next trade.
+          </div>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-green" id="deploy-btn" onclick="deployToAlpaca()">Deploy to Alpaca</button>
+            <button class="btn btn-outline" onclick="document.getElementById('deploy-section').style.display='none'">Cancel</button>
+          </div>
+          <div id="deploy-result" style="display:none" class="inject-result"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -650,6 +699,7 @@ async function loadStrategies() {
       </div>
       <div class="strat-actions">
         <button class="btn btn-primary" onclick="runBacktest('${s.id}')">Run Backtest</button>
+        <button class="btn btn-hermes"  onclick="runOptimize('${s.id}')">Optimize with Hermes</button>
         <button class="btn btn-outline" onclick="openPine('${s.id}')">View Pine Script</button>
       </div>
     </div>
@@ -1272,6 +1322,158 @@ async function loadBotStatus() {
 
   } catch (e) {
     console.warn("Bot status error:", e.message);
+  }
+}
+
+// ─── Hermes Optimization ─────────────────────────────────────────────────────
+
+let currentOptimizeResult = null;
+let pendingDeployParams   = null;
+
+async function runOptimize(stratId) {
+  const symbol    = (document.getElementById(`sym-${stratId}`)?.value?.trim() || 'SPY').toUpperCase();
+  const mode      = stratModes[stratId] || 'stock';
+  const iv        = parseFloat(document.getElementById(`iv-${stratId}`)?.value) || 25;
+  const dte       = parseInt(document.getElementById(`dte-${stratId}`)?.value) || 7;
+  const contracts = parseInt(document.getElementById(`contracts-${stratId}`)?.value) || 1;
+
+  const area = document.getElementById('backtest-area');
+  area.style.display = '';
+  document.getElementById('bt-loading').style.display  = 'none';
+  document.getElementById('bt-content').style.display  = 'none';
+  document.getElementById('bt-title').textContent      = `Optimizing ${stratId.toUpperCase()} on ${symbol} with Hermes (5 iterations)…`;
+
+  const optArea = document.getElementById('optimize-area');
+  optArea.style.display = '';
+  document.getElementById('optimize-loading').style.display = '';
+  document.getElementById('optimize-content').style.display = 'none';
+  document.getElementById('deploy-section').style.display   = 'none';
+  area.scrollIntoView({ behavior: 'smooth' });
+
+  try {
+    const body = { strategy: stratId, symbol, iterations: 5, mode };
+    if (mode === 'options') Object.assign(body, { iv, dte, contracts });
+
+    const result = await fetch('/api/backtest/optimize', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(body),
+    }).then(r => r.json());
+
+    document.getElementById('optimize-loading').style.display = 'none';
+
+    if (result.error) {
+      document.getElementById('optimize-content').style.display = '';
+      document.getElementById('optimize-content').innerHTML =
+        `<div style="color:var(--red);padding:12px">${result.error}</div>`;
+      return;
+    }
+
+    document.getElementById('bt-title').textContent =
+      `Hermes Optimization — ${stratId.toUpperCase()} on ${symbol}`;
+    currentOptimizeResult = { ...result, stratId, symbol };
+    renderOptimizationResult(result);
+    document.getElementById('optimize-content').style.display = '';
+
+  } catch (e) {
+    document.getElementById('optimize-loading').style.display  = 'none';
+    document.getElementById('optimize-content').style.display  = '';
+    document.getElementById('optimize-content').innerHTML =
+      `<div style="color:var(--red);padding:12px">Error: ${e.message}</div>`;
+  }
+}
+
+function renderOptimizationResult(result) {
+  const { iterations, bestIteration } = result;
+  const tbody = document.getElementById('iter-tbody');
+
+  tbody.innerHTML = iterations.map(iter => {
+    const isBest = iter.num === bestIteration;
+    const m = iter.metrics || {};
+    const winVal = parseFloat(m.winRate) || 0;
+    const winCls = winVal > 50 ? 'pos' : 'neg';
+    const retCls = (m.totalReturnR || '').startsWith('+') ? 'pos' : 'neg';
+    const pfNum  = m.profitFactor === '∞' ? 999 : parseFloat(m.profitFactor) || 0;
+    const pfCls  = pfNum > 1 ? 'pos' : 'neg';
+
+    const changes = Object.entries(iter.paramChanges || {})
+      .map(([k, v]) => `<span style="font-family:monospace;font-size:10px">${k}: ${v}</span>`)
+      .join('<br>') || (iter.num === 1 ? '<span style="color:var(--muted);font-size:11px">defaults</span>' : '—');
+
+    const reason = iter.hermesReasoning
+      ? `<span style="font-size:11px;color:var(--muted)">${iter.hermesReasoning}</span>`
+      : '<span style="color:var(--muted)">—</span>';
+
+    return `
+      <tr class="${isBest ? 'iter-best' : ''}">
+        <td>${isBest ? '<span style="color:var(--green);font-weight:700">★</span> ' : ''}#${iter.num}</td>
+        <td class="${winCls}">${m.winRate || '—'}</td>
+        <td class="${pfCls}">${m.profitFactor || '—'}</td>
+        <td class="${retCls}">${m.totalReturnR || '—'}</td>
+        <td>${m.maxDrawdown || '—'}</td>
+        <td style="color:var(--muted)">${iter.tradeCount ?? '—'}</td>
+        <td style="max-width:160px;line-height:1.8">${changes}</td>
+        <td style="max-width:220px">${reason}</td>
+        <td>
+          <button class="btn btn-outline" style="font-size:11px;padding:4px 10px;white-space:nowrap"
+            onclick="selectIteration(${iter.num})">Use Params</button>
+          ${isBest ? '<div style="font-size:10px;color:var(--green);margin-top:3px;text-align:center">★ Best</div>' : ''}
+        </td>
+      </tr>`;
+  }).join('');
+
+  // Pre-select the best iteration for deploy
+  selectIteration(bestIteration);
+}
+
+function selectIteration(iterNum) {
+  if (!currentOptimizeResult) return;
+  const iter = currentOptimizeResult.iterations.find(i => i.num === iterNum);
+  if (!iter) return;
+
+  pendingDeployParams = { strategy: currentOptimizeResult.stratId, params: iter.params };
+
+  const preview = Object.entries(iter.params).map(([k, v]) => `${k}: ${v}`).join('\n');
+  const isBest  = iterNum === currentOptimizeResult.bestIteration;
+  document.getElementById('deploy-label').textContent =
+    `Iteration #${iterNum}${isBest ? ' ★ Best' : ''} — ${currentOptimizeResult.stratId.toUpperCase()} on ${currentOptimizeResult.symbol}`;
+  document.getElementById('deploy-params-preview').textContent = preview;
+  document.getElementById('deploy-result').style.display  = 'none';
+  document.getElementById('deploy-section').style.display = '';
+  document.getElementById('deploy-section').scrollIntoView({ behavior: 'smooth' });
+}
+
+async function deployToAlpaca() {
+  if (!pendingDeployParams) return;
+  const btn = document.getElementById('deploy-btn');
+  btn.disabled = true; btn.textContent = 'Deploying…';
+
+  try {
+    const result = await fetch('/api/deploy', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(pendingDeployParams),
+    }).then(r => r.json());
+
+    const el = document.getElementById('deploy-result');
+    if (result.ok) {
+      el.className = 'inject-result ok';
+      el.innerHTML =
+        `✓ ${result.strategy.toUpperCase()} deployed!<br>
+         <span style="font-size:11px">${result.alpacaMsg}</span><br>
+         <span style="font-size:11px;color:var(--muted)">Restart the bot (<code>node bot-stream.js</code>) to pick up the new params.</span>`;
+    } else {
+      el.className = 'inject-result err';
+      el.textContent = '✗ ' + (result.error || 'Deploy failed');
+    }
+    el.style.display = '';
+  } catch (e) {
+    const el = document.getElementById('deploy-result');
+    el.className = 'inject-result err';
+    el.textContent = '✗ ' + e.message;
+    el.style.display = '';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Deploy to Alpaca';
   }
 }
 

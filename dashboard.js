@@ -1,10 +1,10 @@
 import express from "express";
 import fetch from "node-fetch";
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import "dotenv/config";
-import { runBacktest } from "./backtest.js";
+import { runBacktest, fetchCandles } from "./backtest.js";
 import { injectPineScript } from "./tv-inject.js";
 import { meta as orbMeta }      from "./strategies/orb.js";
 import { meta as vwapMeta }     from "./strategies/vwap.js";
@@ -15,7 +15,7 @@ import { meta as hybridMeta }  from "./strategies/hybrid.js";
 import { fetchChain, fetchExpiryDates, fetchContracts } from "./options.js";
 import { AlpacaStream } from "./stream.js";
 import { loadAllLearning } from "./learner.js";
-import { runHermesAnalysis, loadAllInsights } from "./hermes.js";
+import { runHermesAnalysis, loadAllInsights, suggestParamChanges } from "./hermes.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app  = express();
@@ -213,6 +213,138 @@ app.get("/api/bot-status", (req, res) => {
     recentTrades: history.slice(-10).reverse(),
     learning,
   });
+});
+
+// ─── Backtest optimization loop ───────────────────────────────────────────────
+
+const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m" };
+const STRATEGY_META = { orb: orbMeta, vwap: vwapMeta, trend: trendMeta, meanrev: meanrevMeta, momentum: momentumMeta, hybrid: hybridMeta };
+
+function findBestIteration(iters) {
+  return iters.reduce((bestI, iter, i) => {
+    const pf  = v => v === "∞" ? 999 : (parseFloat(v) || 0);
+    const ret = v => parseFloat((v || "0").replace("R", "").replace("+", "")) || 0;
+    const a = iters[bestI].metrics, b = iter.metrics;
+    if (pf(b.profitFactor) > pf(a.profitFactor)) return i;
+    if (pf(b.profitFactor) === pf(a.profitFactor) && ret(b.totalReturnR) > ret(a.totalReturnR)) return i;
+    return bestI;
+  }, 0);
+}
+
+app.post("/api/backtest/optimize", async (req, res) => {
+  const { strategy, symbol, iterations = 5, mode, iv, dte, contracts, strikeInterval } = req.body;
+  if (!strategy || !symbol) return res.status(400).json({ error: "strategy and symbol required" });
+
+  const meta = STRATEGY_META[strategy];
+  if (!meta) return res.status(400).json({ error: `Unknown strategy: ${strategy}` });
+
+  const tf = TIMEFRAMES[strategy] || "1H";
+  const baseOpts = {
+    mode:           mode || "stock",
+    iv:             parseFloat(iv) / 100 || 0.25,
+    dteDays:        parseInt(dte)         || 7,
+    numContracts:   parseInt(contracts)   || 1,
+    strikeInterval: parseFloat(strikeInterval) || 1,
+  };
+
+  const iterCount = Math.min(Math.max(parseInt(iterations) || 5, 2), 8);
+  console.log(`[Optimize] ${strategy.toUpperCase()} on ${symbol} — ${iterCount} iterations`);
+
+  try {
+    // Fetch candles once; share across all iterations to avoid rate-limiting
+    const candles = await fetchCandles(symbol, tf);
+    console.log(`[Optimize] Got ${candles.length} candles for ${symbol}`);
+
+    let currentParams = { ...meta.params };
+    const iterResults = [];
+
+    for (let i = 0; i < iterCount; i++) {
+      const result = await runBacktest(strategy, symbol, { ...baseOpts, params: currentParams, _candles: candles });
+      const { candles: _c, equityCurve: _e, trades, ...metrics } = result;
+
+      const prevParams = i > 0 ? iterResults[i - 1].params : null;
+      const paramChanges = {};
+      if (prevParams) {
+        for (const [k, v] of Object.entries(currentParams)) {
+          if (prevParams[k] !== undefined && prevParams[k] !== v) paramChanges[k] = `${prevParams[k]} → ${v}`;
+        }
+      }
+
+      iterResults.push({
+        num: i + 1,
+        params:         { ...currentParams },
+        metrics,
+        tradeCount:     (trades || []).length,
+        paramChanges,
+        hermesReasoning: "",
+      });
+
+      if (i < iterCount - 1) {
+        const suggestion = await suggestParamChanges(strategy, currentParams, trades || [], i + 1);
+        iterResults[i].hermesReasoning = suggestion.reasoning;
+        currentParams = { ...currentParams, ...suggestion.changes };
+        console.log(`[Optimize] Iter ${i + 1} done → ${JSON.stringify(suggestion.changes)}`);
+      }
+    }
+
+    const bestIdx = findBestIteration(iterResults);
+    const output = {
+      strategy,
+      symbol,
+      iterations:    iterResults,
+      bestIteration: bestIdx + 1,
+      bestParams:    iterResults[bestIdx].params,
+      optimizedAt:   new Date().toISOString(),
+    };
+
+    const histFile = join(__dirname, "backtest-history.json");
+    let history = {};
+    try { if (existsSync(histFile)) history = JSON.parse(readFileSync(histFile, "utf8")); } catch {}
+    history[`${strategy}-${symbol}`] = output;
+    writeFileSync(histFile, JSON.stringify(history, null, 2));
+
+    res.json(output);
+  } catch (e) {
+    console.error("[Optimize] Error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/api/backtest/history", (req, res) => {
+  const histFile = join(__dirname, "backtest-history.json");
+  if (!existsSync(histFile)) return res.json({});
+  try { res.json(JSON.parse(readFileSync(histFile, "utf8"))); } catch { res.json({}); }
+});
+
+// ─── Deploy optimized params to bot ───────────────────────────────────────────
+
+app.post("/api/deploy", async (req, res) => {
+  const { strategy, params } = req.body;
+  if (!strategy || !params) return res.status(400).json({ error: "strategy and params required" });
+
+  const learnFile = join(__dirname, "learned-params.json");
+  let learned = {};
+  try { if (existsSync(learnFile)) learned = JSON.parse(readFileSync(learnFile, "utf8")); } catch {}
+
+  learned[strategy] = {
+    ...(learned[strategy] || {}),
+    params,
+    source:     "hermes-optimization",
+    deployedAt: new Date().toISOString(),
+  };
+  writeFileSync(learnFile, JSON.stringify(learned, null, 2));
+
+  let alpacaConnected = false, alpacaMsg = "";
+  try {
+    const acct = await alpaca("/v2/account");
+    alpacaConnected = true;
+    alpacaMsg = `Connected — account ${acct.account_number} (${acct.status})`;
+  } catch (e) {
+    alpacaMsg = `Alpaca unreachable: ${e.message} — params saved, bot will use them when it reconnects`;
+  }
+
+  console.log(`[Deploy] ${strategy.toUpperCase()} params saved →`, params);
+  res.json({ ok: true, strategy, params, alpacaConnected, alpacaMsg, deployedAt: learned[strategy].deployedAt });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────

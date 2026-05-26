@@ -16,7 +16,7 @@ import { meta as hybridMeta }  from "./strategies/hybrid.js";
 
 // ─── Market data ──────────────────────────────────────────────────────────────
 
-async function fetchCandles(symbol, interval) {
+export async function fetchCandles(symbol, interval) {
   const yahooMap = { "1m":"1m","5m":"5m","15m":"15m","30m":"30m","1H":"60m","4H":"60m","1D":"1d" };
   const rangeMap = { "1m":"7d","5m":"60d","15m":"60d","30m":"60d","60m":"60d","1d":"1y" };
   const yi = yahooMap[interval] || "60m";
@@ -836,10 +836,10 @@ export async function runBacktest(strategyId, symbol, opts = {}) {
   const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m" };
   const timeframe  = TIMEFRAMES[strategyId] || "1H";
   console.log(`Backtesting ${strategyId.toUpperCase()} on ${symbol} (${timeframe}) — mode: ${opts.mode || "stock"}`);
-  const candles = await fetchCandles(symbol, timeframe);
-  console.log(`  Got ${candles.length} candles`);
+  const candles = opts._candles || await fetchCandles(symbol, timeframe);
+  if (!opts._candles) console.log(`  Got ${candles.length} candles`);
 
-  const params = {}; // use strategy defaults
+  const params = opts.params || {};
   let trades;
   if      (strategyId === "orb")      trades = runORBBacktest(candles, params, opts);
   else if (strategyId === "vwap")     trades = runVWAPBacktest(candles, params, opts);

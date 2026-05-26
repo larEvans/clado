@@ -165,6 +165,185 @@ function ruleBasedAnalysis(trades) {
   };
 }
 
+// ── Parameter optimization helpers ───────────────────────────────────────────
+
+function getParamBounds(strategy) {
+  const B = {
+    orb: {
+      orbMinutes:       { min: 5,   max: 30,  step: 5    },
+      volumeMultiplier: { min: 1.0, max: 3.5, step: 0.1  },
+      maxRangePct:      { min: 0.3, max: 2.5, step: 0.1  },
+      rrRatio:          { min: 1.5, max: 5.0, step: 0.25 },
+    },
+    hybrid: {
+      orbMinutes:    { min: 5,   max: 30,  step: 5    },
+      volMultiplier: { min: 1.0, max: 3.5, step: 0.1  },
+      maxRangePct:   { min: 0.3, max: 2.5, step: 0.1  },
+      rrRatio:       { min: 1.5, max: 5.0, step: 0.25 },
+      emaPeriod:     { min: 5,   max: 20,  step: 1    },
+      emaSlowPeriod: { min: 14,  max: 50,  step: 1    },
+    },
+    vwap: {
+      emaPeriod:     { min: 3,   max: 20,  step: 1    },
+      rsiPeriod:     { min: 3,   max: 20,  step: 1    },
+      rsiOversold:   { min: 20,  max: 45,  step: 1    },
+      rsiOverbought: { min: 55,  max: 80,  step: 1    },
+      stopPct:       { min: 0.1, max: 1.5, step: 0.05 },
+      rrRatio:       { min: 1.5, max: 5.0, step: 0.25 },
+    },
+    trend: {
+      fastEMA:       { min: 5,   max: 20,  step: 1    },
+      slowEMA:       { min: 15,  max: 50,  step: 1    },
+      volMultiplier: { min: 1.0, max: 2.5, step: 0.1  },
+      atrMult:       { min: 1.0, max: 3.0, step: 0.25 },
+      rrRatio:       { min: 1.5, max: 4.0, step: 0.25 },
+    },
+    meanrev: {
+      bbPeriod:      { min: 10,  max: 50,  step: 5    },
+      bbMult:        { min: 1.5, max: 3.0, step: 0.25 },
+      rsiOversold:   { min: 20,  max: 45,  step: 5    },
+      rsiOverbought: { min: 55,  max: 80,  step: 5    },
+      maxHoldBars:   { min: 5,   max: 30,  step: 5    },
+    },
+    momentum: {
+      atrMult: { min: 1.0, max: 3.0, step: 0.25 },
+      rrRatio: { min: 1.5, max: 4.0, step: 0.25 },
+    },
+  };
+  return B[strategy] || {};
+}
+
+function clampParam(value, bound) {
+  if (!bound) return value;
+  const rounded = Math.round(Number(value) / bound.step) * bound.step;
+  return parseFloat(Math.min(Math.max(rounded, bound.min), bound.max).toFixed(4));
+}
+
+function ruleBasedParamSuggestion(strategy, currentParams, trades, iterNum) {
+  const bounds   = getParamBounds(strategy);
+  const losers   = trades.filter(t => (t.pnlR != null ? t.pnlR : (t.win ? 1 : -1)) <= 0);
+  const winners  = trades.filter(t => (t.pnlR != null ? t.pnlR : (t.win ? 1 : -1)) > 0);
+  const winRate  = trades.length > 0 ? winners.length / trades.length : 0;
+  const stopLoss = losers.filter(t => t.exitReason === "stop").length;
+  const timeouts = losers.filter(t => ["time", "eod", "timeout", "session_end"].includes(t.exitReason)).length;
+
+  const changes = {};
+  const reasons = [];
+  const phase   = iterNum % 3; // cycle through 3 adjustment strategies
+
+  const volKey = strategy === "orb" ? "volumeMultiplier" : "volMultiplier";
+
+  if (phase === 1 || stopLoss > losers.length * 0.6) {
+    if (bounds[volKey] && currentParams[volKey] != null) {
+      const v = clampParam(currentParams[volKey] + 0.2, bounds[volKey]);
+      if (v !== currentParams[volKey]) { changes[volKey] = v; reasons.push(`${volKey} ↑ to filter weak breakouts (${stopLoss}/${losers.length} hits stop)`); }
+    }
+    if (bounds.maxRangePct && currentParams.maxRangePct != null) {
+      const v = clampParam(currentParams.maxRangePct - 0.1, bounds.maxRangePct);
+      if (v !== currentParams.maxRangePct) { changes.maxRangePct = v; reasons.push("maxRangePct ↓ for tighter ORB quality"); }
+    }
+  }
+
+  if (phase === 2 || timeouts > losers.length * 0.5) {
+    if (bounds.rrRatio && currentParams.rrRatio != null) {
+      const v = clampParam(currentParams.rrRatio - 0.25, bounds.rrRatio);
+      if (v !== currentParams.rrRatio) { changes.rrRatio = v; reasons.push("rrRatio ↓ — targets were unreachable (timeout exits)"); }
+    }
+  }
+
+  if (phase === 0) {
+    if (winRate > 0.5 && bounds.rrRatio && currentParams.rrRatio != null) {
+      const v = clampParam(currentParams.rrRatio + 0.25, bounds.rrRatio);
+      if (v !== currentParams.rrRatio) { changes.rrRatio = v; reasons.push("rrRatio ↑ — solid win rate supports higher targets"); }
+    } else if (winRate <= 0.5 && bounds[volKey] && currentParams[volKey] != null) {
+      const v = clampParam(currentParams[volKey] + 0.1, bounds[volKey]);
+      if (v !== currentParams[volKey]) { changes[volKey] = v; reasons.push(`${volKey} ↑ — tighten further to reduce false signals`); }
+    }
+  }
+
+  if (strategy === "vwap" && winRate < 0.4 && bounds.rsiOversold && currentParams.rsiOversold != null) {
+    const v = clampParam(currentParams.rsiOversold - 3, bounds.rsiOversold);
+    if (v !== currentParams.rsiOversold) { changes.rsiOversold = v; reasons.push("rsiOversold ↓ for stricter oversold condition"); }
+  }
+  if (strategy === "trend" && winRate < 0.4 && bounds.atrMult && currentParams.atrMult != null) {
+    const v = clampParam(currentParams.atrMult + 0.25, bounds.atrMult);
+    if (v !== currentParams.atrMult) { changes.atrMult = v; reasons.push("atrMult ↑ for wider stops (reduce premature stop-outs)"); }
+  }
+
+  if (Object.keys(changes).length === 0 && bounds.rrRatio && currentParams.rrRatio != null) {
+    const delta = winRate > 0.5 ? 0.25 : -0.25;
+    const v = clampParam(currentParams.rrRatio + delta, bounds.rrRatio);
+    if (v !== currentParams.rrRatio) changes.rrRatio = v;
+    reasons.push(`Exploring rrRatio ${delta > 0 ? "↑" : "↓"} (${(winRate*100).toFixed(0)}% win rate)`);
+  }
+
+  return {
+    changes,
+    reasoning: reasons.join("; ") || "No dominant failure mode detected",
+    targetImprovement: winRate < 0.4 ? "Reduce stop-loss frequency" : "Extend winning trades",
+  };
+}
+
+function buildOptimizePrompt(strategy, currentParams, trades, iterNum) {
+  const losers  = trades.filter(t => (t.pnlR != null ? t.pnlR : (t.win ? 1 : -1)) <= 0);
+  const winners = trades.filter(t => (t.pnlR != null ? t.pnlR : (t.win ? 1 : -1)) > 0);
+  const winRate = trades.length > 0 ? (winners.length / trades.length * 100).toFixed(0) : "?";
+  const stopLoss = losers.filter(t => t.exitReason === "stop").length;
+  const timeouts = losers.filter(t => ["time", "eod", "timeout", "session_end"].includes(t.exitReason)).length;
+  const avgLoss  = losers.length > 0 ? (losers.reduce((s, t) => s + (t.pnlPct || 0), 0) / losers.length).toFixed(2) : "0";
+  const bounds   = getParamBounds(strategy);
+
+  return `You are a quant strategy optimizer. Suggest parameter changes for a ${strategy.toUpperCase()} strategy.
+
+Current Parameters:
+${Object.entries(currentParams).map(([k, v]) => `  ${k}: ${v}`).join("\n")}
+
+Backtest Performance (${trades.length} trades, optimization iteration ${iterNum}):
+- Win rate: ${winRate}% (${winners.length}W / ${losers.length}L)
+- Stop-loss exits: ${stopLoss}/${Math.max(losers.length, 1)} losses
+- Timeout exits: ${timeouts}/${Math.max(losers.length, 1)} losses
+- Average loss: ${avgLoss}%
+
+Valid parameter ranges:
+${Object.entries(bounds).map(([k, b]) => `  ${k}: ${b.min} to ${b.max} (step ${b.step})`).join("\n")}
+
+Suggest 1-3 parameter changes to improve win rate in iteration ${iterNum + 1}.
+Return ONLY valid JSON (no markdown):
+{"changes": {"paramName": numericValue}, "reasoning": "one sentence", "targetImprovement": "what this fixes"}`;
+}
+
+export async function suggestParamChanges(strategy, currentParams, trades, iterNum = 1) {
+  const prompt = buildOptimizePrompt(strategy, currentParams, trades, iterNum);
+  const bounds = getParamBounds(strategy);
+
+  function applyBounds(raw) {
+    if (!raw?.changes) return null;
+    const clamped = Object.fromEntries(
+      Object.entries(raw.changes)
+        .filter(([k]) => bounds[k] && currentParams[k] != null)
+        .map(([k, v]) => [k, clampParam(v, bounds[k])])
+    );
+    return { changes: clamped, reasoning: raw.reasoning || "", targetImprovement: raw.targetImprovement || "" };
+  }
+
+  if (process.env.OLLAMA_HOST) {
+    try {
+      const result = applyBounds(await callOllama(prompt));
+      if (result) { console.log("[Hermes] Param suggestion via Ollama"); return result; }
+    } catch (e) { console.warn("[Hermes] Ollama suggest error:", e.message); }
+  }
+
+  if (process.env.ANTHROPIC_API_KEY) {
+    try {
+      const result = applyBounds(await callClaude(prompt));
+      if (result) { console.log("[Hermes] Param suggestion via Claude"); return result; }
+    } catch (e) { console.warn("[Hermes] Claude suggest error:", e.message); }
+  }
+
+  console.log("[Hermes] Param suggestion via rule-based fallback");
+  return ruleBasedParamSuggestion(strategy, currentParams, trades, iterNum);
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 export async function runHermesAnalysis(strategy = "orb") {
