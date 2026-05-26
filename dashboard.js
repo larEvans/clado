@@ -21,7 +21,16 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const app  = express();
 const PORT = process.env.PORT || process.env.DASHBOARD_PORT || 3000;
 
-const ALPACA_BASE = process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets";
+// Normalise the configured base URL so trailing slashes and accidental
+// "/v2" suffixes don't produce 404s when concatenated with API paths.
+function normalizeAlpacaBase(raw) {
+  if (!raw) return "https://paper-api.alpaca.markets";
+  let b = raw.trim().replace(/\/+$/, ""); // drop trailing slashes
+  // If user pasted ".../v2" or ".../v2beta", strip the version segment.
+  b = b.replace(/\/v\d[^/]*$/, "");
+  return b;
+}
+const ALPACA_BASE = normalizeAlpacaBase(process.env.ALPACA_BASE_URL);
 const ALPACA_HEADERS = {
   "APCA-API-KEY-ID":     process.env.ALPACA_API_KEY,
   "APCA-API-SECRET-KEY": process.env.ALPACA_SECRET_KEY,
@@ -29,14 +38,73 @@ const ALPACA_HEADERS = {
 };
 
 async function alpaca(path) {
-  const res = await fetch(`${ALPACA_BASE}${path}`, { headers: ALPACA_HEADERS });
-  if (!res.ok) throw new Error(`Alpaca ${path} → ${res.status}`);
+  const url = `${ALPACA_BASE}${path}`;
+  const res = await fetch(url, { headers: ALPACA_HEADERS });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Alpaca ${path} → ${res.status} ${res.statusText}${body ? ": " + body.slice(0, 200) : ""}`);
+  }
   return res.json();
 }
 
 app.use(express.json());
 app.use(express.static(__dirname));
 app.get("/", (req, res) => res.sendFile(join(__dirname, "dashboard.html")));
+
+// ─── Diagnostics — visit /api/diag to see why account data is missing ────────
+app.get("/api/diag", async (req, res) => {
+  const keyId    = process.env.ALPACA_API_KEY    || "";
+  const keySec   = process.env.ALPACA_SECRET_KEY || "";
+  const baseRaw  = process.env.ALPACA_BASE_URL   || "";
+  const diag = {
+    env: {
+      ALPACA_API_KEY:    keyId    ? `set (len=${keyId.length}, starts ${keyId.slice(0, 4)}…)`    : "MISSING",
+      ALPACA_SECRET_KEY: keySec   ? `set (len=${keySec.length})`                                  : "MISSING",
+      ALPACA_BASE_URL:   baseRaw  || "(unset — using default)",
+      STRATEGY:          process.env.STRATEGY        || "(unset — defaults to orb)",
+      SYMBOL:            process.env.SYMBOL          || "(unset)",
+      PAPER_TRADING:     process.env.PAPER_TRADING   || "(unset)",
+    },
+    normalizedBase: ALPACA_BASE,
+    probe: { account: null, clock: null, error: null },
+    hints: [],
+  };
+
+  if (baseRaw && !/alpaca\.markets$/i.test(baseRaw.trim().replace(/\/+$/, "").replace(/\/v\d[^/]*$/, ""))) {
+    diag.hints.push(`ALPACA_BASE_URL value "${baseRaw}" doesn't end at an alpaca.markets host — should be "https://paper-api.alpaca.markets" (paper) or "https://api.alpaca.markets" (live)`);
+  }
+  if (baseRaw && /data\.alpaca/.test(baseRaw)) {
+    diag.hints.push(`ALPACA_BASE_URL points to data.alpaca.markets — this is the data API, not the trading API. Use https://paper-api.alpaca.markets for the dashboard's account/orders proxy.`);
+  }
+  if (baseRaw && /\/v\d/.test(baseRaw)) {
+    diag.hints.push(`ALPACA_BASE_URL ends in "/v2" — the dashboard already appends "/v2/...". Remove the version suffix from the env var.`);
+  }
+  if (baseRaw && /\/$/.test(baseRaw)) {
+    diag.hints.push(`ALPACA_BASE_URL has a trailing slash — strip it.`);
+  }
+  if (!keyId || !keySec) {
+    diag.hints.push("ALPACA_API_KEY or ALPACA_SECRET_KEY is missing on Railway — set both under Variables and redeploy.");
+  }
+
+  // Probe — try /v2/account and /v2/clock (clock works without auth scope issues)
+  try {
+    const acct = await alpaca("/v2/account");
+    diag.probe.account = { ok: true, status: acct.status, account_number: acct.account_number, equity: acct.equity };
+  } catch (e) {
+    diag.probe.error = e.message;
+  }
+  try {
+    const clockUrl = `${ALPACA_BASE}/v2/clock`;
+    const r = await fetch(clockUrl, { headers: ALPACA_HEADERS });
+    diag.probe.clock = { url: clockUrl, status: r.status, ok: r.ok };
+    if (!r.ok && r.status === 404) diag.hints.push(`Even /v2/clock 404s — base URL is wrong. Try ALPACA_BASE_URL=https://paper-api.alpaca.markets`);
+    if (r.status === 401 || r.status === 403) diag.hints.push(`Auth failed (${r.status}). Regenerate keys in Alpaca dashboard → Paper Trading → API Keys, then update Railway Variables.`);
+  } catch (e) {
+    diag.probe.clock = { error: e.message };
+  }
+
+  res.json(diag);
+});
 
 // ─── Alpaca proxy ─────────────────────────────────────────────────────────────
 
