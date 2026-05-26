@@ -54,6 +54,16 @@ export class AlpacaStream extends EventEmitter {
             // confirmed subscription — no action needed
             break;
           case "error":
+            if (msg.code === 406) {
+              // Connection limit — back off 60s so the old connection can expire
+              this.#retryDelay = 60_000;
+              console.warn("[Stream] Connection limit (406) — waiting 60s before retry");
+            }
+            if (msg.code === 402) {
+              // Auth failed — wrong credentials, stop retrying
+              this.#closing = true;
+              console.error("[Stream] Auth failed (402) — check ALPACA_API_KEY / ALPACA_SECRET_KEY");
+            }
             this.emit("error", new Error(`Alpaca stream: ${msg.msg} (code ${msg.code})`));
             break;
           case "b":

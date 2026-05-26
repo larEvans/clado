@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "node dashboard.js",
+    "startCommand": "node start.js",
     "healthcheckPath": "/api/strategies",
     "healthcheckTimeout": 30,
     "restartPolicyType": "ON_FAILURE",

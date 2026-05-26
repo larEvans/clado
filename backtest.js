@@ -17,20 +17,32 @@ import { meta as hybridMeta }  from "./strategies/hybrid.js";
 // ─── Market data ──────────────────────────────────────────────────────────────
 
 export async function fetchCandles(symbol, interval) {
-  const yahooMap = { "1m":"1m","5m":"5m","15m":"15m","30m":"30m","1H":"60m","4H":"60m","1D":"1d" };
-  const rangeMap = { "1m":"7d","5m":"60d","15m":"60d","30m":"60d","60m":"60d","1d":"1y" };
-  const yi = yahooMap[interval] || "60m";
-  const range = rangeMap[yi] || "60d";
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=${yi}&range=${range}`;
-  const res = await fetch(url, { headers:{ "User-Agent":"Mozilla/5.0" }, signal: AbortSignal.timeout(15000) });
-  if (!res.ok) throw new Error(`Yahoo Finance ${res.status} for ${symbol} — check the ticker symbol`);
-  const json = await res.json();
-  const r = json.chart?.result?.[0];
-  if (!r) throw new Error(`No data returned for ${symbol}`);
-  const { open, high, low, close, volume } = r.indicators.quote[0];
-  return r.timestamp
-    .map((t,i) => ({ time: t*1000, open: open[i], high: high[i], low: low[i], close: close[i], volume: volume[i]||0 }))
-    .filter(c => c.open != null && c.close != null && !isNaN(c.close));
+  const tfMap  = { "1m":"1Min","5m":"5Min","15m":"15Min","30m":"30Min","1H":"1Hour","4H":"4Hour","1D":"1Day" };
+  const dayMap = { "1Min":7,"5Min":60,"15Min":60,"30Min":60,"1Hour":365,"4Hour":365,"1Day":730 };
+  const tf   = tfMap[interval] || "1Hour";
+  const days = dayMap[tf] || 60;
+  const start = new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
+
+  const BASE    = "https://data.alpaca.markets";
+  const headers = {
+    "APCA-API-KEY-ID":     process.env.ALPACA_API_KEY,
+    "APCA-API-SECRET-KEY": process.env.ALPACA_SECRET_KEY,
+  };
+
+  const candles = [];
+  let nextToken = null;
+
+  do {
+    const qs = new URLSearchParams({ timeframe: tf, start, limit: "1000", adjustment: "split", feed: "iex", ...(nextToken && { page_token: nextToken }) });
+    const res = await fetch(`${BASE}/v2/stocks/${symbol}/bars?${qs}`, { headers, signal: AbortSignal.timeout(20_000) });
+    if (!res.ok) throw new Error(`Alpaca bars ${res.status} for ${symbol} — check the ticker`);
+    const json = await res.json();
+    for (const b of (json.bars || [])) candles.push({ time: new Date(b.t).getTime(), open: b.o, high: b.h, low: b.l, close: b.c, volume: b.v });
+    nextToken = json.next_page_token || null;
+  } while (nextToken && candles.length < 5_000);
+
+  if (candles.length === 0) throw new Error(`No data returned for ${symbol}`);
+  return candles;
 }
 
 // ─── Black-Scholes option pricing ────────────────────────────────────────────

@@ -175,16 +175,39 @@ function broadcastSSE(obj) {
   }
 }
 
-// Start Alpaca stream if credentials are present
-if (process.env.ALPACA_API_KEY && process.env.ALPACA_SECRET_KEY) {
-  const symbol     = process.env.SYMBOL || "SPY";
-  const liveStream = new AlpacaStream([symbol]);
-  liveStream.on("bar",   bar   => broadcastSSE({ type: "bar",   ...bar }));
-  liveStream.on("trade", trade => broadcastSSE({ type: "trade", ...trade }));
-  liveStream.on("connected",    () => console.log("Live price stream connected"));
-  liveStream.on("disconnected", () => console.log("Live price stream disconnected"));
-  liveStream.on("error",        err => console.warn("Live stream:", err.message));
-  liveStream.connect();
+// ─── Watchlist ────────────────────────────────────────────────────────────────
+
+app.get("/api/watchlist", async (req, res) => {
+  try {
+    const lists = await alpaca("/v2/watchlists");
+    if (!lists?.length) return res.json([]);
+    const detail = await alpaca(`/v2/watchlists/${lists[0].id}`);
+    res.json((detail.assets || []).map(a => a.symbol));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Live price stream (skipped when bot-stream.js owns the connection) ───────
+
+if (!process.env.NO_DASHBOARD_STREAM && process.env.ALPACA_API_KEY && process.env.ALPACA_SECRET_KEY) {
+  (async () => {
+    let symbols = [process.env.SYMBOL || "SPY"];
+    try {
+      const lists = await alpaca("/v2/watchlists");
+      if (lists?.length) {
+        const detail  = await alpaca(`/v2/watchlists/${lists[0].id}`);
+        const wl      = (detail.assets || []).map(a => a.symbol).filter(Boolean);
+        if (wl.length) { symbols = wl; console.log(`[Stream] Watchlist symbols: ${wl.join(", ")}`); }
+      }
+    } catch (e) { console.warn("[Stream] Watchlist fetch failed, using", symbols.join(","), "—", e.message); }
+
+    const liveStream = new AlpacaStream(symbols);
+    liveStream.on("bar",          bar   => broadcastSSE({ type: "bar",   ...bar }));
+    liveStream.on("trade",        trade => broadcastSSE({ type: "trade", ...trade }));
+    liveStream.on("connected",    ()    => console.log(`[Stream] Connected: ${symbols.join(", ")}`));
+    liveStream.on("disconnected", ()    => console.log("[Stream] Disconnected"));
+    liveStream.on("error",        err   => console.warn("[Stream]", err.message));
+    liveStream.connect();
+  })();
 }
 
 // ─── Bot status ────────────────────────────────────────────────────────────────
