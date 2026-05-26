@@ -117,6 +117,29 @@ function groupByDay(candles) {
     .map(([date, candles]) => ({ date, candles: candles.sort((a,b) => a.time-b.time) }));
 }
 
+// ─── Near-target early exit ──────────────────────────────────────────────────
+// Default: when price comes within 5% of the planned target distance, close
+// the trade at the near-target price. "Within 5%" = the trade has captured
+// 95% of the entry→target move, so we lock the win instead of waiting for the
+// exact tag. Configurable via NEAR_TARGET_PCT env var or per-call param.
+
+const DEFAULT_NEAR_TARGET_PCT = parseFloat(process.env.NEAR_TARGET_PCT || "5");
+
+export function nearTargetTrigger(side, entry, target, bar, pct = DEFAULT_NEAR_TARGET_PCT) {
+  if (!entry || !target || !bar) return null;
+  const dist  = Math.abs(target - entry);
+  if (dist <= 0) return null;
+  const ratio = Math.max(0, Math.min(1, (100 - pct) / 100)); // 0.95 for pct=5
+  if (side === "buy") {
+    const trigger = entry + dist * ratio;
+    if (bar.high >= trigger && bar.high < target) return trigger;
+  } else {
+    const trigger = entry - dist * ratio;
+    if (bar.low  <= trigger && bar.low  > target) return trigger;
+  }
+  return null;
+}
+
 // ─── Order Blocks (SMC liquidity zones) ──────────────────────────────────────
 //
 // An "order block" is the last opposite-direction candle before a strong
@@ -269,9 +292,17 @@ function runORBBacktest(allCandles, params, opts = {}) {
         if (side === "buy") {
           if (bar.low  <= stop)   { exitPrice = stop;   exitReason = "stop";   }
           else if (bar.high >= target) { exitPrice = target; exitReason = "target"; }
+          else {
+            const nt = nearTargetTrigger(side, entry, target, bar);
+            if (nt != null) { exitPrice = nt; exitReason = "near-target"; }
+          }
         } else {
           if (bar.high >= stop)   { exitPrice = stop;   exitReason = "stop";   }
           else if (bar.low  <= target) { exitPrice = target; exitReason = "target"; }
+          else {
+            const nt = nearTargetTrigger(side, entry, target, bar);
+            if (nt != null) { exitPrice = nt; exitReason = "near-target"; }
+          }
         }
         if (!exitPrice && bar.time >= sessEnd) { exitPrice = bar.close; exitReason = "time"; }
 
@@ -396,11 +427,19 @@ function runVWAPBacktest(allCandles, params, opts = {}) {
       if (side === "buy") {
         if (bar.low  <= stop)   { exitPrice = stop;   exitReason = "stop";     }
         else if (target && bar.high >= target) { exitPrice = target; exitReason = "target";   }
-        else if (flip)          { exitPrice = price;  exitReason = "bias_flip"; }
+        else if (target) {
+          const nt = nearTargetTrigger(side, entry, target, bar);
+          if (nt != null) { exitPrice = nt; exitReason = "near-target"; }
+        }
+        if (!exitPrice && flip) { exitPrice = price;  exitReason = "bias_flip"; }
       } else {
         if (bar.high >= stop)   { exitPrice = stop;   exitReason = "stop";     }
         else if (target && bar.low  <= target) { exitPrice = target; exitReason = "target";   }
-        else if (flip)          { exitPrice = price;  exitReason = "bias_flip"; }
+        else if (target) {
+          const nt = nearTargetTrigger(side, entry, target, bar);
+          if (nt != null) { exitPrice = nt; exitReason = "near-target"; }
+        }
+        if (!exitPrice && flip) { exitPrice = price;  exitReason = "bias_flip"; }
       }
 
       if (exitPrice) {
@@ -524,9 +563,17 @@ function dailyExit(trade, bar, mode, iv, numContracts) {
   if (side === "buy") {
     if (bar.low  <= stop)   { exitPrice = stop;   exitReason = "stop"; }
     else if (bar.high >= target) { exitPrice = target; exitReason = "target"; }
+    else {
+      const nt = nearTargetTrigger(side, entry, target, bar);
+      if (nt != null) { exitPrice = nt; exitReason = "near-target"; }
+    }
   } else {
     if (bar.high >= stop)   { exitPrice = stop;   exitReason = "stop"; }
     else if (bar.low  <= target) { exitPrice = target; exitReason = "target"; }
+    else {
+      const nt = nearTargetTrigger(side, entry, target, bar);
+      if (nt != null) { exitPrice = nt; exitReason = "near-target"; }
+    }
   }
   if (!exitPrice) return null;
 
@@ -772,9 +819,17 @@ function runReversalBacktest(allCandles, params = {}, opts = {}) {
       if (side === "buy") {
         if (bar.low  <= openTrade.stop) { exitPrice = openTrade.stop; exitReason = "trail-stop"; }
         else if (bar.high >= target)    { exitPrice = target;         exitReason = "target"; }
+        else {
+          const nt = nearTargetTrigger(side, entry, target, bar);
+          if (nt != null) { exitPrice = nt; exitReason = "near-target"; }
+        }
       } else {
         if (bar.high >= openTrade.stop) { exitPrice = openTrade.stop; exitReason = "trail-stop"; }
         else if (bar.low  <= target)    { exitPrice = target;         exitReason = "target"; }
+        else {
+          const nt = nearTargetTrigger(side, entry, target, bar);
+          if (nt != null) { exitPrice = nt; exitReason = "near-target"; }
+        }
       }
 
       if (exitPrice) {
@@ -979,9 +1034,17 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
         if (side === "buy") {
           if (bar.low  <= stop)   { exitPrice = stop;   exitReason = "stop";   }
           if (bar.high >= target) { exitPrice = target; exitReason = "target"; }
+          if (!exitPrice) {
+            const nt = nearTargetTrigger(side, entry, target, bar);
+            if (nt != null) { exitPrice = nt; exitReason = "near-target"; }
+          }
         } else {
           if (bar.high >= stop)   { exitPrice = stop;   exitReason = "stop";   }
           if (bar.low  <= target) { exitPrice = target; exitReason = "target"; }
+          if (!exitPrice) {
+            const nt = nearTargetTrigger(side, entry, target, bar);
+            if (nt != null) { exitPrice = nt; exitReason = "near-target"; }
+          }
         }
         // EOD: only force-close if NOT holding overnight or conditions aren't met.
         if (!exitPrice && bar.time >= sessEnd) {
@@ -1112,9 +1175,17 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
         if (side === "buy") {
           if (bar.low  <= stop)   { exitPrice = stop;   exitReason = "stop";   }
           if (bar.high >= target) { exitPrice = target; exitReason = "target"; }
+          if (!exitPrice) {
+            const nt = nearTargetTrigger(side, price, target, bar);
+            if (nt != null) { exitPrice = nt; exitReason = "near-target"; }
+          }
         } else {
           if (bar.high >= stop)   { exitPrice = stop;   exitReason = "stop";   }
           if (bar.low  <= target) { exitPrice = target; exitReason = "target"; }
+          if (!exitPrice) {
+            const nt = nearTargetTrigger(side, price, target, bar);
+            if (nt != null) { exitPrice = nt; exitReason = "near-target"; }
+          }
         }
         if (!exitPrice && bar.time >= sessEnd) { exitPrice = bar.close; exitReason = "time"; }
         if (exitPrice) {
@@ -1239,9 +1310,17 @@ function runHybridReversalBacktest(allCandles, params = {}, opts = {}) {
         if (openTrade.side === "buy") {
           if (bar.low  <= openTrade.stop) { exitPrice = openTrade.stop; exitReason = "trail-stop"; }
           else if (bar.high >= openTrade.target) { exitPrice = openTrade.target; exitReason = "target"; }
+          else {
+            const nt = nearTargetTrigger(openTrade.side, openTrade.entry, openTrade.target, bar);
+            if (nt != null) { exitPrice = nt; exitReason = "near-target"; }
+          }
         } else {
           if (bar.high >= openTrade.stop) { exitPrice = openTrade.stop; exitReason = "trail-stop"; }
           else if (bar.low  <= openTrade.target) { exitPrice = openTrade.target; exitReason = "target"; }
+          else {
+            const nt = nearTargetTrigger(openTrade.side, openTrade.entry, openTrade.target, bar);
+            if (nt != null) { exitPrice = nt; exitReason = "near-target"; }
+          }
         }
         if (!exitPrice && bar.time >= sessEnd) { exitPrice = bar.close; exitReason = "time"; }
         if (exitPrice) {

@@ -19,7 +19,7 @@ import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import { AlpacaStream } from "./stream.js";
 import { getDefaultParams, loadLearnedParams, recordTradeClosed, runLearner } from "./learner.js";
-import { pickStop } from "./backtest.js";
+import { pickStop, nearTargetTrigger } from "./backtest.js";
 
 const SYMBOL      = (process.env.SYMBOL   || "SPY").toUpperCase();
 const STRATEGY    = (process.env.STRATEGY || "hybrid").toLowerCase();
@@ -444,6 +444,13 @@ async function onBar(bar) {
     } else {
       if (bar.high >= pos.stop)   { exitReason = "stop";   exitPrice = pos.stop;   }
       if (bar.low  <= pos.target) { exitReason = "target"; exitPrice = pos.target; }
+    }
+
+    // Near-target early exit: if price comes within 5% of the planned target,
+    // lock in the win rather than waiting for the exact tag.
+    if (!exitReason) {
+      const nt = nearTargetTrigger(pos.side, pos.entry, pos.target, bar);
+      if (nt != null) { exitReason = "near-target"; exitPrice = nt; }
     }
 
     if (exitReason) {
