@@ -58,11 +58,20 @@ export function getDefaultParams(strategy) {
   return { ...(DEFAULTS[strategy] || {}) };
 }
 
-export function loadLearnedParams(strategy) {
+/**
+ * Load tuned params for a strategy. When `regime` is provided, prefer the
+ * per-regime tuned params (byRegime[regime].params); fall back to the global
+ * params; fall back to DEFAULTS. Backward compatible with old learned-params
+ * files that don't have byRegime.
+ */
+export function loadLearnedParams(strategy, regime = null) {
   if (!existsSync(PARAMS_FILE)) return null;
   try {
-    const all = JSON.parse(readFileSync(PARAMS_FILE, "utf8"));
-    return all[strategy]?.params || null;
+    const all  = JSON.parse(readFileSync(PARAMS_FILE, "utf8"));
+    const slot = all[strategy];
+    if (!slot) return null;
+    if (regime && slot.byRegime?.[regime]?.params) return slot.byRegime[regime].params;
+    return slot.params || null;
   } catch { return null; }
 }
 
@@ -71,12 +80,84 @@ export function loadAllLearning() {
   try { return JSON.parse(readFileSync(PARAMS_FILE, "utf8")); } catch { return {}; }
 }
 
+/**
+ * Per-regime stats lookup. Returns { winRate, sampleSize, avgPnl } for a
+ * given strategy + regime, or null if no data yet. Computed fresh from
+ * trade-history.json so it reflects every recorded trade.
+ */
+export function getRegimeStats(strategy, regime) {
+  if (!existsSync(HISTORY_FILE)) return null;
+  let history = [];
+  try { history = JSON.parse(readFileSync(HISTORY_FILE, "utf8")); } catch { return null; }
+  const sub = history.filter(t => t.strategy === strategy && t.regime === regime);
+  if (sub.length === 0) return null;
+  const wins   = sub.filter(t => t.win || (t.pnlPct ?? 0) > 0).length;
+  const avgPnl = sub.reduce((s, t) => s + (t.pnlPct || 0), 0) / sub.length;
+  return {
+    winRate:    wins / sub.length,
+    sampleSize: sub.length,
+    avgPnl:     +avgPnl.toFixed(4),
+  };
+}
+
+/**
+ * Get the full per-strategy regime stats table. Used by /api/router/state
+ * to render the heatmap.
+ */
+export function getAllRegimeStats() {
+  if (!existsSync(HISTORY_FILE)) return {};
+  let history = [];
+  try { history = JSON.parse(readFileSync(HISTORY_FILE, "utf8")); } catch { return {}; }
+  const out = {};
+  for (const t of history) {
+    if (!t.strategy || !t.regime) continue;
+    out[t.strategy] = out[t.strategy] || {};
+    const slot = out[t.strategy][t.regime] = out[t.strategy][t.regime] || { wins: 0, total: 0, sumPnl: 0 };
+    slot.total += 1;
+    slot.sumPnl += (t.pnlPct || 0);
+    if (t.win || (t.pnlPct ?? 0) > 0) slot.wins += 1;
+  }
+  // Reduce to compact { winRate, sampleSize, avgPnl } per cell.
+  const summary = {};
+  for (const [strat, regimes] of Object.entries(out)) {
+    summary[strat] = {};
+    for (const [reg, s] of Object.entries(regimes)) {
+      summary[strat][reg] = {
+        winRate:    s.total > 0 ? +(s.wins / s.total).toFixed(3) : 0,
+        sampleSize: s.total,
+        avgPnl:     s.total > 0 ? +(s.sumPnl / s.total).toFixed(4) : 0,
+      };
+    }
+  }
+  return summary;
+}
+
+/**
+ * Persist per-regime params into learned-params.json under byRegime[regime].
+ * Called by the optimize-by-regime endpoint.
+ */
+export function saveRegimeParams(strategy, regime, params, stats = {}) {
+  let all = {};
+  try { if (existsSync(PARAMS_FILE)) all = JSON.parse(readFileSync(PARAMS_FILE, "utf8")); } catch {}
+  all[strategy] = all[strategy] || {};
+  all[strategy].byRegime = all[strategy].byRegime || {};
+  all[strategy].byRegime[regime] = {
+    params,
+    winRate:    stats.winRate    ?? null,
+    sampleSize: stats.sampleSize ?? null,
+    avgPnl:     stats.avgPnl     ?? null,
+    updatedAt:  new Date().toISOString(),
+  };
+  writeFileSync(PARAMS_FILE, JSON.stringify(all, null, 2));
+}
+
 // ── Record a closed trade ─────────────────────────────────────────────────────
 
 export function recordTradeClosed({
   symbol, strategy, side,
   entryPrice, exitPrice,
   entryTime, exitTime, exitReason,
+  regime = null, hourET = null,
 }) {
   let history = [];
   if (existsSync(HISTORY_FILE)) {
@@ -89,12 +170,20 @@ export function recordTradeClosed({
 
   const win = pnlPct > 0;
 
+  // Derive hourET if not provided
+  if (hourET == null && entryTime) {
+    const d = new Date(entryTime);
+    const offsetMin = (d.getUTCMonth() >= 2 && d.getUTCMonth() <= 10) ? -240 : -300;
+    hourET = new Date(d.getTime() + offsetMin * 60_000).getUTCHours();
+  }
+
   history.push({
     symbol, strategy, side,
     entryPrice, exitPrice,
     pnlPct:    +pnlPct.toFixed(4),
     win,
     entryTime, exitTime, exitReason,
+    regime, hourET,
     recordedAt: new Date().toISOString(),
   });
 

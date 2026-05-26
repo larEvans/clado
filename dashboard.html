@@ -161,6 +161,7 @@
   <div class="tab active" data-tab="account">Account</div>
   <div class="tab" data-tab="strategies">Strategies & Backtest</div>
   <div class="tab" data-tab="signals">Daily Signals</div>
+  <div class="tab" data-tab="router">Strategy Router</div>
   <div class="tab" data-tab="chart">Chart</div>
   <div class="tab" data-tab="options">Options Chain</div>
 </div>
@@ -421,6 +422,35 @@
   <div id="ds-results" style="display:flex;flex-direction:column;gap:14px"></div>
 </div>
 
+<!-- ══ STRATEGY ROUTER PANEL ═════════════════════════════════════════════════ -->
+<div id="tab-router" class="panel">
+
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 18px;display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+    <div style="font-size:13px;color:var(--muted)">
+      The router classifies each symbol's regime, scores every active strategy by historical win rate in that regime, and picks the top-scoring entry. Diversification penalty applied to strategies already used today.
+    </div>
+    <div style="margin-left:auto;display:flex;gap:8px">
+      <button class="btn btn-primary"  onclick="bootstrapRouter()">Bootstrap from Backtest</button>
+      <button class="btn btn-hermes"   onclick="optimizeByRegime()">Optimize All by Regime</button>
+      <button class="btn btn-outline"  onclick="loadRouterState()">Refresh</button>
+    </div>
+  </div>
+
+  <div id="router-loading" style="display:none;text-align:center;color:var(--muted);padding:30px"><span class="spin">⟳</span> Working…</div>
+
+  <div class="section" style="padding:14px 18px">
+    <div class="section-header">Current Regime by Symbol</div>
+    <div id="router-symbols" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;padding:10px"></div>
+  </div>
+
+  <div class="section" style="padding:14px 18px">
+    <div class="section-header">Win-Rate Heatmap (strategy × regime)</div>
+    <div id="router-heatmap" style="padding:12px;overflow-x:auto"></div>
+  </div>
+
+  <div id="router-msg" style="font-size:12px;color:var(--muted);padding:8px 14px"></div>
+</div>
+
 <!-- ══ CHART PANEL ════════════════════════════════════════════════════════════ -->
 <div id="tab-chart" class="panel">
 
@@ -593,6 +623,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (tab.dataset.tab === 'strategies') loadStrategies();
     if (tab.dataset.tab === 'options')    initOptionsTab();
     if (tab.dataset.tab === 'signals')    initDailySignals();
+    if (tab.dataset.tab === 'router')     loadRouterState();
     if (tab.dataset.tab === 'chart')      initChartTab();
   });
 });
@@ -1719,6 +1750,113 @@ async function runDailySignals() {
   } catch (e) {
     document.getElementById('ds-loading').style.display = 'none';
     document.getElementById('ds-results').innerHTML = `<div style="color:var(--red);padding:14px">Error: ${e.message}</div>`;
+  }
+}
+
+// ─── Strategy Router tab ──────────────────────────────────────────────────────
+let routerState = null;
+
+async function loadRouterState() {
+  document.getElementById('router-loading').style.display = '';
+  document.getElementById('router-msg').textContent = '';
+  try {
+    const data = await fetch('/api/router/state').then(r => r.json());
+    document.getElementById('router-loading').style.display = 'none';
+    if (data.error) {
+      document.getElementById('router-msg').textContent = 'Error: ' + data.error;
+      return;
+    }
+    routerState = data;
+    renderRouterState(data);
+  } catch (e) {
+    document.getElementById('router-loading').style.display = 'none';
+    document.getElementById('router-msg').textContent = 'Request failed: ' + e.message;
+  }
+}
+
+function renderRouterState(d) {
+  // Per-symbol cards
+  const sym = d.perSymbol.map(s => {
+    const parts = s.parts || {};
+    const colorFor = t =>
+      t === 'trend-up'   ? '#22c55e' :
+      t === 'trend-down' ? '#ef4444' :
+      t === 'high-vol'   ? '#f59e0b' :
+      t === 'low-vol'    ? '#64748b' :
+      t === 'gap-up'     ? '#10b981' :
+      t === 'gap-down'   ? '#f87171' :
+      '#94a3b8';
+    const chip = (lbl, c) => `<span style="font-size:10px;padding:2px 6px;border-radius:3px;background:${c}22;color:${c};margin-right:4px">${lbl}</span>`;
+    const chips = Object.values(parts).filter(Boolean).map(p => chip(p, colorFor(p))).join('');
+    return `
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px 12px">
+        <div style="font-weight:600;font-size:14px;margin-bottom:6px">${s.symbol}</div>
+        <div style="font-family:monospace;font-size:11px;color:var(--muted);margin-bottom:6px">${s.regime}</div>
+        <div>${chips || '<span style="color:var(--muted);font-size:11px">no data</span>'}</div>
+      </div>`;
+  }).join('');
+  document.getElementById('router-symbols').innerHTML = sym || '<div style="color:var(--muted);padding:20px">No symbols</div>';
+
+  // Heatmap: strategies × regimes
+  const strategies = d.activeStrategies;
+  const regimeSet  = new Set();
+  for (const s of Object.values(d.regimeStats)) for (const r of Object.keys(s)) regimeSet.add(r);
+  const regimes = [...regimeSet].sort();
+
+  if (regimes.length === 0) {
+    document.getElementById('router-heatmap').innerHTML = `
+      <div style="color:var(--muted);padding:16px">
+        No regime stats yet — click <strong>Bootstrap from Backtest</strong> above to seed the table by running every active strategy across the watchlist.
+      </div>`;
+    return;
+  }
+
+  const head = '<tr><th>Strategy</th>' + regimes.map(r => `<th style="font-family:monospace;font-size:10px">${r}</th>`).join('') + '</tr>';
+  const rows = strategies.map(strat => {
+    const cells = regimes.map(reg => {
+      const cell = d.regimeStats[strat]?.[reg];
+      if (!cell || cell.sampleSize === 0) return '<td style="color:var(--muted);font-size:10px">—</td>';
+      const wr = cell.winRate;
+      const bg = wr >= 0.65 ? 'rgba(34,197,94,.18)' : wr >= 0.5 ? 'rgba(245,158,11,.15)' : 'rgba(239,68,68,.15)';
+      const cls = wr >= 0.5 ? 'pos' : 'neg';
+      return `<td style="background:${bg};text-align:center">
+        <div class="${cls}" style="font-weight:600">${(wr*100).toFixed(0)}%</div>
+        <div style="font-size:10px;color:var(--muted)">n=${cell.sampleSize}</div>
+      </td>`;
+    }).join('');
+    return `<tr><td><strong>${strat}</strong></td>${cells}</tr>`;
+  }).join('');
+  document.getElementById('router-heatmap').innerHTML = `<table style="border-collapse:collapse;width:100%"><thead>${head}</thead><tbody>${rows}</tbody></table>`;
+}
+
+async function bootstrapRouter() {
+  document.getElementById('router-loading').style.display = '';
+  document.getElementById('router-msg').textContent = 'Running each active strategy across every watchlist symbol — this can take a minute…';
+  try {
+    const data = await fetch('/api/router/backtest-all', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(r => r.json());
+    document.getElementById('router-loading').style.display = 'none';
+    if (data.error) { document.getElementById('router-msg').textContent = 'Error: ' + data.error; return; }
+    const totalTrades = (data.results||[]).reduce((s,r) => s + (r.trades||0), 0);
+    document.getElementById('router-msg').textContent = `Bootstrap complete: ${data.results.length} strategy×symbol runs, ${totalTrades} trades saved to history.`;
+    loadRouterState();
+  } catch (e) {
+    document.getElementById('router-loading').style.display = 'none';
+    document.getElementById('router-msg').textContent = 'Bootstrap failed: ' + e.message;
+  }
+}
+
+async function optimizeByRegime() {
+  document.getElementById('router-loading').style.display = '';
+  document.getElementById('router-msg').textContent = 'Optimizing each strategy × regime with ≥10 trades…';
+  try {
+    const data = await fetch('/api/router/optimize-by-regime', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(r => r.json());
+    document.getElementById('router-loading').style.display = 'none';
+    if (data.error) { document.getElementById('router-msg').textContent = 'Error: ' + data.error; return; }
+    document.getElementById('router-msg').textContent = `Optimized ${data.tuned.length} buckets. Bot will use the new regime-specific params on next signal.`;
+    loadRouterState();
+  } catch (e) {
+    document.getElementById('router-loading').style.display = 'none';
+    document.getElementById('router-msg').textContent = 'Optimize failed: ' + e.message;
   }
 }
 

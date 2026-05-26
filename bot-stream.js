@@ -20,6 +20,15 @@ import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import { AlpacaStream } from "./stream.js";
 import { getDefaultParams, loadLearnedParams, recordTradeClosed, runLearner } from "./learner.js";
 import { pickStop, nearTargetTrigger } from "./backtest.js";
+import { classifyRegime } from "./regime.js";
+import { chooseSignal }   from "./router.js";
+import { getRegimeStats } from "./learner.js";
+
+const ROUTER_ENABLED   = process.env.ROUTER_ENABLED === "true";
+const STRICT_ROUTER    = process.env.STRICT_ROUTER === "true";
+const ACTIVE_STRATS    = (process.env.ACTIVE_STRATEGIES || "hybrid,hybrid10,hybrid-reversal,reversal,vwap")
+  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+const MAX_CONCURRENT   = parseInt(process.env.MAX_CONCURRENT_POSITIONS || "5");
 
 const SYMBOL      = (process.env.SYMBOL   || "SPY").toUpperCase();
 const STRATEGY    = (process.env.STRATEGY || "hybrid").toLowerCase();
@@ -490,13 +499,240 @@ if (!process.env.ALPACA_API_KEY || !process.env.ALPACA_SECRET_KEY) {
 const startParams = loadLearnedParams(STRATEGY) || getDefaultParams(STRATEGY);
 console.log(`[Bot] Active ${STRATEGY} params:`, startParams);
 
-saveState({ symbol: SYMBOL, strategy: STRATEGY, botStarted: new Date().toISOString() });
+saveState({ symbol: SYMBOL, strategy: STRATEGY, botStarted: new Date().toISOString(), routerEnabled: ROUTER_ENABLED });
 
-const stream = new AlpacaStream([SYMBOL]);
+// ── Router mode: multi-symbol per-bar regime-based dispatch ─────────────────
+//
+// When ROUTER_ENABLED=true, the bot subscribes to every Alpaca watchlist
+// symbol, classifies each symbol's regime on every bar, asks each active
+// strategy's signal evaluator whether it wants to enter, and routes to the
+// strategy with the best historical win rate in that regime.
+//
+// Position state is tracked per symbol in routerStates Map.
+
+const routerStates = new Map(); // symbol → { bars, ema9, ema21, position, tradedToday, lastRegime, lastChoice }
+const ROUTER_STATE_FILE = "bot-router-state.json";
+
+function getSymState(sym) {
+  if (!routerStates.has(sym)) {
+    routerStates.set(sym, {
+      bars: [],
+      ema9: new RollingEMA(9),
+      ema21: new RollingEMA(21),
+      position: null,
+      tradedToday: false,
+      date: "",
+      lastRegime: null,
+      lastChoice: null,
+    });
+  }
+  return routerStates.get(sym);
+}
+
+function saveRouterState() {
+  const out = {};
+  for (const [sym, s] of routerStates.entries()) {
+    out[sym] = {
+      position:     s.position,
+      tradedToday:  s.tradedToday,
+      date:         s.date,
+      lastRegime:   s.lastRegime,
+      lastChoice:   s.lastChoice,
+      barCount:     s.bars.length,
+    };
+  }
+  try {
+    writeFileSync(ROUTER_STATE_FILE, JSON.stringify({
+      symbols: out,
+      strategiesFiredToday: [...(routerDay.strategiesFiredToday || [])],
+      date: routerDay.date,
+      updatedAt: new Date().toISOString(),
+    }, null, 2));
+  } catch (e) { console.warn("[Router] state save failed:", e.message); }
+}
+
+const routerDay = { date: "", strategiesFiredToday: new Set() };
+function resetRouterDayIfNew(today) {
+  if (routerDay.date !== today) {
+    routerDay.date = today;
+    routerDay.strategiesFiredToday = new Set();
+    for (const [, s] of routerStates.entries()) {
+      s.tradedToday = false;
+      s.date = today;
+    }
+  }
+}
+
+// Lookup helper for router scoring. Strategy×regime stats from history;
+// when regime is null, global per-strategy stats are returned.
+function routerStatsLookup(strategy, regime) {
+  if (regime) return getRegimeStats(strategy, regime);
+  // Global (all regimes) lookup
+  const all = getRegimeStats(strategy, null);
+  return all; // getRegimeStats returns per-regime only — null case yields null;
+}
+
+// Each strategy's signal evaluator wrapped to accept a per-symbol bar buffer.
+// evalORB and evalHybrid already accept barBuffer — wrap others.
+function candidateSignals(strategy, sym, barBuffer) {
+  try {
+    if (strategy === "hybrid"   || strategy === "hybrid10")  return evalHybrid(barBuffer);
+    if (strategy === "orb")                                  return evalORB(barBuffer);
+    // For strategies that aren't natively in this bot file yet, return null —
+    // they're still tracked in stats from backtests but live signals only fire
+    // for the two evaluators above.
+    return null;
+  } catch (e) {
+    console.warn(`[Router] ${strategy} eval error for ${sym}:`, e.message);
+    return null;
+  }
+}
+
+async function onRouterBar(bar) {
+  const sym = bar.symbol;
+  const s   = getSymState(sym);
+  s.bars.push(bar);
+  if (s.bars.length > 500) s.bars.shift();
+  s.ema9.update(bar.close);
+  s.ema21.update(bar.close);
+
+  const now    = new Date();
+  const etMins = etMinutesOf(now);
+  const today  = todayET(now);
+
+  if (etMins < MARKET_OPEN || etMins >= MARKET_CLOSE) return;
+  resetRouterDayIfNew(today);
+
+  // ── EOD close ─────────────────────────────────────────────────────────
+  if (etMins >= EOD_CLOSE && s.position) {
+    console.log(`[Router] ${sym} EOD — close @ $${bar.close.toFixed(2)}`);
+    await closeRouterPosition(sym, bar.close, "eod");
+    return;
+  }
+
+  // ── Manage open position (same exit logic as single-symbol path) ──────
+  if (s.position) {
+    const pos = s.position;
+    let exitPrice = null, exitReason = null;
+    if (pos.side === "buy") {
+      if (bar.low  <= pos.stop)   { exitReason = "stop";   exitPrice = pos.stop;   }
+      if (bar.high >= pos.target) { exitReason = "target"; exitPrice = pos.target; }
+    } else {
+      if (bar.high >= pos.stop)   { exitReason = "stop";   exitPrice = pos.stop;   }
+      if (bar.low  <= pos.target) { exitReason = "target"; exitPrice = pos.target; }
+    }
+    if (!exitReason) {
+      const nt = nearTargetTrigger(pos.side, pos.entry, pos.target, bar);
+      if (nt != null) { exitReason = "near-target"; exitPrice = nt; }
+    }
+    if (exitReason) {
+      console.log(`[Router] ${sym} exit: ${exitReason} @ $${exitPrice.toFixed(2)}`);
+      await closeRouterPosition(sym, exitPrice, exitReason);
+    }
+    saveRouterState();
+    return;
+  }
+
+  // ── Entry: classify regime, gather candidates, route ──────────────────
+  if (s.tradedToday) return;
+  if (etMins < ORB_READY) return;
+  if (s.bars.length < 20) return;
+
+  // Capacity check: don't exceed max concurrent positions
+  const openCount = [...routerStates.values()].filter(x => x.position).length;
+  if (openCount >= MAX_CONCURRENT) return;
+
+  const r = classifyRegime(s.bars);
+  s.lastRegime = r.tag;
+
+  const candidates = ACTIVE_STRATS.map(strategy => ({
+    strategy,
+    signal: candidateSignals(strategy, sym, s.bars),
+  }));
+
+  const decision = chooseSignal({
+    candidates,
+    regime:      r.tag,
+    statsLookup: routerStatsLookup,
+    todayState:  routerDay,
+    strict:      STRICT_ROUTER,
+  });
+  s.lastChoice = decision.chosen ? { strategy: decision.chosen.strategy, score: decision.chosen.score, winRate: decision.chosen.winRate, reason: decision.reason } : { reason: decision.reason };
+
+  if (!decision.chosen) { saveRouterState(); return; }
+
+  console.log(`[Router] ${sym} ${r.tag} → ${decision.reason}`);
+  await enterRouterTrade(sym, decision.chosen.strategy, decision.chosen.signal, bar, r.tag);
+  saveRouterState();
+}
+
+async function enterRouterTrade(sym, strategy, signal, bar, regime) {
+  const s = getSymState(sym);
+  const perPositionUSD = TRADE_USD / Math.min(MAX_CONCURRENT, routerStates.size || 1);
+  if (IS_PAPER) {
+    console.log(`[Router] PAPER ${signal.side.toUpperCase()} ${sym} via ${strategy} $${perPositionUSD.toFixed(2)} @ ~${bar.close.toFixed(2)} [regime: ${regime}]`);
+  } else {
+    try { await placeOrder(sym, signal.side, perPositionUSD); }
+    catch (e) { console.error(`[Router] ${sym} order failed:`, e.message); return; }
+  }
+  s.position = {
+    side:   signal.side,
+    entry:  signal.entry,
+    stop:   signal.stop,
+    target: signal.target,
+    strategy,
+    regime,
+    entryTime: new Date().toISOString(),
+    entryBar:  bar,
+  };
+  s.tradedToday = true;
+  routerDay.strategiesFiredToday.add(strategy);
+}
+
+async function closeRouterPosition(sym, exitPrice, exitReason) {
+  const s = getSymState(sym);
+  const pos = s.position;
+  if (!pos) return;
+  if (!IS_PAPER) {
+    try { await closeAlpacaPosition(sym); } catch (e) { console.error(`[Router] ${sym} close failed:`, e.message); }
+  }
+  const hourET = etMinutesOf(new Date(pos.entryTime || Date.now())) / 60 | 0;
+  recordTradeClosed({
+    symbol: sym, strategy: pos.strategy, side: pos.side,
+    entryPrice: pos.entry, exitPrice,
+    entryTime: pos.entryTime, exitTime: new Date().toISOString(),
+    exitReason,
+    regime: pos.regime,
+    hourET,
+  });
+  s.position = null;
+}
+
+// ── Wire up the stream ────────────────────────────────────────────────────────
+
+let resolvedSymbols = [SYMBOL];
+if (ROUTER_ENABLED) {
+  console.log(`[Router] ENABLED — strategies: ${ACTIVE_STRATS.join(", ")} — fetching watchlist…`);
+  try {
+    const wlRes = await fetch(`${ALPACA_BASE}/v2/watchlists`, { headers: ALPACA_HEADERS });
+    const wl    = wlRes.ok ? await wlRes.json() : [];
+    if (wl?.length) {
+      const detailRes = await fetch(`${ALPACA_BASE}/v2/watchlists/${wl[0].id}`, { headers: ALPACA_HEADERS });
+      const detail    = detailRes.ok ? await detailRes.json() : { assets: [] };
+      const syms      = (detail.assets || []).map(a => a.symbol).filter(Boolean);
+      if (syms.length) resolvedSymbols = syms;
+    }
+  } catch (e) { console.warn("[Router] watchlist fetch failed:", e.message); }
+  console.log(`[Router] subscribing to ${resolvedSymbols.length} symbols: ${resolvedSymbols.join(", ")}`);
+} else {
+  console.log(`[Bot] single-strategy mode (${STRATEGY} on ${SYMBOL}) — set ROUTER_ENABLED=true for multi-strategy routing`);
+}
+
+const stream = new AlpacaStream(resolvedSymbols);
 stream.on("connected",    () => console.log("[Bot] Stream connected and authenticated"));
 stream.on("disconnected", () => console.log("[Bot] Stream disconnected — auto-reconnecting"));
 stream.on("error",        err => console.error("[Bot] Stream error:", err.message));
-stream.on("bar",          onBar);
+stream.on("bar",          ROUTER_ENABLED ? onRouterBar : onBar);
 stream.connect();
 
 // Graceful shutdown

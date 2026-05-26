@@ -17,7 +17,8 @@ import { meta as hybridReversalMeta }  from "./strategies/hybrid-reversal.js";
 import { meta as hybrid10Meta }        from "./strategies/hybrid10.js";
 import { fetchChain, fetchExpiryDates, fetchContracts, getLiveOptionsParams } from "./options.js";
 import { AlpacaStream } from "./stream.js";
-import { loadAllLearning } from "./learner.js";
+import { loadAllLearning, getAllRegimeStats, saveRegimeParams, getRegimeStats } from "./learner.js";
+import { classifyRegime } from "./regime.js";
 import { runHermesAnalysis, loadAllInsights, suggestParamChanges, explainTrades, deriveWinOnlyFilters } from "./hermes.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -561,6 +562,157 @@ app.get("/api/daily-signals", async (req, res) => {
     });
   } catch (e) {
     console.error("[DailySignals] Error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Strategy Router ───────────────────────────────────────────────────────────
+
+const ACTIVE_FOR_ROUTER = () => (process.env.ACTIVE_STRATEGIES || "hybrid,hybrid10,hybrid-reversal,reversal,vwap")
+  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+
+// Current regime per watchlist symbol + per-strategy×regime stats heatmap.
+app.get("/api/router/state", async (req, res) => {
+  try {
+    // Resolve watchlist
+    let symbols;
+    try {
+      const lists = await alpaca("/v2/watchlists");
+      if (lists?.length) {
+        const detail = await alpaca(`/v2/watchlists/${lists[0].id}`);
+        symbols = (detail.assets || []).map(a => a.symbol).filter(Boolean);
+      }
+    } catch {}
+    if (!symbols?.length) symbols = [process.env.SYMBOL || "SPY"];
+
+    // For each symbol, fetch recent 5m bars (~5 days) and classify regime
+    const tf = "5m";
+    const perSymbol = await Promise.all(symbols.map(async sym => {
+      try {
+        const candles = await fetchCandles(sym, tf);
+        const recent  = candles.slice(-400); // last ~2.5 days of 5m bars
+        const r       = classifyRegime(recent);
+        return { symbol: sym, regime: r.tag, parts: r.parts };
+      } catch (e) {
+        return { symbol: sym, regime: "unknown", error: e.message };
+      }
+    }));
+
+    const regimeStats = getAllRegimeStats();
+    const activeStrategies = ACTIVE_FOR_ROUTER();
+
+    res.json({
+      symbols,
+      activeStrategies,
+      perSymbol,
+      regimeStats,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Run every active strategy across the watchlist for the historical window
+// available from Alpaca (~60 days of 5m bars). Saves trades into history so
+// the per-regime stats table populates. Required before going live.
+app.post("/api/router/backtest-all", async (req, res) => {
+  try {
+    const strategies = req.body?.strategies || ACTIVE_FOR_ROUTER();
+    let symbols      = req.body?.symbols;
+    if (!symbols) {
+      try {
+        const lists = await alpaca("/v2/watchlists");
+        if (lists?.length) {
+          const detail = await alpaca(`/v2/watchlists/${lists[0].id}`);
+          symbols = (detail.assets || []).map(a => a.symbol).filter(Boolean);
+        }
+      } catch {}
+      if (!symbols?.length) symbols = [process.env.SYMBOL || "SPY"];
+    }
+
+    console.log(`[Router] bootstrap: ${strategies.length} strategies × ${symbols.length} symbols`);
+    const results = [];
+    for (const strategy of strategies) {
+      for (const symbol of symbols) {
+        try {
+          const r = await runBacktest(strategy, symbol, {
+            mode:          "stock",
+            forceDaily:    strategy === "hybrid" || strategy === "hybrid10",
+            saveToHistory: true, // appended via the route's saveToHistory path
+          });
+          // /api/backtest's helper isn't directly available here, so write inline.
+          const recs = (r.trades || []).map(t => ({
+            symbol, strategy, side: t.side,
+            entryPrice: t.entry, exitPrice: t.exit,
+            pnlPct: +(t.pnlPct || 0).toFixed(4),
+            pnlR:   t.pnlR != null ? +t.pnlR.toFixed(3) : null,
+            win:    (t.pnlPct || 0) > 0,
+            entryTime: t.entryTime ? new Date(t.entryTime).toISOString() : null,
+            exitTime:  t.exitTime  ? new Date(t.exitTime).toISOString()  : null,
+            exitReason: t.exitReason,
+            regime:    t.regime || "unknown",
+            hourET:    t.hourET ?? null,
+            forced:    !!t.forced,
+            source:    "router-bootstrap",
+            recordedAt: new Date().toISOString(),
+          }));
+          appendToTradeHistory(recs);
+          results.push({ strategy, symbol, trades: recs.length });
+        } catch (e) {
+          results.push({ strategy, symbol, error: e.message });
+        }
+      }
+    }
+
+    res.json({
+      strategies, symbols,
+      results,
+      regimeStats: getAllRegimeStats(),
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("[Router] backtest-all error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// For each strategy × regime with ≥ minSamples historical trades, run the
+// Hermes optimizer on that bucket and persist the resulting tuned params.
+app.post("/api/router/optimize-by-regime", async (req, res) => {
+  try {
+    const strategies = req.body?.strategies || ACTIVE_FOR_ROUTER();
+    const minSamples = Math.max(parseInt(req.body?.minSamples) || 10, 5);
+    const stats      = getAllRegimeStats();
+    const tuned      = [];
+
+    for (const strategy of strategies) {
+      const regimes = stats[strategy] || {};
+      for (const [regime, s] of Object.entries(regimes)) {
+        if (s.sampleSize < minSamples) continue;
+        // Use Hermes's rule-based param suggester on this bucket.
+        // We don't have the subset's actual trades here; suggestParamChanges
+        // uses aggregate stats so we pass a synthetic trades array shape it accepts.
+        try {
+          const seedParams = STRATEGY_META[strategy]?.params || {};
+          // Fabricate a minimum-viable trades summary by re-loading history.
+          const histPath = join(__dirname, "trade-history.json");
+          let history = [];
+          try { history = JSON.parse(readFileSync(histPath, "utf8")); } catch {}
+          const subset = history.filter(t => t.strategy === strategy && t.regime === regime);
+          const suggestion = await suggestParamChanges(strategy, seedParams, subset, 1);
+          const newParams  = { ...seedParams, ...(suggestion.changes || {}) };
+          saveRegimeParams(strategy, regime, newParams, s);
+          tuned.push({ strategy, regime, samples: s.sampleSize, winRate: s.winRate, changes: suggestion.changes, reasoning: suggestion.reasoning });
+        } catch (e) {
+          tuned.push({ strategy, regime, error: e.message });
+        }
+      }
+    }
+
+    res.json({ tuned, generatedAt: new Date().toISOString() });
+  } catch (e) {
+    console.error("[Router] optimize-by-regime error:", e.message);
     res.status(500).json({ error: e.message });
   }
 });

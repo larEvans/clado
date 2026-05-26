@@ -16,6 +16,7 @@ import { meta as hybridMeta }  from "./strategies/hybrid.js";
 import { meta as reversalMeta } from "./strategies/reversal.js";
 import { meta as hybridReversalMeta } from "./strategies/hybrid-reversal.js";
 import { meta as hybrid10Meta }       from "./strategies/hybrid10.js";
+import { classifyRegime }              from "./regime.js";
 
 // ─── Market data ──────────────────────────────────────────────────────────────
 
@@ -1482,6 +1483,26 @@ export async function runBacktest(strategyId, symbol, opts = {}) {
   else if (strategyId === "hybrid-reversal") trades = runHybridReversalBacktest(candles, params, opts);
   else if (strategyId === "hybrid10") trades = runHybridBacktest(candles, { ...hybrid10Meta.params, ...params }, opts);
   else throw new Error(`Unknown strategy: ${strategyId}`);
+
+  // Tag each trade with the market regime at its entry time. Same classifier
+  // used live, so regime stats bucket consistently across backtest+live data.
+  // Slice candles up to entry so we don't peek into the future.
+  for (const t of trades) {
+    if (t.regime) continue;
+    if (!t.entryTime) continue;
+    const cutoff = candles.findIndex(c => c.time >= t.entryTime);
+    const slice  = cutoff > 0 ? candles.slice(Math.max(0, cutoff - 200), cutoff + 1) : candles.slice(0, 1);
+    try {
+      const r   = classifyRegime(slice);
+      t.regime  = r.tag;
+      t.regimeParts = r.parts;
+    } catch { t.regime = "unknown"; }
+    // Convenient ET hour for per-hour bucketing
+    const d = new Date(t.entryTime);
+    const offsetMin = (d.getUTCMonth() >= 2 && d.getUTCMonth() <= 10) ? -240 : -300;
+    const et = new Date(d.getTime() + offsetMin * 60_000);
+    t.hourET = et.getUTCHours();
+  }
 
   const metrics = calcMetrics(trades, opts.mode || "stock");
 
