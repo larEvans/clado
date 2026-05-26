@@ -14,6 +14,8 @@ import { meta as meanrevMeta } from "./strategies/meanrev.js";
 import { meta as momentumMeta } from "./strategies/momentum.js";
 import { meta as hybridMeta }  from "./strategies/hybrid.js";
 import { meta as reversalMeta } from "./strategies/reversal.js";
+import { meta as hybridReversalMeta } from "./strategies/hybrid-reversal.js";
+import { meta as hybrid10Meta }       from "./strategies/hybrid10.js";
 
 // ─── Market data ──────────────────────────────────────────────────────────────
 
@@ -867,14 +869,20 @@ function runReversalBacktest(allCandles, params = {}, opts = {}) {
 
 function runHybridBacktest(allCandles, params = {}, opts = {}) {
   const {
-    orbMinutes    = 15,
-    rrRatio       = 2.0,
-    volMultiplier = 1.3,
-    maxRangePct   = 1.0,
-    emaPeriod     = 9,
-    emaSlowPeriod = 21,
+    orbMinutes        = 15,
+    rrRatio           = 2.0,
+    volMultiplier     = 1.3,
+    maxRangePct       = 1.0,
+    emaPeriod         = 9,
+    emaSlowPeriod     = 21,
+    holdOvernight     = false,
+    minOvernightR     = 0.5,
+    closeRangePct     = 25,
+    overnightStopMult = 1.5,
+    atrPeriod         = 14,
   } = { ...hybridMeta.params, ...params };
   const { mode = "stock", iv = 0.18, dteDays = 7, numContracts = 1, strikeInterval = 1, forceDaily = false } = opts;
+  const atrArr = holdOvernight ? atrArray(allCandles, atrPeriod) : null;
 
   // Pre-compute EMAs across all candles (warm up with full history for accuracy)
   const closes       = allCandles.map(c => c.close);
@@ -884,6 +892,27 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
 
   const sessions = groupByDay(allCandles);
   const trades   = [];
+  // Position persists across sessions when holdOvernight is true and the
+  // EOD gap-continuation setup triggers.
+  let openTrade = null;
+
+  // Helper: does the day's close justify holding overnight?
+  const shouldHoldOvernight = (trade, sessBars) => {
+    if (!holdOvernight || !trade) return false;
+    const last = sessBars[sessBars.length - 1];
+    const dayHigh = Math.max(...sessBars.map(b => b.high));
+    const dayLow  = Math.min(...sessBars.map(b => b.low));
+    const range   = dayHigh - dayLow;
+    if (range <= 0) return false;
+    const risk    = Math.abs(trade.entry - trade.initialStop || trade.entry - trade.stop);
+    const pnlUSD  = trade.side === "buy" ? last.close - trade.entry : trade.entry - last.close;
+    const rProfit = risk > 0 ? pnlUSD / risk : 0;
+    if (rProfit < minOvernightR) return false;
+    const cutoff = (closeRangePct / 100) * range;
+    if (trade.side === "buy"  && last.close >= dayHigh - cutoff) return true;
+    if (trade.side === "sell" && last.close <= dayLow  + cutoff) return true;
+    return false;
+  };
 
   for (const { date, candles } of sessions) {
     const open    = nyseOpenMs(candles[0].time);
@@ -892,6 +921,40 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
 
     const sessCandles = candles.filter(c => c.time >= open && c.time < open + 7 * 3600_000);
     if (sessCandles.length < 4) continue;
+
+    // ── Carried-over trade: just manage exits this session, no new entries ──
+    if (openTrade) {
+      for (const bar of sessCandles) {
+        const { side, target } = openTrade;
+        let exitPrice = null, exitReason = null;
+        if (side === "buy") {
+          if (bar.low  <= openTrade.stop) { exitPrice = openTrade.stop; exitReason = "overnight-stop"; }
+          else if (bar.high >= target)    { exitPrice = target;         exitReason = "target"; }
+        } else {
+          if (bar.high >= openTrade.stop) { exitPrice = openTrade.stop; exitReason = "overnight-stop"; }
+          else if (bar.low  <= target)    { exitPrice = target;         exitReason = "target"; }
+        }
+        // After 11 AM ET on the next session, if still open, close it.
+        const elapsedMin = (bar.time - open) / 60_000;
+        if (!exitPrice && elapsedMin >= 90) { exitPrice = bar.close; exitReason = "next-session-close"; }
+        if (exitPrice) {
+          const risk   = Math.abs(openTrade.entry - (openTrade.initialStop || openTrade.stop));
+          const pnlUSD = side === "buy" ? exitPrice - openTrade.entry : openTrade.entry - exitPrice;
+          trades.push({
+            date, entryTime: openTrade.entryTime, exitTime: bar.time,
+            side, entry: openTrade.entry, stop: openTrade.stop, target,
+            exit: exitPrice, exitReason,
+            pnlR: risk > 0 ? pnlUSD / risk : 0, pnlPct: (pnlUSD / openTrade.entry) * 100,
+            stopSource: openTrade.stopSource || "overnight",
+            heldOvernight: true,
+          });
+          openTrade = null;
+          break;
+        }
+      }
+      // If still holding after this session, continue rolling; skip new entries.
+      if (openTrade) continue;
+    }
 
     const orbCandles = sessCandles.filter(c => c.time < orbEnd);
     if (orbCandles.length === 0) continue;
@@ -903,7 +966,6 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
     if ((orb.orbRange / mid) * 100 >= maxRangePct) continue;
 
     const postOrb      = sessCandles.filter(c => c.time >= orbEnd);
-    let openTrade      = null;
     let tradeEntered   = false;
 
     for (let i = 0; i < postOrb.length; i++) {
@@ -921,7 +983,21 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
           if (bar.high >= stop)   { exitPrice = stop;   exitReason = "stop";   }
           if (bar.low  <= target) { exitPrice = target; exitReason = "target"; }
         }
-        if (!exitPrice && bar.time >= sessEnd) { exitPrice = bar.close; exitReason = "time"; }
+        // EOD: only force-close if NOT holding overnight or conditions aren't met.
+        if (!exitPrice && bar.time >= sessEnd) {
+          if (holdOvernight && shouldHoldOvernight({ ...openTrade, initialStop: openTrade.initialStop || openTrade.stop }, sessCandles)) {
+            // Widen the stop for overnight; carry the position to next session.
+            const idxBar = timeToIdx.get(bar.time);
+            const a      = atrArr && idxBar != null ? atrArr[idxBar] : null;
+            if (a) {
+              if (side === "buy")  openTrade.stop = Math.min(openTrade.stop, bar.close - a * overnightStopMult);
+              else                 openTrade.stop = Math.max(openTrade.stop, bar.close + a * overnightStopMult);
+            }
+            openTrade.heldOvernight = true;
+            break; // exit the inner bar loop; carry to next session
+          }
+          exitPrice = bar.close; exitReason = "time";
+        }
 
         if (exitPrice) {
           const risk   = Math.abs(entry - stop);
@@ -1057,25 +1133,188 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
       }
     }
 
-    // Close any position still open at session end
+    // Close any position still open at session end — UNLESS overnight setup triggers.
     if (openTrade && postOrb.length > 0) {
-      const last   = postOrb[postOrb.length - 1];
-      const { side, entry, stop, entryTime } = openTrade;
-      const pnlUSD = side === "buy" ? last.close - entry : entry - last.close;
-      const risk   = Math.abs(entry - stop);
+      if (holdOvernight && shouldHoldOvernight({ ...openTrade, initialStop: openTrade.initialStop || openTrade.stop }, sessCandles)) {
+        // Widen the stop for the gap and carry to next session.
+        const last  = postOrb[postOrb.length - 1];
+        const idxL  = timeToIdx.get(last.time);
+        const a     = atrArr && idxL != null ? atrArr[idxL] : null;
+        if (a) {
+          if (openTrade.side === "buy") openTrade.stop = Math.min(openTrade.stop, last.close - a * overnightStopMult);
+          else                          openTrade.stop = Math.max(openTrade.stop, last.close + a * overnightStopMult);
+        }
+        openTrade.heldOvernight = true;
+        // Don't push — keep openTrade alive for next session
+      } else {
+        const last   = postOrb[postOrb.length - 1];
+        const { side, entry, stop, entryTime } = openTrade;
+        const pnlUSD = side === "buy" ? last.close - entry : entry - last.close;
+        const risk   = Math.abs(entry - stop);
 
-      let optResult = {};
-      if (mode === "options" && openTrade.entryPremium != null) {
-        const elapsed    = (last.time - entryTime) / 86_400_000;
-        const exitPremium = optionPremium(last.close, openTrade.optionStrike, Math.max(openTrade.entryDTE - elapsed, 0.01), iv, openTrade.optionType);
-        const optPnL     = (exitPremium - openTrade.entryPremium) * 100 * numContracts;
-        optResult = { optionType: openTrade.optionType, optionStrike: openTrade.optionStrike, entryPremium: openTrade.entryPremium, exitPremium, optionsPnL: optPnL, optionsPnLPct: openTrade.entryPremium > 0 ? ((exitPremium - openTrade.entryPremium) / openTrade.entryPremium) * 100 : 0, optionDTE: openTrade.entryDTE };
+        let optResult = {};
+        if (mode === "options" && openTrade.entryPremium != null) {
+          const elapsed    = (last.time - entryTime) / 86_400_000;
+          const exitPremium = optionPremium(last.close, openTrade.optionStrike, Math.max(openTrade.entryDTE - elapsed, 0.01), iv, openTrade.optionType);
+          const optPnL     = (exitPremium - openTrade.entryPremium) * 100 * numContracts;
+          optResult = { optionType: openTrade.optionType, optionStrike: openTrade.optionStrike, entryPremium: openTrade.entryPremium, exitPremium, optionsPnL: optPnL, optionsPnLPct: openTrade.entryPremium > 0 ? ((exitPremium - openTrade.entryPremium) / openTrade.entryPremium) * 100 : 0, optionDTE: openTrade.entryDTE };
+        }
+
+        trades.push({ date, entryTime, exitTime: last.time, side, entry, stop, target: openTrade.target, exit: last.close, exitReason: "time", pnlR: risk > 0 ? pnlUSD / risk : 0, pnlPct: (pnlUSD / entry) * 100, forced: openTrade.forced || false, stopSource: openTrade.stopSource || "orb-fallback", orderBlock: openTrade.orderBlock || null, ...optResult });
+        openTrade = null;
       }
-
-      trades.push({ date, entryTime, exitTime: last.time, side, entry, stop, target: openTrade.target, exit: last.close, exitReason: "time", pnlR: risk > 0 ? pnlUSD / risk : 0, pnlPct: (pnlUSD / entry) * 100, forced: openTrade.forced || false, stopSource: openTrade.stopSource || "orb-fallback", orderBlock: openTrade.orderBlock || null, ...optResult });
     }
   }
 
+  return trades;
+}
+
+// ─── Hybrid + Reversal combo — two entry paths under one ATR trailing stop ───
+
+function runHybridReversalBacktest(allCandles, params = {}, opts = {}) {
+  const {
+    orbMinutes    = 15,
+    rrRatio       = 2.0,
+    volMultiplier = 1.3,
+    maxRangePct   = 1.0,
+    emaPeriod     = 9,
+    emaSlowPeriod = 21,
+    rsiPeriod     = 14,
+    atrPeriod     = 14,
+    atrMult       = 1.5,
+    trailMult     = 1.0,
+    swingLookback = 10,
+    breakEvenR    = 1.0,
+  } = { ...hybridReversalMeta.params, ...params };
+  const { mode = "stock", iv = 0.18, dteDays = 7, numContracts = 1, strikeInterval = 1 } = opts;
+
+  const closes  = allCandles.map(c => c.close);
+  const ema9arr = emaFull(closes, emaPeriod);
+  const ema21arr = emaFull(closes, emaSlowPeriod);
+  const rsi     = rsiArray(closes, rsiPeriod);
+  const atr     = atrArray(allCandles, atrPeriod);
+  const timeToIdx = new Map(allCandles.map((c, i) => [c.time, i]));
+
+  const sessions = groupByDay(allCandles);
+  const trades   = [];
+
+  for (const { date, candles } of sessions) {
+    const open    = nyseOpenMs(candles[0].time);
+    const orbEnd  = open + orbMinutes * 60_000;
+    const sessEnd = open + 6.25 * 3600_000;
+    const sessCandles = candles.filter(c => c.time >= open && c.time < open + 7 * 3600_000);
+    if (sessCandles.length < 4) continue;
+    const orbCandles = sessCandles.filter(c => c.time < orbEnd);
+    if (orbCandles.length === 0) continue;
+    const orb = calcRange(orbCandles);
+    if (!orb) continue;
+    const mid = (orb.orbHigh + orb.orbLow) / 2;
+    if ((orb.orbRange / mid) * 100 >= maxRangePct) continue;
+    const postOrb = sessCandles.filter(c => c.time >= orbEnd);
+
+    let openTrade = null, tradeEntered = false;
+
+    for (let i = 0; i < postOrb.length; i++) {
+      const bar = postOrb[i];
+      const idx = timeToIdx.get(bar.time);
+      if (idx === undefined) continue;
+
+      // ── Trailing-stop exit management ────────────────────────────────────
+      if (openTrade) {
+        const a = atr[idx] || openTrade.atrAtEntry;
+        const trail = a * trailMult;
+        const initRisk = Math.abs(openTrade.entry - openTrade.initialStop);
+        if (openTrade.side === "buy") {
+          const newStop = bar.close - trail;
+          if (newStop > openTrade.stop) openTrade.stop = newStop;
+          const rProfit = (bar.close - openTrade.entry) / initRisk;
+          if (rProfit >= breakEvenR && openTrade.stop < openTrade.entry) openTrade.stop = openTrade.entry;
+        } else {
+          const newStop = bar.close + trail;
+          if (newStop < openTrade.stop) openTrade.stop = newStop;
+          const rProfit = (openTrade.entry - bar.close) / initRisk;
+          if (rProfit >= breakEvenR && openTrade.stop > openTrade.entry) openTrade.stop = openTrade.entry;
+        }
+        let exitPrice = null, exitReason = null;
+        if (openTrade.side === "buy") {
+          if (bar.low  <= openTrade.stop) { exitPrice = openTrade.stop; exitReason = "trail-stop"; }
+          else if (bar.high >= openTrade.target) { exitPrice = openTrade.target; exitReason = "target"; }
+        } else {
+          if (bar.high >= openTrade.stop) { exitPrice = openTrade.stop; exitReason = "trail-stop"; }
+          else if (bar.low  <= openTrade.target) { exitPrice = openTrade.target; exitReason = "target"; }
+        }
+        if (!exitPrice && bar.time >= sessEnd) { exitPrice = bar.close; exitReason = "time"; }
+        if (exitPrice) {
+          const pnlUSD = openTrade.side === "buy" ? exitPrice - openTrade.entry : openTrade.entry - exitPrice;
+          const pnlR   = initRisk > 0 ? pnlUSD / initRisk : 0;
+          let optResult = {};
+          if (mode === "options" && openTrade.entryPremium != null) {
+            const elapsed     = (bar.time - openTrade.entryTime) / 86_400_000;
+            const exitPremium = optionPremium(exitPrice, openTrade.optionStrike, Math.max(openTrade.entryDTE - elapsed, 0.01), iv, openTrade.optionType);
+            const optPnL      = (exitPremium - openTrade.entryPremium) * 100 * numContracts;
+            optResult = { optionType: openTrade.optionType, optionStrike: openTrade.optionStrike, entryPremium: openTrade.entryPremium, exitPremium, optionsPnL: optPnL, optionsPnLPct: openTrade.entryPremium > 0 ? ((exitPremium - openTrade.entryPremium) / openTrade.entryPremium) * 100 : 0, optionDTE: openTrade.entryDTE };
+          }
+          trades.push({
+            date, entryTime: openTrade.entryTime, exitTime: bar.time,
+            side: openTrade.side, entry: openTrade.entry, stop: openTrade.initialStop, trailStop: openTrade.stop, target: openTrade.target,
+            exit: exitPrice, exitReason, pnlR, pnlPct: (pnlUSD / openTrade.entry) * 100,
+            stopSource: "atr-trail", entrySignal: openTrade.entrySignal, ...optResult,
+          });
+          openTrade = null;
+        }
+        continue;
+      }
+      if (tradeEntered) continue;
+
+      const fastEMA = ema9arr[idx], slowEMA = ema21arr[idx];
+      if (!fastEMA || !slowEMA || !rsi[idx] || !atr[idx]) continue;
+      const vwap = sessionVWAP([...orbCandles, ...postOrb.slice(0, i + 1)]);
+      if (!vwap) continue;
+      const startIdx = Math.max(0, idx - 20);
+      const volSlice = allCandles.slice(startIdx, idx);
+      const volMA    = volSlice.length > 0 ? volSlice.reduce((s, b) => s + b.volume, 0) / volSlice.length : 0;
+      const volOK    = volMA > 0 && bar.volume >= volMA * volMultiplier;
+      const price    = bar.close;
+
+      // ── PATH A: Hybrid triple-confirmation ───────────────────────────────
+      let signal = null;
+      if (price > orb.orbHigh && price > vwap && fastEMA > slowEMA && volOK)      signal = { side: "buy",  source: "hybrid-breakout" };
+      else if (price < orb.orbLow && price < vwap && fastEMA < slowEMA && volOK) signal = { side: "sell", source: "hybrid-breakout" };
+
+      // ── PATH B: Reversal divergence ──────────────────────────────────────
+      if (!signal && idx > swingLookback) {
+        const win    = allCandles.slice(idx - swingLookback, idx + 1);
+        const rWin   = rsi.slice(idx - swingLookback, idx + 1);
+        let lowIdx = 0, highIdx = 0;
+        for (let k = 1; k < win.length - 1; k++) {
+          if (win[k].low  < win[lowIdx].low)   lowIdx  = k;
+          if (win[k].high > win[highIdx].high) highIdx = k;
+        }
+        const bullishDiv = bar.low  < win[lowIdx].low  && rsi[idx] > rWin[lowIdx]  && rsi[idx] < 50 && price > allCandles[idx - 1].close;
+        const bearishDiv = bar.high > win[highIdx].high && rsi[idx] < rWin[highIdx] && rsi[idx] > 50 && price < allCandles[idx - 1].close;
+        if (bullishDiv) signal = { side: "buy",  source: "reversal-div" };
+        if (bearishDiv) signal = { side: "sell", source: "reversal-div" };
+      }
+
+      if (!signal) continue;
+
+      // ATR-based initial stop + target
+      const initRisk    = atr[idx] * atrMult;
+      const initialStop = signal.side === "buy" ? price - initRisk : price + initRisk;
+      const target      = signal.side === "buy" ? price + initRisk * rrRatio : price - initRisk * rrRatio;
+
+      let optInfo = {};
+      if (mode === "options") {
+        const optionType   = signal.side === "buy" ? "call" : "put";
+        const optionStrike = atmStrike(price, strikeInterval);
+        const entryPremium = optionPremium(price, optionStrike, dteDays, iv, optionType);
+        optInfo = { optionType, optionStrike, entryPremium, entryDTE: dteDays };
+      }
+
+      openTrade = { side: signal.side, entry: price, initialStop, stop: initialStop, target, entryTime: bar.time, atrAtEntry: atr[idx], entrySignal: signal.source, ...optInfo };
+      tradeEntered = true;
+    }
+  }
   return trades;
 }
 
@@ -1146,7 +1385,7 @@ export function calcMetrics(trades, mode = "stock") {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export async function runBacktest(strategyId, symbol, opts = {}) {
-  const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m", reversal: "5m" };
+  const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m", reversal: "5m", "hybrid-reversal": "5m", hybrid10: "5m" };
   const timeframe  = TIMEFRAMES[strategyId] || "1H";
   console.log(`Backtesting ${strategyId.toUpperCase()} on ${symbol} (${timeframe}) — mode: ${opts.mode || "stock"}`);
   const candles = opts._candles || await fetchCandles(symbol, timeframe);
@@ -1161,6 +1400,8 @@ export async function runBacktest(strategyId, symbol, opts = {}) {
   else if (strategyId === "momentum") trades = runMomentumBacktest(candles, params, opts);
   else if (strategyId === "hybrid")   trades = runHybridBacktest(candles, params, opts);
   else if (strategyId === "reversal") trades = runReversalBacktest(candles, params, opts);
+  else if (strategyId === "hybrid-reversal") trades = runHybridReversalBacktest(candles, params, opts);
+  else if (strategyId === "hybrid10") trades = runHybridBacktest(candles, { ...hybrid10Meta.params, ...params }, opts);
   else throw new Error(`Unknown strategy: ${strategyId}`);
 
   const metrics = calcMetrics(trades, opts.mode || "stock");
