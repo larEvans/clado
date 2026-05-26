@@ -180,6 +180,65 @@ export async function selectContract(underlying, side, currentPrice, params = {}
   };
 }
 
+// ─── Live options environment (for backtests) ─────────────────────────────────
+//
+// Returns today's representative options environment for `symbol`: nearest
+// expiry's DTE and the ATM contract's implied vol. Used to drive Black-Scholes
+// in the backtest with values that match the current market instead of static
+// defaults. Falls back to sensible defaults if Alpaca data is unavailable.
+
+export async function getLiveOptionsParams(symbol, currentPrice) {
+  const fallback = { iv: 0.25, dteDays: 7, source: "fallback", strike: null, expiry: null };
+  try {
+    const expiries = await fetchExpiryDates(symbol);
+    if (!expiries?.length) return fallback;
+
+    // Prefer the nearest expiry ≥ 1 day out (today's expiry has near-zero theta value).
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const target = expiries
+      .map(d => ({ d, ms: new Date(d).getTime() }))
+      .filter(x => x.ms - today.getTime() >= 86_400_000)
+      [0]?.d || expiries[0];
+
+    const dteDays = Math.max(1, Math.round((new Date(target).getTime() - today.getTime()) / 86_400_000));
+
+    // ATM-ish snapshot — try call side first, fall back to put.
+    const pad = Math.max(currentPrice * 0.02, 1);
+    const snaps = await fetchSnapshots(symbol, {
+      type: "call",
+      expDate: target,
+      strikeGte: currentPrice - pad,
+      strikeLte: currentPrice + pad,
+    });
+
+    let iv = null;
+    let atmStrike = null;
+    for (const [sym, snap] of Object.entries(snaps)) {
+      const v = snap?.impliedVolatility ?? snap?.greeks?.iv ?? null;
+      if (v && v > 0) {
+        iv = v;
+        // Try to recover the strike from the OCC symbol (last 8 digits = strike × 1000)
+        const m = sym.match(/(\d{8})$/);
+        if (m) atmStrike = parseInt(m[1]) / 1000;
+        break;
+      }
+    }
+
+    if (!iv) return { ...fallback, dteDays, expiry: target, source: "alpaca-partial" };
+
+    return {
+      iv:        parseFloat(iv.toFixed(4)),
+      dteDays,
+      expiry:    target,
+      strike:    atmStrike,
+      source:    "alpaca",
+    };
+  } catch (e) {
+    return { ...fallback, error: e.message };
+  }
+}
+
 // ─── Order placement ──────────────────────────────────────────────────────────
 
 export async function placeOptionsOrder(symbol, side, qty) {

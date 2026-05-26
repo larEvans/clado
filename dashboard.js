@@ -12,10 +12,10 @@ import { meta as trendMeta }    from "./strategies/trend.js";
 import { meta as meanrevMeta }  from "./strategies/meanrev.js";
 import { meta as momentumMeta } from "./strategies/momentum.js";
 import { meta as hybridMeta }  from "./strategies/hybrid.js";
-import { fetchChain, fetchExpiryDates, fetchContracts } from "./options.js";
+import { fetchChain, fetchExpiryDates, fetchContracts, getLiveOptionsParams } from "./options.js";
 import { AlpacaStream } from "./stream.js";
 import { loadAllLearning } from "./learner.js";
-import { runHermesAnalysis, loadAllInsights, suggestParamChanges } from "./hermes.js";
+import { runHermesAnalysis, loadAllInsights, suggestParamChanges, explainTrades, deriveWinOnlyFilters } from "./hermes.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app  = express();
@@ -62,8 +62,17 @@ app.get("/api/bot-log", (req, res) => {
 
 // ─── Strategies ───────────────────────────────────────────────────────────────
 
+// Hybrid is the only active strategy. Pass ?all=1 to see the full catalog
+// (or set ACTIVE_STRATEGIES=orb,vwap,... in the environment to whitelist others).
 app.get("/api/strategies", (req, res) => {
-  res.json([orbMeta, vwapMeta, trendMeta, meanrevMeta, momentumMeta, hybridMeta]);
+  const all = [hybridMeta, orbMeta, vwapMeta, trendMeta, meanrevMeta, momentumMeta];
+  if (req.query?.all === "1") return res.json(all);
+  const whitelist = (process.env.ACTIVE_STRATEGIES || "hybrid")
+    .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  const active = all
+    .filter(m => whitelist.includes(m.id))
+    .map(m => ({ ...m, active: true }));
+  res.json(active);
 });
 
 // ─── Backtest ─────────────────────────────────────────────────────────────────
@@ -106,8 +115,16 @@ function appendToTradeHistory(records) {
   return records.length;
 }
 
+// Quote symbol's last trade for picking an ATM strike when fetching live options params.
+async function lastTradePrice(symbol) {
+  try {
+    const j = await (await fetch(`https://data.alpaca.markets/v2/stocks/${symbol}/trades/latest?feed=iex`, { headers: ALPACA_HEADERS, signal: AbortSignal.timeout(8000) })).json();
+    return j?.trade?.p || null;
+  } catch { return null; }
+}
+
 app.post("/api/backtest", async (req, res) => {
-  const { strategy, symbol, mode, iv, dte, contracts, strikeInterval, forceDaily, saveToHistory } = req.body;
+  const { strategy, symbol, mode, iv, dte, contracts, strikeInterval, forceDaily, saveToHistory, useLiveOptions } = req.body;
   if (!strategy || !symbol) return res.status(400).json({ error: "strategy and symbol required" });
   try {
     const opts = {
@@ -118,8 +135,22 @@ app.post("/api/backtest", async (req, res) => {
       strikeInterval: parseFloat(strikeInterval) || 1,
       forceDaily:     !!forceDaily,
     };
+
+    // If running in options mode, pull today's IV + DTE from Alpaca so the
+    // Black-Scholes math reflects the actual current options environment.
+    // Auto-enabled when caller doesn't pass explicit iv/dte, or when useLiveOptions=true.
+    if (opts.mode === "options" && (useLiveOptions || iv == null || dte == null)) {
+      const px = await lastTradePrice(symbol);
+      const live = await getLiveOptionsParams(symbol, px || 100);
+      if (live.iv)      opts.iv      = live.iv;
+      if (live.dteDays) opts.dteDays = live.dteDays;
+      opts.liveOptions = live;
+      console.log(`[Backtest] Live options env for ${symbol}: IV=${(opts.iv*100).toFixed(1)}% DTE=${opts.dteDays}d (${live.source})`);
+    }
+
     console.log(`Running backtest: ${strategy} on ${symbol} [${opts.mode}]${opts.forceDaily ? " forceDaily" : ""}`);
     const results = await runBacktest(strategy, symbol, opts);
+    if (opts.liveOptions) results.liveOptionsEnv = opts.liveOptions;
 
     // forceDaily implies the user wants every session's trade in order history.
     if (saveToHistory || forceDaily) {
@@ -193,10 +224,66 @@ app.get("/api/hermes", (req, res) => {
 });
 
 app.post("/api/hermes/analyze", async (req, res) => {
-  const strategy = req.body?.strategy || "orb";
+  const strategy = req.body?.strategy || "hybrid";
   try {
     const result = await runHermesAnalysis(strategy);
     res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Per-trade explainer — returns each recent trade with a one-line verdict
+// describing why it won or lost. Reads from trade-history.json.
+app.get("/api/hermes/explain-trades", (req, res) => {
+  const strategy = req.query?.strategy || "hybrid";
+  const limit    = Math.min(parseInt(req.query?.limit) || 50, 500);
+  const histFile = join(__dirname, "trade-history.json");
+  if (!existsSync(histFile)) return res.json({ trades: [], filters: { filters: [] }, message: "No trade history yet" });
+  try {
+    const all = JSON.parse(readFileSync(histFile, "utf8"));
+    const trades = all.filter(t => !strategy || t.strategy === strategy).slice(-limit);
+    const explained = explainTrades(trades);
+    const filters   = deriveWinOnlyFilters(trades);
+    res.json({
+      strategy,
+      tradeCount: trades.length,
+      summary: {
+        wins:   explained.filter(t => t.verdict === "GOOD").length,
+        losses: explained.filter(t => t.verdict === "BAD").length,
+      },
+      trades:  explained.slice().reverse(),
+      winOnlyFilters: filters,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Apply the win-only filters as live bot config so future entries skip the loser profile.
+app.post("/api/hermes/apply-filters", (req, res) => {
+  const strategy = req.body?.strategy || "hybrid";
+  const histFile = join(__dirname, "trade-history.json");
+  if (!existsSync(histFile)) return res.status(400).json({ error: "No trade history" });
+  try {
+    const all = JSON.parse(readFileSync(histFile, "utf8"));
+    const trades = all.filter(t => t.strategy === strategy);
+    const { filters, blockedLosers, totalLosers, estWinRateAfter } = deriveWinOnlyFilters(trades);
+
+    const learnFile = join(__dirname, "learned-params.json");
+    let learned = {};
+    try { if (existsSync(learnFile)) learned = JSON.parse(readFileSync(learnFile, "utf8")); } catch {}
+    learned[strategy] = {
+      ...(learned[strategy] || {}),
+      winOnlyFilters: filters,
+      filtersAppliedAt: new Date().toISOString(),
+      blockedLosers,
+      totalLosers,
+      estWinRateAfter,
+    };
+    writeFileSync(learnFile, JSON.stringify(learned, null, 2));
+    console.log(`[Hermes] Applied ${filters.length} win-only filters for ${strategy}`);
+    res.json({ ok: true, strategy, filters, blockedLosers, totalLosers, estWinRateAfter });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -344,6 +431,18 @@ app.post("/api/backtest/optimize", async (req, res) => {
     forceDaily:     !!forceDaily,
   };
 
+  // Pull today's IV/DTE from Alpaca for options-mode optimization runs.
+  let liveOptionsEnv = null;
+  if (baseOpts.mode === "options" && (req.body.useLiveOptions || iv == null || dte == null)) {
+    try {
+      const px = await lastTradePrice(symbol);
+      liveOptionsEnv = await getLiveOptionsParams(symbol, px || 100);
+      if (liveOptionsEnv.iv)      baseOpts.iv      = liveOptionsEnv.iv;
+      if (liveOptionsEnv.dteDays) baseOpts.dteDays = liveOptionsEnv.dteDays;
+      console.log(`[Optimize] Live options env for ${symbol}: IV=${(baseOpts.iv*100).toFixed(1)}% DTE=${baseOpts.dteDays}d (${liveOptionsEnv.source})`);
+    } catch (e) { console.warn("[Optimize] Live options fetch failed:", e.message); }
+  }
+
   const targetPct = targetReturnPct != null ? parseFloat(targetReturnPct) : null;
   const hardCap   = Math.min(Math.max(parseInt(maxIterations) || 25, 2), 50);
   const baseIters = Math.min(Math.max(parseInt(iterations) || 5, 2), 8);
@@ -424,6 +523,7 @@ app.post("/api/backtest/optimize", async (req, res) => {
       targetReturnPct: targetPct,
       targetReached,
       savedToHistory:  savedCount,
+      liveOptionsEnv,
       optimizedAt:   new Date().toISOString(),
     };
 

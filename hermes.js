@@ -344,6 +344,156 @@ export async function suggestParamChanges(strategy, currentParams, trades, iterN
   return ruleBasedParamSuggestion(strategy, currentParams, trades, iterNum);
 }
 
+// ── Per-trade explainer ──────────────────────────────────────────────────────
+//
+// For every trade in `trades`, return a short verdict explaining why it won
+// or lost based on its exit reason, hold time, and how it compared to the
+// cohort. Pure rule-based — no API needed — so it always runs.
+
+export function explainTrades(trades) {
+  if (!trades?.length) return [];
+
+  const winners = trades.filter(t => (t.pnlPct ?? t.pnlR ?? 0) > 0);
+  const losers  = trades.filter(t => (t.pnlPct ?? t.pnlR ?? 0) <= 0);
+  const wRate   = trades.length > 0 ? winners.length / trades.length : 0;
+
+  const avgWinPct  = winners.length ? winners.reduce((s, t) => s + (t.pnlPct || 0), 0) / winners.length : 0;
+  const avgLossPct = losers.length  ? losers.reduce((s, t)  => s + (t.pnlPct || 0), 0) / losers.length  : 0;
+
+  // Hold time (minutes), if we have entry/exit timestamps
+  const holdMin = (t) => {
+    const a = t.entryTime ? new Date(t.entryTime).getTime() : null;
+    const b = t.exitTime  ? new Date(t.exitTime).getTime()  : null;
+    return a && b ? Math.round((b - a) / 60000) : null;
+  };
+
+  return trades.map(t => {
+    const pnl   = t.pnlPct ?? (t.pnlR ?? 0);
+    const win   = pnl > 0;
+    const hold  = holdMin(t);
+    const reason = (t.exitReason || "").toLowerCase();
+    const reasons = [];
+    let verdict;
+
+    if (win) {
+      if (reason === "target")    reasons.push(`hit profit target (+${pnl.toFixed(2)}%)`);
+      else if (reason === "time") reasons.push(`closed in profit at session end (+${pnl.toFixed(2)}%)`);
+      else if (reason.includes("cross") || reason === "bias_flip") reasons.push(`exited on momentum flip (+${pnl.toFixed(2)}%)`);
+      else                        reasons.push(`closed in profit via ${reason || "exit"} (+${pnl.toFixed(2)}%)`);
+
+      if (hold != null && hold < 30) reasons.push(`quick win in ${hold}m — entry caught momentum early`);
+      else if (hold != null && hold > 180) reasons.push(`long hold (${hold}m) — patience paid off`);
+      if (pnl > avgWinPct * 1.5) reasons.push(`top-quartile winner (${pnl.toFixed(2)}% vs cohort avg ${avgWinPct.toFixed(2)}%)`);
+      verdict = "GOOD";
+    } else {
+      if (reason === "stop") reasons.push(`stop hit (${pnl.toFixed(2)}%) — entry was too close to invalidation`);
+      else if (reason === "time" || reason === "session_end" || reason === "eod" || reason === "timeout")
+        reasons.push(`timed out without reaching target (${pnl.toFixed(2)}%) — target may be unrealistic for the day's range`);
+      else if (reason === "bias_flip" || reason.includes("cross"))
+        reasons.push(`momentum flipped against us (${pnl.toFixed(2)}%)`);
+      else reasons.push(`closed at a loss via ${reason || "exit"} (${pnl.toFixed(2)}%)`);
+
+      if (hold != null && hold < 10) reasons.push(`stopped in ${hold}m — entered into immediate reversal`);
+      if (t.forced) reasons.push("entry was forced (no triple-confirmation) — known-lower-probability setup");
+      if (pnl < avgLossPct * 1.5) reasons.push(`worse-than-average loser (${pnl.toFixed(2)}% vs cohort avg ${avgLossPct.toFixed(2)}%)`);
+      verdict = "BAD";
+    }
+
+    return {
+      ...t,
+      verdict,
+      verdictReasons: reasons,
+      verdictText:    `${verdict}: ${reasons.join(" · ")}`,
+      cohortWinRate:  +(wRate * 100).toFixed(1),
+    };
+  });
+}
+
+// ── Win-only filter learner ──────────────────────────────────────────────────
+//
+// Examines actual losing trades and proposes parameter floors that would have
+// excluded most of them. Returns concrete filters the bot can apply to refuse
+// future entries that match the loser profile.
+
+export function deriveWinOnlyFilters(trades) {
+  if (!trades?.length) return { filters: [], blockedLosers: 0, totalLosers: 0 };
+  const winners = trades.filter(t => (t.pnlPct ?? t.pnlR ?? 0) > 0);
+  const losers  = trades.filter(t => (t.pnlPct ?? t.pnlR ?? 0) <= 0);
+
+  const filters = [];
+
+  // 1) Entry-hour filter — if losers cluster in a specific ET hour, block it.
+  const hourBuckets = {};
+  for (const t of trades) {
+    if (!t.entryTime) continue;
+    const d = new Date(t.entryTime);
+    // Convert to ET (approximate — backtest data is UTC, ET ≈ UTC-4/-5)
+    const etH = (d.getUTCHours() - 4 + 24) % 24;
+    hourBuckets[etH] = hourBuckets[etH] || { wins: 0, losses: 0 };
+    if ((t.pnlPct ?? t.pnlR ?? 0) > 0) hourBuckets[etH].wins++;
+    else hourBuckets[etH].losses++;
+  }
+  const badHours = Object.entries(hourBuckets)
+    .filter(([_h, b]) => b.losses >= 3 && b.losses > b.wins * 2)
+    .map(([h]) => parseInt(h));
+  if (badHours.length) {
+    filters.push({
+      type: "skip-entry-hours-ET",
+      value: badHours,
+      reason: `Hours with ≥3 losses AND loss:win ratio > 2:1 — skip new entries`,
+    });
+  }
+
+  // 2) Side bias — if one side accounts for the majority of losses, demand stricter confirmation for it.
+  const longL  = losers.filter(t => t.side === "buy").length;
+  const shortL = losers.filter(t => t.side === "sell").length;
+  if (longL > shortL * 2 && longL >= 4) {
+    filters.push({ type: "require-stronger-long", value: true, reason: `${longL} long losses vs ${shortL} short — demand extra confirmation on longs` });
+  } else if (shortL > longL * 2 && shortL >= 4) {
+    filters.push({ type: "require-stronger-short", value: true, reason: `${shortL} short losses vs ${longL} long — demand extra confirmation on shorts` });
+  }
+
+  // 3) Forced-entry block — if forced entries are net negative, block them outright.
+  const forcedAll = trades.filter(t => t.forced);
+  const forcedWin = forcedAll.filter(t => (t.pnlPct ?? t.pnlR ?? 0) > 0).length;
+  if (forcedAll.length >= 5 && forcedWin / forcedAll.length < 0.4) {
+    filters.push({
+      type: "disable-force-daily",
+      value: true,
+      reason: `Forced entries: ${forcedWin}/${forcedAll.length} wins (<40%) — disable forceDaily`,
+    });
+  }
+
+  // 4) Stop-distance floor — if most stop-outs happened with stops < median, widen the floor.
+  const stopOuts = losers.filter(t => t.exitReason === "stop" && t.entryPrice != null);
+  if (stopOuts.length >= 4) {
+    filters.push({
+      type: "raise-stop-distance",
+      value: "min 0.4% from entry",
+      reason: `${stopOuts.length} stops hit — current stops are too tight`,
+    });
+  }
+
+  // Estimate how many losers these filters would have blocked
+  const blockedLosers = losers.filter(t => {
+    if (badHours.length && t.entryTime) {
+      const etH = (new Date(t.entryTime).getUTCHours() - 4 + 24) % 24;
+      if (badHours.includes(etH)) return true;
+    }
+    if (t.forced && filters.some(f => f.type === "disable-force-daily")) return true;
+    return false;
+  }).length;
+
+  return {
+    filters,
+    blockedLosers,
+    totalLosers: losers.length,
+    estWinRateAfter: trades.length > 0
+      ? `${((winners.length / Math.max(trades.length - blockedLosers, 1)) * 100).toFixed(1)}%`
+      : "—",
+  };
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 export async function runHermesAnalysis(strategy = "orb") {
