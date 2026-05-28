@@ -5,6 +5,8 @@ import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import "dotenv/config";
 import { runBacktest, fetchCandles } from "./backtest.js";
+import { runCPCV } from "./cpcv.js";
+import { runAgentDebate } from "./agents.js";
 import { injectPineScript } from "./tv-inject.js";
 import { meta as orbMeta }      from "./strategies/orb.js";
 import { meta as vwapMeta }     from "./strategies/vwap.js";
@@ -566,6 +568,61 @@ app.get("/api/daily-signals", async (req, res) => {
   }
 });
 
+// ─── Agent debate preview ─────────────────────────────────────────────────────
+//
+// POST a trade candidate; get Bull / Bear / Risk-Manager verdicts back. Lets
+// the dashboard show a "What would the agents say?" preview before going live.
+
+app.post("/api/agents/preview", async (req, res) => {
+  const trade = req.body?.trade;
+  if (!trade || !trade.side) return res.status(400).json({ error: "trade.side required" });
+  try {
+    const ctx    = req.body?.context || {};
+    const result = await runAgentDebate(trade, ctx);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── CPCV (Combinatorial Purged Cross-Validation) ─────────────────────────────
+//
+// POST body: { strategy, symbol, K=6, N=2, purgeBars=20, metric="winRate" }
+// Returns: per-fold metrics, aggregate stats (mean, stddev, CV), PBO estimate,
+// and a verdict (ROBUST / OK / UNSTABLE / LIKELY_OVERFIT / INSUFFICIENT_DATA).
+
+app.post("/api/backtest/cpcv", async (req, res) => {
+  const { strategy, symbol, K = 6, N = 2, purgeBars = 20, metric = "winRate", mode = "stock", iv, dte, contracts } = req.body || {};
+  if (!strategy || !symbol) return res.status(400).json({ error: "strategy and symbol required" });
+
+  const meta = STRATEGY_META[strategy];
+  if (!meta) return res.status(400).json({ error: `Unknown strategy: ${strategy}` });
+
+  const tf      = TIMEFRAMES[strategy] || "5m";
+  const opts    = {
+    mode:           mode || "stock",
+    iv:             parseFloat(iv) / 100 || 0.25,
+    dteDays:        parseInt(dte)         || 7,
+    numContracts:   parseInt(contracts)   || 1,
+    forceDaily:     strategy === "hybrid" || strategy === "hybrid10",
+  };
+
+  try {
+    console.log(`[CPCV] ${strategy} on ${symbol} — K=${K} N=${N} purge=${purgeBars} metric=${metric}`);
+    const candles = await fetchCandles(symbol, tf);
+    const result  = await runCPCV(strategy, symbol, candles, {
+      K, N, purgeBars,
+      params: { ...meta.params },
+      opts,
+      metric,
+    });
+    res.json(result);
+  } catch (e) {
+    console.error("[CPCV] error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── Strategy Router ───────────────────────────────────────────────────────────
 
 const ACTIVE_FOR_ROUTER = () => (process.env.ACTIVE_STRATEGIES || "hybrid,hybrid10,hybrid-reversal,reversal,vwap")
@@ -606,6 +663,13 @@ app.get("/api/router/state", async (req, res) => {
       activeStrategies,
       perSymbol,
       regimeStats,
+      config: {
+        routerEnabled:        process.env.ROUTER_ENABLED === "true",
+        strictRouter:         process.env.STRICT_ROUTER === "true",
+        consensusMin:         Math.max(1, parseInt(process.env.CONSENSUS_MIN || "1")),
+        maxConcurrentPositions: parseInt(process.env.MAX_CONCURRENT_POSITIONS || "5"),
+        agentDebate:          process.env.AGENT_DEBATE === "true",
+      },
       generatedAt: new Date().toISOString(),
     });
   } catch (e) {

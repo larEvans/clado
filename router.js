@@ -36,13 +36,39 @@ function scoreCandidate(strategy, regime, statsLookup) {
   };
 }
 
-export function chooseSignal({ candidates, regime, statsLookup, todayState, strict = false }) {
+export function chooseSignal({ candidates, regime, statsLookup, todayState, strict = false, consensusMin = 1 }) {
   const live = (candidates || []).filter(c => c && c.signal);
   if (live.length === 0) return { chosen: null, ranking: [], reason: "no candidates fired" };
 
+  // CONSENSUS_MODE: require ≥ consensusMin strategies to agree on the same side
+  // before routing any trade. Quieter days, higher win rate per trade.
+  if (consensusMin > 1) {
+    const buys  = live.filter(c => c.signal.side === "buy").length;
+    const sells = live.filter(c => c.signal.side === "sell").length;
+    const majority = Math.max(buys, sells);
+    if (majority < consensusMin) {
+      return {
+        chosen:  null,
+        ranking: [],
+        reason:  `consensus not met: ${buys} buy / ${sells} sell candidates (need ≥${consensusMin} on one side)`,
+        consensus: { required: consensusMin, buys, sells, met: false },
+      };
+    }
+  }
+
   const fired = todayState?.strategiesFiredToday || new Set();
 
-  const ranking = live.map(c => {
+  // When consensus is required, narrow `live` to the majority side so we
+  // don't score the lone contrarian as the winner.
+  let pool = live;
+  if (consensusMin > 1) {
+    const buys  = live.filter(c => c.signal.side === "buy").length;
+    const sells = live.filter(c => c.signal.side === "sell").length;
+    const winSide = buys >= sells ? "buy" : "sell";
+    pool = live.filter(c => c.signal.side === winSide);
+  }
+
+  const ranking = pool.map(c => {
     const s = scoreCandidate(c.strategy, regime, statsLookup);
     // Diversification: discount strategies already used today
     const diverseMultiplier = fired.has(c.strategy) ? DIVERSIFICATION_DISCOUNT : 1.0;

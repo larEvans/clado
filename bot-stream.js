@@ -22,13 +22,17 @@ import { getDefaultParams, loadLearnedParams, recordTradeClosed, runLearner } fr
 import { pickStop, nearTargetTrigger } from "./backtest.js";
 import { classifyRegime } from "./regime.js";
 import { chooseSignal }   from "./router.js";
-import { getRegimeStats } from "./learner.js";
+import { getRegimeStats, getAllRegimeStats } from "./learner.js";
+import { runAgentDebate, debateEnabled } from "./agents.js";
 
 const ROUTER_ENABLED   = process.env.ROUTER_ENABLED === "true";
 const STRICT_ROUTER    = process.env.STRICT_ROUTER === "true";
 const ACTIVE_STRATS    = (process.env.ACTIVE_STRATEGIES || "hybrid,hybrid10,hybrid-reversal,reversal,vwap")
   .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 const MAX_CONCURRENT   = parseInt(process.env.MAX_CONCURRENT_POSITIONS || "5");
+// CONSENSUS_MODE: require ≥ CONSENSUS_MIN strategies to agree on direction
+// before the router lets a trade through. Off (=1) by default.
+const CONSENSUS_MIN    = Math.max(1, parseInt(process.env.CONSENSUS_MIN || "1"));
 
 const SYMBOL      = (process.env.SYMBOL   || "SPY").toUpperCase();
 const STRATEGY    = (process.env.STRATEGY || "hybrid").toLowerCase();
@@ -652,23 +656,56 @@ async function onRouterBar(bar) {
 
   const decision = chooseSignal({
     candidates,
-    regime:      r.tag,
-    statsLookup: routerStatsLookup,
-    todayState:  routerDay,
-    strict:      STRICT_ROUTER,
+    regime:       r.tag,
+    statsLookup:  routerStatsLookup,
+    todayState:   routerDay,
+    strict:       STRICT_ROUTER,
+    consensusMin: CONSENSUS_MIN,
   });
   s.lastChoice = decision.chosen ? { strategy: decision.chosen.strategy, score: decision.chosen.score, winRate: decision.chosen.winRate, reason: decision.reason } : { reason: decision.reason };
 
   if (!decision.chosen) { saveRouterState(); return; }
 
   console.log(`[Router] ${sym} ${r.tag} → ${decision.reason}`);
-  await enterRouterTrade(sym, decision.chosen.strategy, decision.chosen.signal, bar, r.tag);
+
+  // AGENT_DEBATE: Bull / Bear / Risk Manager weigh in before entry fires.
+  let sizeMultiplier = 1.0;
+  if (debateEnabled()) {
+    const tradeCandidate = {
+      symbol:    sym,
+      strategy:  decision.chosen.strategy,
+      side:      decision.chosen.signal.side,
+      entry:     decision.chosen.signal.entry,
+      stop:      decision.chosen.signal.stop,
+      target:    decision.chosen.signal.target,
+      regime:    r.tag,
+      orderBlock: decision.chosen.signal.orderBlock || null,
+      forced:    !!decision.chosen.signal.forced,
+      entrySignal: decision.chosen.signal.entrySignal || decision.chosen.strategy,
+    };
+    const ctx = {
+      regimeStats:   getAllRegimeStats(),
+      openPositions: [...routerStates.values()].filter(x => x.position).length,
+      sessionPnl:    0, // could compute from today's recorded trades; 0 is safe default
+    };
+    try {
+      const debate = await runAgentDebate(tradeCandidate, ctx);
+      console.log(`[Agents] ${sym}: ${debate.verdict} (bull ${debate.bull.confidence}, bear ${debate.bear.confidence}) → ${debate.risk.reasoning}`);
+      s.lastChoice = { ...s.lastChoice, debate };
+      if (debate.verdict !== "APPROVE") { saveRouterState(); return; }
+      sizeMultiplier = debate.risk.sizeMultiplier || 1.0;
+    } catch (e) {
+      console.warn(`[Agents] ${sym} debate failed (proceeding with full size):`, e.message);
+    }
+  }
+
+  await enterRouterTrade(sym, decision.chosen.strategy, decision.chosen.signal, bar, r.tag, sizeMultiplier);
   saveRouterState();
 }
 
-async function enterRouterTrade(sym, strategy, signal, bar, regime) {
+async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultiplier = 1.0) {
   const s = getSymState(sym);
-  const perPositionUSD = TRADE_USD / Math.min(MAX_CONCURRENT, routerStates.size || 1);
+  const perPositionUSD = (TRADE_USD / Math.min(MAX_CONCURRENT, routerStates.size || 1)) * sizeMultiplier;
   if (IS_PAPER) {
     console.log(`[Router] PAPER ${signal.side.toUpperCase()} ${sym} via ${strategy} $${perPositionUSD.toFixed(2)} @ ~${bar.close.toFixed(2)} [regime: ${regime}]`);
   } else {

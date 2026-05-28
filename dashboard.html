@@ -810,6 +810,7 @@ async function loadStrategies() {
       <div class="strat-actions">
         <button class="btn btn-primary" onclick="runBacktest('${s.id}')">Run Backtest</button>
         <button class="btn btn-hermes"  onclick="runOptimize('${s.id}')">Optimize with Hermes</button>
+        <button class="btn btn-outline" onclick="runCPCV('${s.id}')">Validate (CPCV)</button>
         <button class="btn btn-outline" onclick="openPine('${s.id}')">View Pine Script</button>
       </div>
     </div>
@@ -1750,6 +1751,79 @@ async function runDailySignals() {
   } catch (e) {
     document.getElementById('ds-loading').style.display = 'none';
     document.getElementById('ds-results').innerHTML = `<div style="color:var(--red);padding:14px">Error: ${e.message}</div>`;
+  }
+}
+
+// ─── CPCV validation ──────────────────────────────────────────────────────────
+async function runCPCV(stratId) {
+  const symbol = (document.getElementById(`sym-${stratId}`)?.value?.trim() || 'SPY').toUpperCase();
+  document.getElementById('backtest-area').style.display = '';
+  document.getElementById('bt-loading').style.display = '';
+  document.getElementById('bt-content').style.display = 'none';
+  document.getElementById('bt-title').textContent = `CPCV Validation — ${stratId.toUpperCase()} on ${symbol}`;
+  document.getElementById('backtest-area').scrollIntoView({ behavior: 'smooth' });
+
+  try {
+    const result = await fetch('/api/backtest/cpcv', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ strategy: stratId, symbol, K: 6, N: 2, purgeBars: 20, metric: 'winRate' }),
+    }).then(r => r.json());
+
+    document.getElementById('bt-loading').style.display = 'none';
+    document.getElementById('bt-content').style.display = '';
+
+    if (result.error) {
+      document.getElementById('bt-metrics').innerHTML = `<div style="color:var(--red);padding:12px">${result.error}</div>`;
+      return;
+    }
+
+    const verdictColor = {
+      ROBUST:            '#22c55e',
+      OK:                '#10b981',
+      UNSTABLE:          '#f59e0b',
+      LIKELY_OVERFIT:    '#ef4444',
+      INSUFFICIENT_DATA: '#64748b',
+    }[result.verdict] || '#64748b';
+
+    const agg = result.aggregate;
+    const metricsHtml = `
+      <div class="metric" style="grid-column:1/-1;padding:14px 18px;background:${verdictColor}22;border:1px solid ${verdictColor}55;border-radius:6px">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+          <div>
+            <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px">Verdict</div>
+            <div style="font-weight:700;font-size:18px;color:${verdictColor}">${result.verdict.replace(/_/g, ' ')}</div>
+          </div>
+          <div style="font-size:11px;color:var(--muted);max-width:60%;text-align:right">
+            ${result.totalCombinations} train/test splits · ${result.validFolds} valid folds · K=${result.K} blocks, N=${result.N} test blocks each, ${result.purgeBars}-bar purge
+          </div>
+        </div>
+      </div>
+      <div class="metric"><div class="m-label">Mean ${result.metric}</div><div class="m-value">${agg.mean}${result.metric === 'winRate' ? '%' : ''}</div></div>
+      <div class="metric"><div class="m-label">Std Dev</div><div class="m-value">${agg.stddev}</div></div>
+      <div class="metric"><div class="m-label">CV (lower is more stable)</div><div class="m-value">${agg.cv ?? '—'}</div></div>
+      <div class="metric"><div class="m-label">Median</div><div class="m-value">${agg.median}${result.metric === 'winRate' ? '%' : ''}</div></div>
+      <div class="metric"><div class="m-label">Min</div><div class="m-value neg">${agg.min}${result.metric === 'winRate' ? '%' : ''}</div></div>
+      <div class="metric"><div class="m-label">Max</div><div class="m-value pos">${agg.max}${result.metric === 'winRate' ? '%' : ''}</div></div>
+      <div class="metric"><div class="m-label">P.B.O.</div><div class="m-value">${(result.pbo*100).toFixed(0)}%</div></div>
+    `;
+    document.getElementById('bt-metrics').innerHTML = metricsHtml;
+
+    // Per-fold table
+    const trades = document.getElementById('bt-trades') || document.querySelector('#bt-content .tbl-wrap');
+    if (trades) {
+      const rows = (result.folds || []).map(f => {
+        if (f.error || f.skipped) return `<tr><td>${(f.combo||[]).join('+')}</td><td colspan="5" style="color:var(--muted);font-size:11px">${f.error || f.skipped}</td></tr>`;
+        return `<tr><td>${f.combo.join('+')}</td><td>${f.totalTrades ?? '—'}</td><td>${f.winRate ?? '—'}</td><td>${f.totalReturnR ?? '—'}</td><td>${f.profitFactor ?? '—'}</td><td>${f.maxDrawdown ?? '—'}</td></tr>`;
+      }).join('');
+      const html = `<table><thead><tr><th>Test Blocks</th><th>Trades</th><th>Win Rate</th><th>Return</th><th>PF</th><th>MDD</th></tr></thead><tbody>${rows}</tbody></table>`;
+      const wrap = document.querySelector('#bt-content .tbl-wrap');
+      if (wrap) wrap.innerHTML = html;
+    }
+  } catch (e) {
+    document.getElementById('bt-loading').style.display = 'none';
+    document.getElementById('bt-content').style.display = '';
+    document.getElementById('bt-metrics').innerHTML = `<div style="color:var(--red);padding:12px">Error: ${e.message}</div>`;
   }
 }
 
