@@ -16,15 +16,33 @@ import { meta as hybridMeta }  from "./strategies/hybrid.js";
 import { meta as reversalMeta } from "./strategies/reversal.js";
 import { meta as hybridReversalMeta } from "./strategies/hybrid-reversal.js";
 import { meta as hybrid10Meta }       from "./strategies/hybrid10.js";
+import { meta as gapFillMeta }        from "./strategies/gap-fill.js";
+import { meta as vwapReclaimMeta }    from "./strategies/vwap-reclaim.js";
+import { meta as firstHourFadeMeta }  from "./strategies/first-hour-fade.js";
 import { classifyRegime }              from "./regime.js";
 
 // ─── Market data ──────────────────────────────────────────────────────────────
 
-export async function fetchCandles(symbol, interval) {
+/**
+ * Fetch historical bars from Alpaca.
+ *
+ * Default day window per timeframe is short to keep typical backtests fast.
+ * Pass { yearWindow: true } or set BACKTEST_DAYS env var to override and pull
+ * a full year (or longer) of data for sub-hour timeframes. Pagination cap
+ * scales accordingly.
+ */
+export async function fetchCandles(symbol, interval, opts = {}) {
   const tfMap  = { "1m":"1Min","5m":"5Min","15m":"15Min","30m":"30Min","1H":"1Hour","4H":"4Hour","1D":"1Day" };
-  const dayMap = { "1Min":7,"5Min":60,"15Min":60,"30Min":60,"1Hour":365,"4Hour":365,"1Day":730 };
-  const tf   = tfMap[interval] || "1Hour";
-  const days = dayMap[tf] || 60;
+  const tf     = tfMap[interval] || "1Hour";
+
+  const yearWindow = opts.yearWindow || process.env.BACKTEST_DAYS;
+  const envDays    = parseInt(process.env.BACKTEST_DAYS || "0") || null;
+
+  const shortDays = { "1Min":7,"5Min":60,"15Min":60,"30Min":60,"1Hour":365,"4Hour":365,"1Day":730 };
+  const yearDays  = { "1Min":30,"5Min":365,"15Min":365,"30Min":365,"1Hour":730,"4Hour":730,"1Day":1825 };
+  const days = envDays
+    || (yearWindow ? (yearDays[tf] || 365) : (shortDays[tf] || 60));
+
   const start = new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
 
   const BASE    = "https://data.alpaca.markets";
@@ -35,15 +53,18 @@ export async function fetchCandles(symbol, interval) {
 
   const candles = [];
   let nextToken = null;
+  // Scale the hard cap with the requested window so a year of 5-min bars
+  // (~19,700 candles) actually fits.
+  const candleCap = (yearWindow || envDays) ? 30_000 : 5_000;
 
   do {
-    const qs = new URLSearchParams({ timeframe: tf, start, limit: "1000", adjustment: "split", feed: "iex", ...(nextToken && { page_token: nextToken }) });
-    const res = await fetch(`${BASE}/v2/stocks/${symbol}/bars?${qs}`, { headers, signal: AbortSignal.timeout(20_000) });
+    const qs = new URLSearchParams({ timeframe: tf, start, limit: "10000", adjustment: "split", feed: "iex", ...(nextToken && { page_token: nextToken }) });
+    const res = await fetch(`${BASE}/v2/stocks/${symbol}/bars?${qs}`, { headers, signal: AbortSignal.timeout(30_000) });
     if (!res.ok) throw new Error(`Alpaca bars ${res.status} for ${symbol} — check the ticker`);
     const json = await res.json();
     for (const b of (json.bars || [])) candles.push({ time: new Date(b.t).getTime(), open: b.o, high: b.h, low: b.l, close: b.c, volume: b.v });
     nextToken = json.next_page_token || null;
-  } while (nextToken && candles.length < 5_000);
+  } while (nextToken && candles.length < candleCap);
 
   if (candles.length === 0) throw new Error(`No data returned for ${symbol}`);
   return candles;
@@ -1398,6 +1419,284 @@ function runHybridReversalBacktest(allCandles, params = {}, opts = {}) {
   return trades;
 }
 
+// ─── Gap Fill Backtest ───────────────────────────────────────────────────────
+
+function runGapFillBacktest(allCandles, params = {}, opts = {}) {
+  const { minGapPct = 0.4, stopMult = 0.5, timeExitMin = 150 } = { ...gapFillMeta.params, ...params };
+  const { mode = "stock", iv = 0.18, dteDays = 7, numContracts = 1, strikeInterval = 1 } = opts;
+
+  const sessions = groupByDay(allCandles);
+  const trades   = [];
+
+  for (let d = 1; d < sessions.length; d++) {
+    const today = sessions[d].candles;
+    const prior = sessions[d - 1].candles;
+    if (today.length < 4 || prior.length < 1) continue;
+
+    const priorClose = prior[prior.length - 1].close;
+    const todayOpen  = today[0].open;
+    const gapPct     = ((todayOpen - priorClose) / priorClose) * 100;
+    if (Math.abs(gapPct) < minGapPct) continue;
+
+    const sessionStart = nyseOpenMs(today[0].time);
+    const confirmStart = sessionStart + 5 * 60_000; // first bar after 9:35
+    const sessExit     = sessionStart + timeExitMin * 60_000;
+
+    // Find the first confirmation bar after 9:35 ET
+    const postOpen = today.filter(c => c.time >= confirmStart);
+    if (postOpen.length === 0) continue;
+
+    // LONG fade of gap-down
+    const isGapDown = gapPct < -minGapPct;
+    const isGapUp   = gapPct >  minGapPct;
+    let entryBar = null;
+    let side     = null;
+    for (const bar of postOpen) {
+      if (isGapDown && bar.close > bar.open && bar.close < priorClose) { entryBar = bar; side = "buy";  break; }
+      if (isGapUp   && bar.close < bar.open && bar.close > priorClose) { entryBar = bar; side = "sell"; break; }
+    }
+    if (!entryBar) continue;
+
+    const entry      = entryBar.close;
+    const gapAbs     = Math.abs(todayOpen - priorClose);
+    const stop       = side === "buy" ? todayOpen - gapAbs * stopMult : todayOpen + gapAbs * stopMult;
+    const target     = priorClose;
+    if (side === "buy"  && entry >= target) continue;
+    if (side === "sell" && entry <= target) continue;
+
+    let optInfo = {};
+    if (mode === "options") {
+      const optionType   = side === "buy" ? "call" : "put";
+      const optionStrike = atmStrike(entry, strikeInterval);
+      const entryPremium = optionPremium(entry, optionStrike, dteDays, iv, optionType);
+      optInfo = { optionType, optionStrike, entryPremium, entryDTE: dteDays };
+    }
+
+    const idx = today.indexOf(entryBar);
+    let openTrade = { side, entry, stop, target, entryTime: entryBar.time, ...optInfo };
+    let exitPrice = null, exitReason = null;
+    for (let i = idx + 1; i < today.length && openTrade; i++) {
+      const bar = today[i];
+      if (side === "buy") {
+        if (bar.low  <= stop)   { exitPrice = stop;   exitReason = "stop";   }
+        if (bar.high >= target) { exitPrice = target; exitReason = "target"; }
+      } else {
+        if (bar.high >= stop)   { exitPrice = stop;   exitReason = "stop";   }
+        if (bar.low  <= target) { exitPrice = target; exitReason = "target"; }
+      }
+      if (!exitPrice && bar.time >= sessExit) { exitPrice = bar.close; exitReason = "time"; }
+      if (exitPrice) {
+        const risk   = Math.abs(entry - stop);
+        const pnlUSD = side === "buy" ? exitPrice - entry : entry - exitPrice;
+        let optResult = {};
+        if (mode === "options" && openTrade.entryPremium != null) {
+          const elapsed     = (bar.time - openTrade.entryTime) / 86_400_000;
+          const exitPremium = optionPremium(exitPrice, openTrade.optionStrike, Math.max(openTrade.entryDTE - elapsed, 0.01), iv, openTrade.optionType);
+          const optPnL      = (exitPremium - openTrade.entryPremium) * 100 * numContracts;
+          optResult = { optionType: openTrade.optionType, optionStrike: openTrade.optionStrike, entryPremium: openTrade.entryPremium, exitPremium, optionsPnL: optPnL, optionsPnLPct: openTrade.entryPremium > 0 ? ((exitPremium - openTrade.entryPremium) / openTrade.entryPremium) * 100 : 0, optionDTE: openTrade.entryDTE };
+        }
+        trades.push({ date: sessions[d].date, entryTime: entryBar.time, exitTime: bar.time, side, entry, stop, target, exit: exitPrice, exitReason, pnlR: risk > 0 ? pnlUSD/risk : 0, pnlPct: (pnlUSD/entry)*100, gapPct: +gapPct.toFixed(3), ...optResult });
+        openTrade = null;
+      }
+    }
+  }
+  return trades;
+}
+
+// ─── VWAP Reclaim Backtest ───────────────────────────────────────────────────
+
+function runVWAPReclaimBacktest(allCandles, params = {}, opts = {}) {
+  const {
+    minReclaimPct    = 0.05,
+    volMultiplier    = 1.2,
+    stopPct          = 0.4,
+    rrRatio          = 1.5,
+    minBarsAfterOpen = 6,
+  } = { ...vwapReclaimMeta.params, ...params };
+  const { mode = "stock", iv = 0.18, dteDays = 7, numContracts = 1, strikeInterval = 1 } = opts;
+
+  const sessions = groupByDay(allCandles);
+  const trades   = [];
+
+  for (const { date, candles } of sessions) {
+    if (candles.length < minBarsAfterOpen + 3) continue;
+    const open = nyseOpenMs(candles[0].time);
+    const sessEnd = open + 6.25 * 3600_000;
+    const sess = candles.filter(c => c.time >= open && c.time < open + 7 * 3600_000);
+    if (sess.length < minBarsAfterOpen + 3) continue;
+
+    let openTrade = null;
+    let prevPrice = null, prevVWAPside = null;
+
+    for (let i = minBarsAfterOpen; i < sess.length; i++) {
+      const bar = sess[i];
+      const slice = sess.slice(0, i + 1);
+      const vwap = sessionVWAP(slice);
+      if (!vwap) continue;
+
+      // Exit management
+      if (openTrade) {
+        let exitPrice = null, exitReason = null;
+        if (openTrade.side === "buy") {
+          if (bar.low  <= openTrade.stop)   { exitPrice = openTrade.stop;   exitReason = "stop";   }
+          if (bar.high >= openTrade.target) { exitPrice = openTrade.target; exitReason = "target"; }
+        } else {
+          if (bar.high >= openTrade.stop)   { exitPrice = openTrade.stop;   exitReason = "stop";   }
+          if (bar.low  <= openTrade.target) { exitPrice = openTrade.target; exitReason = "target"; }
+        }
+        if (!exitPrice && bar.time >= sessEnd) { exitPrice = bar.close; exitReason = "time"; }
+        if (exitPrice) {
+          const risk   = Math.abs(openTrade.entry - openTrade.stop);
+          const pnlUSD = openTrade.side === "buy" ? exitPrice - openTrade.entry : openTrade.entry - exitPrice;
+          let optResult = {};
+          if (mode === "options" && openTrade.entryPremium != null) {
+            const elapsed     = (bar.time - openTrade.entryTime) / 86_400_000;
+            const exitPremium = optionPremium(exitPrice, openTrade.optionStrike, Math.max(openTrade.entryDTE - elapsed, 0.01), iv, openTrade.optionType);
+            const optPnL      = (exitPremium - openTrade.entryPremium) * 100 * numContracts;
+            optResult = { optionType: openTrade.optionType, optionStrike: openTrade.optionStrike, entryPremium: openTrade.entryPremium, exitPremium, optionsPnL: optPnL, optionsPnLPct: openTrade.entryPremium > 0 ? ((exitPremium - openTrade.entryPremium) / openTrade.entryPremium) * 100 : 0, optionDTE: openTrade.entryDTE };
+          }
+          trades.push({ date, entryTime: openTrade.entryTime, exitTime: bar.time, side: openTrade.side, entry: openTrade.entry, stop: openTrade.stop, target: openTrade.target, exit: exitPrice, exitReason, pnlR: risk > 0 ? pnlUSD/risk : 0, pnlPct: (pnlUSD/openTrade.entry)*100, ...optResult });
+          openTrade = null;
+        }
+        continue;
+      }
+
+      // Track prior bar's side of VWAP
+      const curSide = bar.close > vwap ? "above" : "below";
+
+      // Volume check
+      const lookback = sess.slice(Math.max(0, i - 20), i);
+      const volAvg = lookback.length ? lookback.reduce((s, b) => s + b.volume, 0) / lookback.length : 0;
+      const volOK  = volAvg > 0 && bar.volume >= volAvg * volMultiplier;
+
+      // Reclaim: prior bar low dipped below VWAP, current bar closes above VWAP
+      const reclaimLong  = prevVWAPside === "below" && curSide === "above" &&
+                           bar.low <= vwap && ((bar.close - vwap) / vwap) * 100 >= minReclaimPct && volOK;
+      const reclaimShort = prevVWAPside === "above" && curSide === "below" &&
+                           bar.high >= vwap && ((vwap - bar.close) / vwap) * 100 >= minReclaimPct && volOK;
+
+      prevVWAPside = curSide;
+      prevPrice = bar.close;
+
+      if (!reclaimLong && !reclaimShort) continue;
+
+      const side  = reclaimLong ? "buy" : "sell";
+      const entry = bar.close;
+      const stop  = side === "buy" ? entry - entry * (stopPct / 100) : entry + entry * (stopPct / 100);
+      const vwapDist = Math.abs(entry - vwap);
+      const target = side === "buy" ? entry + vwapDist * rrRatio : entry - vwapDist * rrRatio;
+      if (side === "buy" && entry >= target) continue;
+      if (side === "sell" && entry <= target) continue;
+
+      let optInfo = {};
+      if (mode === "options") {
+        const optionType   = side === "buy" ? "call" : "put";
+        const optionStrike = atmStrike(entry, strikeInterval);
+        const entryPremium = optionPremium(entry, optionStrike, dteDays, iv, optionType);
+        optInfo = { optionType, optionStrike, entryPremium, entryDTE: dteDays };
+      }
+      openTrade = { side, entry, stop, target, entryTime: bar.time, ...optInfo };
+    }
+  }
+  return trades;
+}
+
+// ─── First-Hour Fade Backtest ────────────────────────────────────────────────
+
+function runFirstHourFadeBacktest(allCandles, params = {}, opts = {}) {
+  const {
+    minFirstHourPct = 0.6,
+    exhaustionTop   = 25,
+    retracePct      = 50,
+    timeExitMin     = 240,
+  } = { ...firstHourFadeMeta.params, ...params };
+  const { mode = "stock", iv = 0.18, dteDays = 7, numContracts = 1, strikeInterval = 1 } = opts;
+
+  const sessions = groupByDay(allCandles);
+  const trades   = [];
+
+  for (const { date, candles } of sessions) {
+    const open      = nyseOpenMs(candles[0].time);
+    const hourOneEnd = open + 60 * 60_000;
+    const sessExit  = open + timeExitMin * 60_000;
+    const sessEnd   = open + 6.25 * 3600_000;
+
+    const sess = candles.filter(c => c.time >= open && c.time < open + 7 * 3600_000);
+    const h1   = sess.filter(c => c.time >= open && c.time < hourOneEnd);
+    if (h1.length < 4) continue;
+
+    const h1Open  = h1[0].open;
+    const h1Close = h1[h1.length - 1].close;
+    const h1High  = Math.max(...h1.map(b => b.high));
+    const h1Low   = Math.min(...h1.map(b => b.low));
+    const h1Range = h1High - h1Low;
+    if (h1Range <= 0) continue;
+
+    const movePct = ((h1Close - h1Open) / h1Open) * 100;
+    if (Math.abs(movePct) < minFirstHourPct) continue;
+
+    const cutoff = (exhaustionTop / 100) * h1Range;
+    const closeInTopBand = h1Close >= h1High - cutoff;
+    const closeInBotBand = h1Close <= h1Low + cutoff;
+    const fadeShort = movePct > 0 && closeInTopBand;
+    const fadeLong  = movePct < 0 && closeInBotBand;
+    if (!fadeShort && !fadeLong) continue;
+
+    const postH1 = sess.filter(c => c.time >= hourOneEnd);
+    if (postH1.length === 0) continue;
+
+    // Confirmation: the first bar in hour 2 closes against the morning direction
+    const confirm = postH1[0];
+    if (fadeShort && confirm.close >= h1Close) continue;
+    if (fadeLong  && confirm.close <= h1Close) continue;
+
+    const side   = fadeShort ? "sell" : "buy";
+    const entry  = confirm.close;
+    const stop   = side === "sell" ? h1High : h1Low;
+    const target = side === "sell"
+      ? h1Open + (h1Close - h1Open) * (1 - retracePct / 100)
+      : h1Open + (h1Close - h1Open) * (1 - retracePct / 100);
+    if (side === "buy"  && entry >= target) continue;
+    if (side === "sell" && entry <= target) continue;
+
+    let optInfo = {};
+    if (mode === "options") {
+      const optionType   = side === "buy" ? "call" : "put";
+      const optionStrike = atmStrike(entry, strikeInterval);
+      const entryPremium = optionPremium(entry, optionStrike, dteDays, iv, optionType);
+      optInfo = { optionType, optionStrike, entryPremium, entryDTE: dteDays };
+    }
+
+    let openTrade = { side, entry, stop, target, entryTime: confirm.time, ...optInfo };
+    for (let i = 1; i < postH1.length && openTrade; i++) {
+      const bar = postH1[i];
+      let exitPrice = null, exitReason = null;
+      if (side === "buy") {
+        if (bar.low  <= stop)   { exitPrice = stop;   exitReason = "stop";   }
+        if (bar.high >= target) { exitPrice = target; exitReason = "target"; }
+      } else {
+        if (bar.high >= stop)   { exitPrice = stop;   exitReason = "stop";   }
+        if (bar.low  <= target) { exitPrice = target; exitReason = "target"; }
+      }
+      if (!exitPrice && (bar.time >= sessExit || bar.time >= sessEnd)) { exitPrice = bar.close; exitReason = "time"; }
+      if (exitPrice) {
+        const risk   = Math.abs(entry - stop);
+        const pnlUSD = side === "buy" ? exitPrice - entry : entry - exitPrice;
+        let optResult = {};
+        if (mode === "options" && openTrade.entryPremium != null) {
+          const elapsed     = (bar.time - openTrade.entryTime) / 86_400_000;
+          const exitPremium = optionPremium(exitPrice, openTrade.optionStrike, Math.max(openTrade.entryDTE - elapsed, 0.01), iv, openTrade.optionType);
+          const optPnL      = (exitPremium - openTrade.entryPremium) * 100 * numContracts;
+          optResult = { optionType: openTrade.optionType, optionStrike: openTrade.optionStrike, entryPremium: openTrade.entryPremium, exitPremium, optionsPnL: optPnL, optionsPnLPct: openTrade.entryPremium > 0 ? ((exitPremium - openTrade.entryPremium) / openTrade.entryPremium) * 100 : 0, optionDTE: openTrade.entryDTE };
+        }
+        trades.push({ date, entryTime: confirm.time, exitTime: bar.time, side, entry, stop, target, exit: exitPrice, exitReason, pnlR: risk > 0 ? pnlUSD/risk : 0, pnlPct: (pnlUSD/entry)*100, h1MovePct: +movePct.toFixed(3), ...optResult });
+        openTrade = null;
+      }
+    }
+  }
+  return trades;
+}
+
 // ─── Metrics ──────────────────────────────────────────────────────────────────
 
 export function calcMetrics(trades, mode = "stock") {
@@ -1465,10 +1764,10 @@ export function calcMetrics(trades, mode = "stock") {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export async function runBacktest(strategyId, symbol, opts = {}) {
-  const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m", reversal: "5m", "hybrid-reversal": "5m", hybrid10: "5m" };
+  const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m", reversal: "5m", "hybrid-reversal": "5m", hybrid10: "5m", "gap-fill": "5m", "vwap-reclaim": "5m", "first-hour-fade": "5m" };
   const timeframe  = TIMEFRAMES[strategyId] || "1H";
   console.log(`Backtesting ${strategyId.toUpperCase()} on ${symbol} (${timeframe}) — mode: ${opts.mode || "stock"}`);
-  const candles = opts._candles || await fetchCandles(symbol, timeframe);
+  const candles = opts._candles || await fetchCandles(symbol, timeframe, { yearWindow: !!opts.yearWindow });
   if (!opts._candles) console.log(`  Got ${candles.length} candles`);
 
   const params = opts.params || {};
@@ -1482,6 +1781,9 @@ export async function runBacktest(strategyId, symbol, opts = {}) {
   else if (strategyId === "reversal") trades = runReversalBacktest(candles, params, opts);
   else if (strategyId === "hybrid-reversal") trades = runHybridReversalBacktest(candles, params, opts);
   else if (strategyId === "hybrid10") trades = runHybridBacktest(candles, { ...hybrid10Meta.params, ...params }, opts);
+  else if (strategyId === "gap-fill")        trades = runGapFillBacktest(candles, params, opts);
+  else if (strategyId === "vwap-reclaim")    trades = runVWAPReclaimBacktest(candles, params, opts);
+  else if (strategyId === "first-hour-fade") trades = runFirstHourFadeBacktest(candles, params, opts);
   else throw new Error(`Unknown strategy: ${strategyId}`);
 
   // Tag each trade with the market regime at its entry time. Same classifier

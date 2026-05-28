@@ -17,6 +17,9 @@ import { meta as hybridMeta }  from "./strategies/hybrid.js";
 import { meta as reversalMeta }        from "./strategies/reversal.js";
 import { meta as hybridReversalMeta }  from "./strategies/hybrid-reversal.js";
 import { meta as hybrid10Meta }        from "./strategies/hybrid10.js";
+import { meta as gapFillMeta }         from "./strategies/gap-fill.js";
+import { meta as vwapReclaimMeta }     from "./strategies/vwap-reclaim.js";
+import { meta as firstHourFadeMeta }   from "./strategies/first-hour-fade.js";
 import { fetchChain, fetchExpiryDates, fetchContracts, getLiveOptionsParams } from "./options.js";
 import { AlpacaStream } from "./stream.js";
 import { loadAllLearning, getAllRegimeStats, saveRegimeParams, getRegimeStats } from "./learner.js";
@@ -139,10 +142,16 @@ app.get("/api/bot-log", (req, res) => {
 // Hybrid is the only active strategy. Pass ?all=1 to see the full catalog
 // (or set ACTIVE_STRATEGIES=orb,vwap,... in the environment to whitelist others).
 app.get("/api/strategies", (req, res) => {
-  const all = [hybridMeta, hybridReversalMeta, hybrid10Meta, reversalMeta, vwapMeta, orbMeta, trendMeta, meanrevMeta, momentumMeta];
+  const all = [
+    hybridMeta, hybridReversalMeta, hybrid10Meta,
+    reversalMeta, vwapMeta, vwapReclaimMeta,
+    gapFillMeta, firstHourFadeMeta,
+    orbMeta, trendMeta, meanrevMeta, momentumMeta,
+  ];
   if (req.query?.all === "1") return res.json(all);
-  // Hybrid family + Reversal + VWAP active by default. Override with ACTIVE_STRATEGIES env.
-  const whitelist = (process.env.ACTIVE_STRATEGIES || "hybrid,hybrid-reversal,hybrid10,reversal,vwap")
+  // Hybrid family + Reversal + VWAP family + new ≥50% strategies active by default.
+  const whitelist = (process.env.ACTIVE_STRATEGIES ||
+    "hybrid,hybrid-reversal,hybrid10,reversal,vwap,vwap-reclaim,gap-fill,first-hour-fade")
     .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
   const active = all
     .filter(m => whitelist.includes(m.id))
@@ -568,6 +577,143 @@ app.get("/api/daily-signals", async (req, res) => {
   }
 });
 
+// ─── Year-long options backtest across all strategies × watchlist ────────────
+//
+// Runs every active strategy across every watchlist symbol on ~1 year of 5m
+// data, in options mode, pulling today's IV/DTE from Alpaca per symbol so the
+// Black-Scholes math reflects a realistic current environment. Aggregates
+// per-strategy and per-symbol results, saves trades to history (so the regime
+// router and Hermes can learn from them), and reports total options PnL.
+
+app.post("/api/backtest/year-options", async (req, res) => {
+  try {
+    const strategies = req.body?.strategies || ACTIVE_FOR_ROUTER();
+    let symbols      = req.body?.symbols;
+    const contracts  = parseInt(req.body?.contracts) || 1;
+    const dteOverride = req.body?.dte != null ? parseInt(req.body.dte) : null;
+    const ivOverride  = req.body?.iv  != null ? parseFloat(req.body.iv) / 100 : null;
+
+    if (!symbols) {
+      try {
+        const lists = await alpaca("/v2/watchlists");
+        if (lists?.length) {
+          const detail = await alpaca(`/v2/watchlists/${lists[0].id}`);
+          symbols = (detail.assets || []).map(a => a.symbol).filter(Boolean);
+        }
+      } catch {}
+      if (!symbols?.length) symbols = [process.env.SYMBOL || "SPY"];
+    }
+
+    console.log(`[YearOptions] ${strategies.length} strategies × ${symbols.length} symbols × 1y of 5m bars in options mode`);
+
+    // Pre-fetch live options env once per symbol so we don't hammer the API
+    const liveBySymbol = {};
+    for (const sym of symbols) {
+      try {
+        const px   = await lastTradePrice(sym);
+        const live = await getLiveOptionsParams(sym, px || 100);
+        liveBySymbol[sym] = live;
+      } catch (e) {
+        liveBySymbol[sym] = { iv: 0.25, dteDays: 7, source: "fallback", error: e.message };
+      }
+    }
+
+    const results = [];
+    for (const strategy of strategies) {
+      for (const symbol of symbols) {
+        try {
+          const live = liveBySymbol[symbol];
+          const opts = {
+            mode:           "options",
+            iv:             ivOverride ?? live.iv ?? 0.25,
+            dteDays:        dteOverride ?? live.dteDays ?? 7,
+            numContracts:   contracts,
+            strikeInterval: 1,
+            forceDaily:     strategy === "hybrid" || strategy === "hybrid10",
+            yearWindow:     true,
+          };
+          const r = await runBacktest(strategy, symbol, opts);
+          const trades = r.trades || [];
+          const wins   = trades.filter(t => (t.pnlPct || 0) > 0).length;
+          const total  = trades.length;
+          const winRate = total > 0 ? wins / total : 0;
+          const optTotal  = r.optionsMetrics?.totalPnL          || "$0.00";
+          const optMoved  = r.optionsMetrics?.totalPremiumTraded || "$0.00";
+
+          // Persist to trade-history with the source tag.
+          const recs = trades.map(t => ({
+            symbol, strategy, side: t.side,
+            entryPrice: t.entry, exitPrice: t.exit,
+            pnlPct: +(t.pnlPct || 0).toFixed(4),
+            pnlR:   t.pnlR != null ? +t.pnlR.toFixed(3) : null,
+            win:    (t.pnlPct || 0) > 0,
+            entryTime: t.entryTime ? new Date(t.entryTime).toISOString() : null,
+            exitTime:  t.exitTime  ? new Date(t.exitTime).toISOString()  : null,
+            exitReason: t.exitReason,
+            regime:    t.regime || "unknown",
+            hourET:    t.hourET ?? null,
+            optionType:   t.optionType    || null,
+            optionStrike: t.optionStrike  || null,
+            entryPremium: t.entryPremium  || null,
+            exitPremium:  t.exitPremium   || null,
+            optionsPnL:   t.optionsPnL    || null,
+            optionsPnLPct: t.optionsPnLPct || null,
+            source:     "year-options",
+            forced:     !!t.forced,
+            recordedAt: new Date().toISOString(),
+          }));
+          appendToTradeHistory(recs);
+
+          results.push({
+            strategy, symbol,
+            totalTrades: total,
+            wins, losses: total - wins,
+            winRate:    +(winRate * 100).toFixed(1),
+            totalReturnR: r.totalReturnR,
+            profitFactor: r.profitFactor,
+            maxDrawdown:  r.maxDrawdown,
+            optionsTotalPnL: optTotal,
+            optionsPremiumMoved: optMoved,
+            liveOptionsEnv: live,
+            saved: recs.length,
+          });
+        } catch (e) {
+          results.push({ strategy, symbol, error: e.message });
+        }
+      }
+    }
+
+    // Aggregate per strategy
+    const byStrategy = {};
+    for (const r of results) {
+      if (r.error) continue;
+      byStrategy[r.strategy] = byStrategy[r.strategy] || { trades: 0, wins: 0, premiumMoved: 0, pnlTotal: 0 };
+      const slot = byStrategy[r.strategy];
+      slot.trades += r.totalTrades;
+      slot.wins   += r.wins;
+      slot.premiumMoved += parseFloat((r.optionsPremiumMoved || "0").replace(/[$,]/g, "")) || 0;
+      slot.pnlTotal     += parseFloat((r.optionsTotalPnL     || "0").replace(/[$,]/g, "")) || 0;
+    }
+    const stratSummary = Object.entries(byStrategy).map(([s, v]) => ({
+      strategy: s,
+      trades:   v.trades,
+      winRate:  v.trades > 0 ? +((v.wins / v.trades) * 100).toFixed(1) : 0,
+      premiumMoved: "$" + v.premiumMoved.toFixed(2),
+      pnlTotal:     "$" + v.pnlTotal.toFixed(2),
+    })).sort((a, b) => b.winRate - a.winRate);
+
+    res.json({
+      strategies, symbols,
+      results,
+      summary: stratSummary,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("[YearOptions] error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── Agent debate preview ─────────────────────────────────────────────────────
 //
 // POST a trade candidate; get Bull / Bear / Risk-Manager verdicts back. Lets
@@ -625,7 +771,8 @@ app.post("/api/backtest/cpcv", async (req, res) => {
 
 // ─── Strategy Router ───────────────────────────────────────────────────────────
 
-const ACTIVE_FOR_ROUTER = () => (process.env.ACTIVE_STRATEGIES || "hybrid,hybrid10,hybrid-reversal,reversal,vwap")
+const ACTIVE_FOR_ROUTER = () => (process.env.ACTIVE_STRATEGIES ||
+  "hybrid,hybrid10,hybrid-reversal,reversal,vwap,vwap-reclaim,gap-fill,first-hour-fade")
   .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 
 // Current regime per watchlist symbol + per-strategy×regime stats heatmap.
@@ -783,8 +930,12 @@ app.post("/api/router/optimize-by-regime", async (req, res) => {
 
 // ─── Backtest optimization loop ───────────────────────────────────────────────
 
-const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m", reversal: "5m", "hybrid-reversal": "5m", hybrid10: "5m" };
-const STRATEGY_META = { orb: orbMeta, vwap: vwapMeta, trend: trendMeta, meanrev: meanrevMeta, momentum: momentumMeta, hybrid: hybridMeta, reversal: reversalMeta, "hybrid-reversal": hybridReversalMeta, hybrid10: hybrid10Meta };
+const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m", reversal: "5m", "hybrid-reversal": "5m", hybrid10: "5m", "gap-fill": "5m", "vwap-reclaim": "5m", "first-hour-fade": "5m" };
+const STRATEGY_META = {
+  orb: orbMeta, vwap: vwapMeta, trend: trendMeta, meanrev: meanrevMeta, momentum: momentumMeta,
+  hybrid: hybridMeta, reversal: reversalMeta, "hybrid-reversal": hybridReversalMeta, hybrid10: hybrid10Meta,
+  "gap-fill": gapFillMeta, "vwap-reclaim": vwapReclaimMeta, "first-hour-fade": firstHourFadeMeta,
+};
 
 function findBestIteration(iters) {
   return iters.reduce((bestI, iter, i) => {

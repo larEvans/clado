@@ -429,8 +429,9 @@
     <div style="font-size:13px;color:var(--muted)">
       The router classifies each symbol's regime, scores every active strategy by historical win rate in that regime, and picks the top-scoring entry. Diversification penalty applied to strategies already used today.
     </div>
-    <div style="margin-left:auto;display:flex;gap:8px">
+    <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
       <button class="btn btn-primary"  onclick="bootstrapRouter()">Bootstrap from Backtest</button>
+      <button class="btn btn-green"    onclick="runYearOptions()">Year Backtest (Options)</button>
       <button class="btn btn-hermes"   onclick="optimizeByRegime()">Optimize All by Regime</button>
       <button class="btn btn-outline"  onclick="loadRouterState()">Refresh</button>
     </div>
@@ -449,6 +450,13 @@
   </div>
 
   <div id="router-msg" style="font-size:12px;color:var(--muted);padding:8px 14px"></div>
+
+  <div id="year-options-results" class="section" style="display:none;padding:14px 18px">
+    <div class="section-header">Year-long Options Backtest — Summary by Strategy</div>
+    <div id="year-options-summary" style="padding:10px"></div>
+    <div class="section-header" style="margin-top:14px">Per-Symbol Detail</div>
+    <div id="year-options-detail" class="tbl-wrap" style="padding:6px"></div>
+  </div>
 </div>
 
 <!-- ══ CHART PANEL ════════════════════════════════════════════════════════════ -->
@@ -1916,6 +1924,46 @@ async function bootstrapRouter() {
   } catch (e) {
     document.getElementById('router-loading').style.display = 'none';
     document.getElementById('router-msg').textContent = 'Bootstrap failed: ' + e.message;
+  }
+}
+
+async function runYearOptions() {
+  document.getElementById('router-loading').style.display = '';
+  document.getElementById('router-msg').textContent = 'Running every active strategy × every watchlist symbol on 1 year of 5m bars in options mode — this can take a few minutes…';
+  document.getElementById('year-options-results').style.display = 'none';
+  try {
+    const data = await fetch('/api/backtest/year-options', { method: 'POST', headers: { 'Content-Type':'application/json' }, body: JSON.stringify({}) }).then(r => r.json());
+    document.getElementById('router-loading').style.display = 'none';
+    if (data.error) { document.getElementById('router-msg').textContent = 'Error: ' + data.error; return; }
+
+    const summary = data.summary || [];
+    const sumHtml = summary.length === 0
+      ? '<div style="color:var(--muted)">No data</div>'
+      : `<table><thead><tr><th>Strategy</th><th>Trades</th><th>Win Rate</th><th>Total Options P&amp;L</th><th>Premium Moved</th></tr></thead><tbody>${
+          summary.map(s => `<tr><td><strong>${s.strategy}</strong></td><td>${s.trades}</td><td class="${s.winRate >= 50 ? 'pos' : 'neg'}">${s.winRate}%</td><td>${s.pnlTotal}</td><td>${s.premiumMoved}</td></tr>`).join('')
+        }</tbody></table>`;
+    document.getElementById('year-options-summary').innerHTML = sumHtml;
+
+    const detailRows = (data.results || []).map(r => {
+      if (r.error) return `<tr><td>${r.strategy}</td><td>${r.symbol}</td><td colspan="6" style="color:var(--red);font-size:11px">${r.error}</td></tr>`;
+      return `<tr>
+        <td>${r.strategy}</td><td><strong>${r.symbol}</strong></td>
+        <td>${r.totalTrades}</td>
+        <td class="${r.winRate >= 50 ? 'pos' : 'neg'}">${r.winRate}%</td>
+        <td>${r.optionsTotalPnL}</td>
+        <td>${r.optionsPremiumMoved}</td>
+        <td>${r.totalReturnR}</td>
+        <td style="font-size:11px;color:var(--muted)">IV ${(r.liveOptionsEnv?.iv*100||0).toFixed(1)}% · ${r.liveOptionsEnv?.dteDays||'?'}d</td>
+      </tr>`;
+    }).join('');
+    document.getElementById('year-options-detail').innerHTML = `<table><thead><tr><th>Strategy</th><th>Symbol</th><th>Trades</th><th>Win Rate</th><th>Options P&amp;L</th><th>Premium Moved</th><th>Return (R)</th><th>Live Env</th></tr></thead><tbody>${detailRows}</tbody></table>`;
+
+    document.getElementById('year-options-results').style.display = '';
+    document.getElementById('router-msg').textContent = `Year-options backtest complete · ${summary.length} strategies × ${data.symbols.length} symbols.`;
+    loadRouterState();
+  } catch (e) {
+    document.getElementById('router-loading').style.display = 'none';
+    document.getElementById('router-msg').textContent = 'Failed: ' + e.message;
   }
 }
 
