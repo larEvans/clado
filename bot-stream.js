@@ -30,6 +30,15 @@ const STRICT_ROUTER    = process.env.STRICT_ROUTER === "true";
 const ACTIVE_STRATS    = (process.env.ACTIVE_STRATEGIES || "hybrid,hybrid10,hybrid-reversal,reversal,vwap")
   .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 const MAX_CONCURRENT   = parseInt(process.env.MAX_CONCURRENT_POSITIONS || "5");
+
+// Crypto symbols (comma-separated, with slash like "BTC/USD,ETH/USD"). When
+// set, the bot opens a second WebSocket to the crypto feed in parallel with
+// stocks and routes/places crypto orders 24/7.
+const CRYPTO_SYMBOLS = (process.env.CRYPTO_SYMBOLS || "")
+  .split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+
+// Crypto helpers
+const isCryptoSymbol = sym => typeof sym === "string" && sym.includes("/");
 // CONSENSUS_MODE: require ≥ CONSENSUS_MIN strategies to agree on direction
 // before the router lets a trade through. Off (=1) by default.
 const CONSENSUS_MIN    = Math.max(1, parseInt(process.env.CONSENSUS_MIN || "1"));
@@ -119,15 +128,20 @@ function appendLog(entry) {
 // ── Alpaca REST helpers ───────────────────────────────────────────────────────
 
 async function placeOrder(symbol, side, notionalUSD) {
+  // Crypto requires time_in_force=gtc and minimum $10 notional; stocks use day TIF.
+  const isCrypto = isCryptoSymbol(symbol);
+  const tif      = isCrypto ? "gtc" : "day";
+  const notional = isCrypto ? Math.max(notionalUSD, 10) : notionalUSD;
+
   const res = await fetch(`${ALPACA_BASE}/v2/orders`, {
     method: "POST",
     headers: ALPACA_HEADERS,
     body: JSON.stringify({
       symbol,
-      notional:     notionalUSD.toFixed(2),
+      notional:     notional.toFixed(2),
       side,
       type:         "market",
-      time_in_force:"day",
+      time_in_force: tif,
     }),
   });
   const data = await res.json();
@@ -603,12 +617,15 @@ async function onRouterBar(bar) {
   const now    = new Date();
   const etMins = etMinutesOf(now);
   const today  = todayET(now);
+  const crypto = isCryptoSymbol(sym);
 
-  if (etMins < MARKET_OPEN || etMins >= MARKET_CLOSE) return;
+  // Crypto trades 24/7 — bypass NYSE market-hours gating. For stocks, only
+  // act inside RTH; for crypto, every bar at any hour is fair game.
+  if (!crypto && (etMins < MARKET_OPEN || etMins >= MARKET_CLOSE)) return;
   resetRouterDayIfNew(today);
 
-  // ── EOD close ─────────────────────────────────────────────────────────
-  if (etMins >= EOD_CLOSE && s.position) {
+  // ── EOD close (stocks only — crypto positions can roll overnight) ───
+  if (!crypto && etMins >= EOD_CLOSE && s.position) {
     console.log(`[Router] ${sym} EOD — close @ $${bar.close.toFixed(2)}`);
     await closeRouterPosition(sym, bar.close, "eod");
     return;
@@ -639,7 +656,7 @@ async function onRouterBar(bar) {
 
   // ── Entry: classify regime, gather candidates, route ──────────────────
   if (s.tradedToday) return;
-  if (etMins < ORB_READY) return;
+  if (!crypto && etMins < ORB_READY) return;  // ORB-gated entries are stocks-only
   if (s.bars.length < 20) return;
 
   // Capacity check: don't exceed max concurrent positions
@@ -649,7 +666,12 @@ async function onRouterBar(bar) {
   const r = classifyRegime(s.bars);
   s.lastRegime = r.tag;
 
-  const candidates = ACTIVE_STRATS.map(strategy => ({
+  // Crypto narrows to strategies that don't depend on a 9:30 ET open.
+  // Mean-reversion / divergence strategies apply 24/7; ORB-based ones don't.
+  const eligibleStrats = crypto
+    ? ACTIVE_STRATS.filter(x => ["reversal", "vwap-reclaim", "hybrid-reversal"].includes(x))
+    : ACTIVE_STRATS;
+  const candidates = eligibleStrats.map(strategy => ({
     strategy,
     signal: candidateSignals(strategy, sym, s.bars),
   }));
@@ -765,12 +787,37 @@ if (ROUTER_ENABLED) {
   console.log(`[Bot] single-strategy mode (${STRATEGY} on ${SYMBOL}) — set ROUTER_ENABLED=true for multi-strategy routing`);
 }
 
-const stream = new AlpacaStream(resolvedSymbols);
-stream.on("connected",    () => console.log("[Bot] Stream connected and authenticated"));
-stream.on("disconnected", () => console.log("[Bot] Stream disconnected — auto-reconnecting"));
-stream.on("error",        err => console.error("[Bot] Stream error:", err.message));
-stream.on("bar",          ROUTER_ENABLED ? onRouterBar : onBar);
-stream.connect();
+// Split symbols by feed: stocks go to the IEX stream, crypto to the v1beta3 stream.
+const stockSymbols  = resolvedSymbols.filter(s => !isCryptoSymbol(s));
+const cryptoSymbols = [...new Set([...resolvedSymbols.filter(isCryptoSymbol), ...CRYPTO_SYMBOLS])];
+
+const streams = [];
+
+if (stockSymbols.length > 0) {
+  const s = new AlpacaStream(stockSymbols, { feed: "stocks" });
+  s.on("connected",    () => console.log(`[Bot] STOCKS stream connected — ${stockSymbols.join(", ")}`));
+  s.on("disconnected", () => console.log("[Bot] STOCKS stream disconnected — auto-reconnecting"));
+  s.on("error",        err => console.error("[Bot] STOCKS stream error:", err.message));
+  s.on("bar",          ROUTER_ENABLED ? onRouterBar : onBar);
+  s.connect();
+  streams.push(s);
+}
+
+if (cryptoSymbols.length > 0) {
+  if (!ROUTER_ENABLED) {
+    console.log(`[Bot] CRYPTO_SYMBOLS set but ROUTER_ENABLED is off — crypto bars will stream but only the router consumes them. Set ROUTER_ENABLED=true to trade crypto.`);
+  }
+  const s = new AlpacaStream(cryptoSymbols, { feed: "crypto" });
+  s.on("connected",    () => console.log(`[Bot] CRYPTO stream connected — ${cryptoSymbols.join(", ")}`));
+  s.on("disconnected", () => console.log("[Bot] CRYPTO stream disconnected — auto-reconnecting"));
+  s.on("error",        err => console.error("[Bot] CRYPTO stream error:", err.message));
+  // Crypto always goes through the router (the single-strategy onBar is too NYSE-centric)
+  s.on("bar",          onRouterBar);
+  s.connect();
+  streams.push(s);
+}
+
+const stream = streams[0] || null; // keep `stream` reference for SIGINT close below
 
 // Graceful shutdown
 process.on("SIGINT", async () => {
@@ -780,6 +827,6 @@ process.on("SIGINT", async () => {
     console.warn("[Bot] WARNING: Open position not closed — check your Alpaca account!");
   }
   saveState({ botStopped: new Date().toISOString() });
-  stream.close();
+  for (const s of streams) { try { s.close(); } catch {} }
   process.exit(0);
 });

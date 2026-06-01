@@ -1,12 +1,23 @@
 /**
- * Alpaca WebSocket 1-minute bar stream (IEX free tier)
+ * Alpaca WebSocket 1-minute bar stream
+ *
+ * Supports two feeds via the `feed` constructor option:
+ *   - "stocks" (default): wss://stream.data.alpaca.markets/v2/iex
+ *   - "crypto"          : wss://stream.data.alpaca.markets/v1beta3/crypto/us
+ *
+ * Both use the same auth + subscribe protocol. Crypto symbols are formatted
+ * with a slash ("BTC/USD"). Crypto markets trade 24/7.
+ *
  * Node 22 built-in WebSocket — no extra dependencies
  * Emits: 'connected', 'disconnected', 'bar', 'trade', 'error'
  */
 
 import { EventEmitter } from "events";
 
-const WS_URL = "wss://stream.data.alpaca.markets/v2/iex";
+const FEED_URLS = {
+  stocks: "wss://stream.data.alpaca.markets/v2/iex",
+  crypto: "wss://stream.data.alpaca.markets/v1beta3/crypto/us",
+};
 
 export class AlpacaStream extends EventEmitter {
   #ws         = null;
@@ -14,11 +25,17 @@ export class AlpacaStream extends EventEmitter {
   #authed     = false;
   #closing    = false;
   #retryDelay = 3000;
+  #feed       = "stocks";
+  #wsUrl      = FEED_URLS.stocks;
 
-  constructor(symbols = ["SPY"]) {
+  constructor(symbols = ["SPY"], opts = {}) {
     super();
     this.#symbols = [].concat(symbols);
+    this.#feed    = opts.feed === "crypto" ? "crypto" : "stocks";
+    this.#wsUrl   = FEED_URLS[this.#feed];
   }
+
+  get feed() { return this.#feed; }
 
   connect() {
     this.#closing = false;
@@ -26,7 +43,7 @@ export class AlpacaStream extends EventEmitter {
   }
 
   #open() {
-    const ws = new WebSocket(WS_URL);
+    const ws = new WebSocket(this.#wsUrl);
     this.#ws  = ws;
 
     ws.addEventListener("open", () => {

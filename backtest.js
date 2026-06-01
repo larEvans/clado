@@ -51,20 +51,41 @@ export async function fetchCandles(symbol, interval, opts = {}) {
     "APCA-API-SECRET-KEY": process.env.ALPACA_SECRET_KEY,
   };
 
-  const candles = [];
-  let nextToken = null;
-  // Scale the hard cap with the requested window so a year of 5-min bars
-  // (~19,700 candles) actually fits.
+  // Crypto symbols (BTC/USD, ETH/USD…) use a different historical endpoint
+  // and parameter set: /v1beta3/crypto/us/bars?symbols=BTC/USD&timeframe=…
+  const isCrypto = symbol.includes("/");
   const candleCap = (yearWindow || envDays) ? 30_000 : 5_000;
 
-  do {
-    const qs = new URLSearchParams({ timeframe: tf, start, limit: "10000", adjustment: "split", feed: "iex", ...(nextToken && { page_token: nextToken }) });
-    const res = await fetch(`${BASE}/v2/stocks/${symbol}/bars?${qs}`, { headers, signal: AbortSignal.timeout(30_000) });
-    if (!res.ok) throw new Error(`Alpaca bars ${res.status} for ${symbol} — check the ticker`);
-    const json = await res.json();
-    for (const b of (json.bars || [])) candles.push({ time: new Date(b.t).getTime(), open: b.o, high: b.h, low: b.l, close: b.c, volume: b.v });
-    nextToken = json.next_page_token || null;
-  } while (nextToken && candles.length < candleCap);
+  const candles = [];
+  let nextToken = null;
+
+  if (isCrypto) {
+    do {
+      const qs = new URLSearchParams({
+        symbols:   symbol,
+        timeframe: tf,
+        start,
+        limit:     "10000",
+        sort:      "asc",
+        ...(nextToken && { page_token: nextToken }),
+      });
+      const res = await fetch(`${BASE}/v1beta3/crypto/us/bars?${qs}`, { headers, signal: AbortSignal.timeout(30_000) });
+      if (!res.ok) throw new Error(`Alpaca crypto bars ${res.status} for ${symbol} — check the symbol format (e.g. BTC/USD)`);
+      const json = await res.json();
+      const bars = json.bars?.[symbol] || [];
+      for (const b of bars) candles.push({ time: new Date(b.t).getTime(), open: b.o, high: b.h, low: b.l, close: b.c, volume: b.v });
+      nextToken = json.next_page_token || null;
+    } while (nextToken && candles.length < candleCap);
+  } else {
+    do {
+      const qs = new URLSearchParams({ timeframe: tf, start, limit: "10000", adjustment: "split", feed: "iex", ...(nextToken && { page_token: nextToken }) });
+      const res = await fetch(`${BASE}/v2/stocks/${symbol}/bars?${qs}`, { headers, signal: AbortSignal.timeout(30_000) });
+      if (!res.ok) throw new Error(`Alpaca bars ${res.status} for ${symbol} — check the ticker`);
+      const json = await res.json();
+      for (const b of (json.bars || [])) candles.push({ time: new Date(b.t).getTime(), open: b.o, high: b.h, low: b.l, close: b.c, volume: b.v });
+      nextToken = json.next_page_token || null;
+    } while (nextToken && candles.length < candleCap);
+  }
 
   if (candles.length === 0) throw new Error(`No data returned for ${symbol}`);
   return candles;
