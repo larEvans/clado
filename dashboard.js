@@ -60,6 +60,52 @@ app.use(express.json());
 app.use(express.static(__dirname));
 app.get("/", (req, res) => res.sendFile(join(__dirname, "dashboard.html")));
 
+// ─── Test trade — fire a tiny paper order to confirm execution path works ──
+// POST /api/test-trade  { symbol, side, notional, type?, tif? }
+// Defaults: notional=$2, type=market. For crypto symbols (with "/"), tif=gtc.
+// Returns the raw Alpaca response so we can see exactly what happened.
+app.post("/api/test-trade", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const symbol   = (body.symbol || "BTC/USD").trim();
+    const side     = (body.side   || "buy").toLowerCase();
+    const notional = parseFloat(body.notional ?? 2);
+    const type     = (body.type   || "market").toLowerCase();
+    const isCrypto = symbol.includes("/");
+    const tif      = (body.tif    || (isCrypto ? "gtc" : "day")).toLowerCase();
+
+    const orderBody = {
+      symbol,
+      notional:      notional.toFixed(2),
+      side,
+      type,
+      time_in_force: tif,
+    };
+
+    const url = `${ALPACA_BASE}/v2/orders`;
+    const r = await fetch(url, { method: "POST", headers: ALPACA_HEADERS, body: JSON.stringify(orderBody) });
+    const text = await r.text();
+    let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+    res.status(r.ok ? 200 : 400).json({
+      ok:        r.ok,
+      status:    r.status,
+      sentTo:    url,
+      sentBody:  orderBody,
+      response:  data,
+      hints: r.ok ? [] : [
+        symbol.includes("/")
+          ? "Crypto orders require crypto trading enabled on your Alpaca account → https://app.alpaca.markets/paper/dashboard/overview → Settings → Crypto"
+          : null,
+        r.status === 403 ? "Account permissions issue — check Alpaca dashboard." : null,
+        r.status === 422 ? "Symbol or order parameters invalid — check the response." : null,
+      ].filter(Boolean),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ─── Diagnostics — visit /api/diag to see why account data is missing ────────
 app.get("/api/diag", async (req, res) => {
   const keyId    = process.env.ALPACA_API_KEY    || "";
