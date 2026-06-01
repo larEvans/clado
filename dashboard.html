@@ -162,6 +162,7 @@
   <div class="tab" data-tab="strategies">Strategies & Backtest</div>
   <div class="tab" data-tab="signals">Daily Signals</div>
   <div class="tab" data-tab="router">Strategy Router</div>
+  <div class="tab" data-tab="options-backtest">Options Backtest</div>
   <div class="tab" data-tab="chart">Chart</div>
   <div class="tab" data-tab="options">Options Chain</div>
 </div>
@@ -600,6 +601,111 @@
     <div id="year-options-summary" style="padding:10px"></div>
     <div class="section-header" style="margin-top:14px">Per-Symbol Detail</div>
     <div id="year-options-detail" class="tbl-wrap" style="padding:6px"></div>
+  </div>
+</div>
+
+<!-- ══ OPTIONS BACKTEST PANEL ════════════════════════════════════════════════ -->
+<div id="tab-options-backtest" class="panel">
+
+  <!-- How to read -->
+  <details style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:6px 14px">
+    <summary style="cursor:pointer;font-size:13px;font-weight:600;padding:6px 0">📘 How to use this page (click to expand)</summary>
+    <div style="font-size:13px;line-height:1.6;color:#cbd5e1;padding:10px 4px 14px">
+      <p style="margin:0 0 10px"><strong>Two modes of backtesting:</strong></p>
+      <ul style="margin:0 0 10px;padding-left:24px">
+        <li><strong>Single Run</strong> — pick one (strategy × symbol) combo, run it on options data over your chosen window, see the equity curve and full trade list.</li>
+        <li><strong>Bulk Run</strong> — run every active strategy against every watchlist symbol in options mode. Each cell of the summary shows win rate, total options P&amp;L, and total premium moved per (strategy × symbol).</li>
+      </ul>
+      <p style="margin:0 0 10px"><strong>IV/DTE source:</strong></p>
+      <ul style="margin:0 0 10px;padding-left:24px">
+        <li><strong>Live</strong> (default) — pulls today's IV and nearest expiry DTE from Alpaca per symbol. Most realistic for current conditions.</li>
+        <li><strong>Static</strong> — uses your hand-entered IV % and DTE. Useful for stress-testing strategies under specific vol environments.</li>
+      </ul>
+      <p style="margin:0 0 6px"><strong>Options-specific metrics (in addition to standard stock metrics):</strong></p>
+      <ul style="margin:0;padding-left:24px;font-size:12px">
+        <li><code>Total P&amp;L</code> = sum of all per-contract option PnL (gross, before commissions)</li>
+        <li><code>Total Premium Moved</code> = total dollars of option premium that changed hands (entry + exit combined)</li>
+        <li><code>Avg Premium</code> = average entry premium per share — useful for sizing intuition</li>
+        <li><code>Win Rate</code> here is on the option PnL, not the underlying stock direction (an in-the-money option that decays from theta still loses)</li>
+      </ul>
+    </div>
+  </details>
+
+  <!-- Controls -->
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 18px;display:flex;gap:18px;align-items:flex-end;flex-wrap:wrap">
+    <div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.6px">Symbol</div>
+      <input id="optbt-symbol" type="text" value="QQQ" class="inp" style="width:110px;text-transform:uppercase">
+    </div>
+    <div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.6px">Strategy</div>
+      <select id="optbt-strategy" class="inp" style="width:200px">
+        <option value="hybrid10" selected>Hybrid-10</option>
+        <option value="vwap-reclaim">VWAP Reclaim</option>
+        <option value="hybrid">Hybrid</option>
+        <option value="hybrid-reversal">Hybrid + Reversal</option>
+        <option value="reversal">Reversal</option>
+        <option value="vwap">VWAP</option>
+        <option value="orb">ORB</option>
+        <option value="gap-fill">Gap Fill</option>
+        <option value="first-hour-fade">First-Hour Fade</option>
+      </select>
+    </div>
+    <div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.6px">IV Source</div>
+      <select id="optbt-iv-source" class="inp" style="width:120px">
+        <option value="live" selected>Live (Alpaca)</option>
+        <option value="static">Static</option>
+      </select>
+    </div>
+    <div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.6px">IV %</div>
+      <input id="optbt-iv" type="number" value="25" min="5" max="300" class="inp" style="width:65px">
+    </div>
+    <div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.6px">DTE</div>
+      <input id="optbt-dte" type="number" value="7" min="0" max="60" class="inp" style="width:55px">
+    </div>
+    <div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.6px">Contracts</div>
+      <input id="optbt-contracts" type="number" value="1" min="1" max="100" class="inp" style="width:60px">
+    </div>
+    <div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.6px">Window</div>
+      <select id="optbt-window" class="inp" style="width:110px">
+        <option value="short" selected>~60 days</option>
+        <option value="year">~1 year</option>
+      </select>
+    </div>
+    <div style="display:flex;gap:8px;margin-left:auto">
+      <button class="btn btn-primary" onclick="runOptionsBacktest()">Run</button>
+      <button class="btn btn-hermes"  onclick="runBulkOptionsBacktest()">Bulk: All Strategies × Watchlist</button>
+    </div>
+  </div>
+
+  <div id="optbt-loading" style="display:none;text-align:center;color:var(--muted);padding:30px"><span class="spin">⟳</span> Running options backtest…</div>
+  <div id="optbt-msg"     style="font-size:12px;color:var(--muted);padding:6px 14px"></div>
+
+  <!-- Single-run results -->
+  <div id="optbt-single" class="section" style="display:none;padding:14px 18px">
+    <div class="section-header">Single Run · <span id="optbt-single-label" style="color:var(--muted);font-weight:400"></span></div>
+    <div id="optbt-single-metrics" class="bot-grid" style="padding:8px"></div>
+    <div id="optbt-single-options" style="padding:10px 14px;background:rgba(59,130,246,.06);border:1px solid rgba(59,130,246,.2);border-radius:6px;margin:8px;font-size:13px;display:none"></div>
+    <div class="section-header" style="margin-top:14px;font-size:11px">Trade List</div>
+    <div class="tbl-wrap"><table>
+      <thead><tr>
+        <th>Date</th><th>Side</th><th>Type</th><th>Strike</th><th>Entry $</th><th>Exit $</th><th>Stock P&amp;L %</th><th>Option P&amp;L</th><th>Exit Reason</th>
+      </tr></thead>
+      <tbody id="optbt-single-trades"></tbody>
+    </table></div>
+  </div>
+
+  <!-- Bulk results -->
+  <div id="optbt-bulk" class="section" style="display:none;padding:14px 18px">
+    <div class="section-header">Bulk Run · Summary by Strategy</div>
+    <div id="optbt-bulk-summary" style="padding:10px"></div>
+    <div class="section-header" style="margin-top:14px;font-size:11px">Per-Symbol Detail</div>
+    <div class="tbl-wrap" id="optbt-bulk-detail" style="padding:6px"></div>
   </div>
 </div>
 
@@ -2306,6 +2412,143 @@ async function optimizeByRegime() {
   } catch (e) {
     document.getElementById('router-loading').style.display = 'none';
     document.getElementById('router-msg').textContent = 'Optimize failed: ' + e.message;
+  }
+}
+
+// ─── Options Backtest tab ─────────────────────────────────────────────────────
+async function runOptionsBacktest() {
+  const symbol    = (document.getElementById('optbt-symbol').value || 'QQQ').trim().toUpperCase();
+  const strategy  = document.getElementById('optbt-strategy').value;
+  const ivSource  = document.getElementById('optbt-iv-source').value;
+  const iv        = parseFloat(document.getElementById('optbt-iv').value) || 25;
+  const dte       = parseInt(document.getElementById('optbt-dte').value) || 7;
+  const contracts = parseInt(document.getElementById('optbt-contracts').value) || 1;
+  const window    = document.getElementById('optbt-window').value;
+
+  document.getElementById('optbt-loading').style.display = '';
+  document.getElementById('optbt-single').style.display  = 'none';
+  document.getElementById('optbt-bulk').style.display    = 'none';
+  document.getElementById('optbt-msg').textContent       = '';
+
+  const body = {
+    strategy, symbol,
+    mode: 'options',
+    contracts,
+    saveToHistory: false,
+    useLiveOptions: ivSource === 'live',
+    yearWindow: window === 'year',
+  };
+  if (ivSource === 'static') Object.assign(body, { iv, dte });
+
+  try {
+    const r = await fetch('/api/backtest', { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify(body) }).then(r => r.json());
+    document.getElementById('optbt-loading').style.display = 'none';
+    if (r.error) { document.getElementById('optbt-msg').textContent = 'Error: ' + r.error; return; }
+
+    document.getElementById('optbt-single-label').textContent = `${strategy.toUpperCase()} on ${symbol} · ${ivSource === 'live' ? `live IV ${r.liveOptionsEnv?.iv ? (r.liveOptionsEnv.iv*100).toFixed(1)+'%' : '?'} / DTE ${r.liveOptionsEnv?.dteDays || '?'}d` : `static IV ${iv}% / DTE ${dte}d`}`;
+
+    // Summary metrics
+    const m = {
+      'Total Trades': r.totalTrades, 'Wins': r.wins, 'Losses': r.losses,
+      'Win Rate': r.winRate, 'Profit Factor': r.profitFactor,
+      'Total Return': r.totalReturnR, 'Max DD': r.maxDrawdown,
+    };
+    document.getElementById('optbt-single-metrics').innerHTML = Object.entries(m).map(([k, v]) => {
+      const cls = (k === 'Win Rate' && parseFloat(v) >= 50) || (k === 'Total Return' && String(v).startsWith('+')) || (k === 'Profit Factor' && parseFloat(v) > 1) ? 'pos'
+                : (k === 'Total Return' && String(v).startsWith('-')) ? 'neg' : '';
+      return `<div class="metric"><div class="m-label">${k}</div><div class="m-value ${cls}">${v ?? '—'}</div></div>`;
+    }).join('');
+
+    // Options-specific block
+    if (r.optionsMetrics) {
+      const om = r.optionsMetrics;
+      const pnlCls = om.totalPnL.includes('-') ? 'neg' : 'pos';
+      document.getElementById('optbt-single-options').style.display = '';
+      document.getElementById('optbt-single-options').innerHTML = `
+        <div style="font-weight:600;margin-bottom:8px;color:#93c5fd">Options Metrics</div>
+        <div style="display:flex;gap:24px;flex-wrap:wrap">
+          <div><span style="color:var(--muted)">Total P&amp;L:</span> <strong class="${pnlCls}">${om.totalPnL}</strong></div>
+          <div><span style="color:var(--muted)">Options Win Rate:</span> <strong>${om.winRate}</strong></div>
+          <div><span style="color:var(--muted)">Avg Entry Premium:</span> ${om.avgPremium}</div>
+          <div><span style="color:var(--muted)">Total Entry Premium:</span> ${om.totalEntryPremium}</div>
+          <div><span style="color:var(--muted)">Total Exit Premium:</span> ${om.totalExitPremium}</div>
+          <div><span style="color:var(--muted)">Total Premium Moved:</span> ${om.totalPremiumTraded}</div>
+          <div><span style="color:var(--muted)">Contracts Traded:</span> ${om.contractsTraded}</div>
+        </div>`;
+    } else {
+      document.getElementById('optbt-single-options').style.display = 'none';
+    }
+
+    // Trade list
+    const trades = (r.trades || []).slice().reverse().slice(0, 200);
+    if (trades.length === 0) {
+      document.getElementById('optbt-single-trades').innerHTML = `<tr><td colspan="9" class="empty">No trades generated</td></tr>`;
+    } else {
+      document.getElementById('optbt-single-trades').innerHTML = trades.map(t => {
+        const sideCls = t.side === 'buy' ? 'pos' : 'neg';
+        const sPct    = t.pnlPct ?? 0;
+        const sCls    = sPct > 0 ? 'pos' : 'neg';
+        const oPnL    = t.optionsPnL != null ? (t.optionsPnL >= 0 ? '+$' : '-$') + Math.abs(t.optionsPnL).toFixed(2) : '—';
+        const oCls    = t.optionsPnL != null ? (t.optionsPnL >= 0 ? 'pos' : 'neg') : '';
+        return `<tr>
+          <td>${t.date || '—'}</td>
+          <td class="${sideCls}">${(t.side||'').toUpperCase()}</td>
+          <td>${t.optionType || '—'}</td>
+          <td>${t.optionStrike != null ? '$'+t.optionStrike.toFixed(0) : '—'}</td>
+          <td>${t.entryPremium != null ? '$'+t.entryPremium.toFixed(2) : '—'}</td>
+          <td>${t.exitPremium  != null ? '$'+t.exitPremium.toFixed(2)  : '—'}</td>
+          <td class="${sCls}">${sPct >= 0 ? '+' : ''}${sPct.toFixed(2)}%</td>
+          <td class="${oCls}">${oPnL}</td>
+          <td style="font-size:11px;color:var(--muted)">${t.exitReason || '—'}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    document.getElementById('optbt-single').style.display = '';
+    document.getElementById('optbt-msg').textContent = `Backtest complete · ${r.totalTrades || 0} trade(s) generated`;
+  } catch (e) {
+    document.getElementById('optbt-loading').style.display = 'none';
+    document.getElementById('optbt-msg').textContent = 'Failed: ' + e.message;
+  }
+}
+
+async function runBulkOptionsBacktest() {
+  document.getElementById('optbt-loading').style.display = '';
+  document.getElementById('optbt-single').style.display  = 'none';
+  document.getElementById('optbt-bulk').style.display    = 'none';
+  document.getElementById('optbt-msg').textContent = 'Running every active strategy × every watchlist symbol on 1 year of 5m bars in options mode — this can take a few minutes…';
+
+  try {
+    const data = await fetch('/api/backtest/year-options', { method:'POST', headers:{ 'Content-Type':'application/json' }, body:'{}' }).then(r => r.json());
+    document.getElementById('optbt-loading').style.display = 'none';
+    if (data.error) { document.getElementById('optbt-msg').textContent = 'Error: ' + data.error; return; }
+
+    const summary = data.summary || [];
+    document.getElementById('optbt-bulk-summary').innerHTML = summary.length === 0
+      ? '<div style="color:var(--muted)">No data</div>'
+      : `<table><thead><tr><th>Strategy</th><th>Trades</th><th>Win Rate</th><th>Total Options P&amp;L</th><th>Premium Moved</th></tr></thead><tbody>${
+          summary.map(s => `<tr><td><strong>${s.strategy}</strong></td><td>${s.trades}</td><td class="${s.winRate >= 50 ? 'pos' : 'neg'}">${s.winRate}%</td><td>${s.pnlTotal}</td><td>${s.premiumMoved}</td></tr>`).join('')
+        }</tbody></table>`;
+
+    const detailRows = (data.results || []).map(r => {
+      if (r.error) return `<tr><td>${r.strategy}</td><td>${r.symbol}</td><td colspan="6" style="color:var(--red);font-size:11px">${r.error}</td></tr>`;
+      return `<tr>
+        <td>${r.strategy}</td><td><strong>${r.symbol}</strong></td>
+        <td>${r.totalTrades}</td>
+        <td class="${r.winRate >= 50 ? 'pos' : 'neg'}">${r.winRate}%</td>
+        <td>${r.optionsTotalPnL}</td>
+        <td>${r.optionsPremiumMoved}</td>
+        <td>${r.totalReturnR}</td>
+        <td style="font-size:11px;color:var(--muted)">IV ${(r.liveOptionsEnv?.iv*100||0).toFixed(1)}% · ${r.liveOptionsEnv?.dteDays||'?'}d</td>
+      </tr>`;
+    }).join('');
+    document.getElementById('optbt-bulk-detail').innerHTML = `<table><thead><tr><th>Strategy</th><th>Symbol</th><th>Trades</th><th>Win Rate</th><th>Options P&amp;L</th><th>Premium Moved</th><th>Return (R)</th><th>Live Env</th></tr></thead><tbody>${detailRows}</tbody></table>`;
+
+    document.getElementById('optbt-bulk').style.display = '';
+    document.getElementById('optbt-msg').textContent = `Bulk complete · ${summary.length} strategies × ${data.symbols.length} symbols`;
+  } catch (e) {
+    document.getElementById('optbt-loading').style.display = 'none';
+    document.getElementById('optbt-msg').textContent = 'Failed: ' + e.message;
   }
 }
 
