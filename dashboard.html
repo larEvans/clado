@@ -700,6 +700,37 @@
     </table></div>
   </div>
 
+  <!-- Options Strategist Learning -->
+  <div class="section" style="padding:14px 18px">
+    <div class="section-header" style="justify-content:space-between">
+      <span>Options Strategist · What it's learned</span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input id="learn-strategy" type="text" placeholder="strategy (optional)" class="inp" style="font-size:11px;padding:3px 8px;width:130px">
+        <input id="learn-symbol"   type="text" placeholder="symbol (optional)"   class="inp" style="font-size:11px;padding:3px 8px;width:90px;text-transform:uppercase">
+        <button class="btn btn-outline" style="font-size:11px;padding:4px 10px" onclick="loadOptionsLearning()">Refresh</button>
+      </div>
+    </div>
+    <div id="learn-summary" style="padding:10px 14px;font-size:12px;color:var(--muted)"></div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:6px 12px">
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px">Win Rate by DTE</div>
+        <div id="learn-byDte" class="tbl-wrap"></div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px">Win Rate by Delta</div>
+        <div id="learn-byDelta" class="tbl-wrap"></div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px">Win Rate by IV regime</div>
+        <div id="learn-byIv" class="tbl-wrap"></div>
+      </div>
+    </div>
+    <div style="padding:10px 14px">
+      <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px">Best DTE × Delta buckets (n ≥ 5)</div>
+      <div id="learn-buckets" class="tbl-wrap"></div>
+    </div>
+  </div>
+
   <!-- Bulk results -->
   <div id="optbt-bulk" class="section" style="display:none;padding:14px 18px">
     <div class="section-header">Bulk Run · Summary by Strategy</div>
@@ -882,6 +913,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (tab.dataset.tab === 'options')    initOptionsTab();
     if (tab.dataset.tab === 'signals')    initDailySignals();
     if (tab.dataset.tab === 'router')     loadRouterState();
+    if (tab.dataset.tab === 'options-backtest') loadOptionsLearning();
     if (tab.dataset.tab === 'chart')      initChartTab();
   });
 });
@@ -2412,6 +2444,49 @@ async function optimizeByRegime() {
   } catch (e) {
     document.getElementById('router-loading').style.display = 'none';
     document.getElementById('router-msg').textContent = 'Optimize failed: ' + e.message;
+  }
+}
+
+// ─── Options Strategist learning panel ───────────────────────────────────────
+async function loadOptionsLearning() {
+  const strategy = document.getElementById('learn-strategy')?.value.trim().toLowerCase() || '';
+  const symbol   = document.getElementById('learn-symbol')?.value.trim().toUpperCase()   || '';
+  try {
+    const qs = new URLSearchParams();
+    if (strategy) qs.set('strategy', strategy);
+    if (symbol)   qs.set('symbol', symbol);
+    const data = await fetch('/api/options/learning' + (qs.toString() ? '?'+qs.toString() : '')).then(r => r.json());
+    const sum = document.getElementById('learn-summary');
+    sum.textContent = data.total === 0
+      ? 'No closed options trades yet — let the bot run with Options Strategist ON, or backtest in options mode with saveToHistory.'
+      : `${data.total} closed options trades${strategy ? ' · '+strategy : ''}${symbol ? ' · '+symbol : ''} · min sample for "qualified" = ${data.minSampleSize}`;
+
+    const renderTable = (rows, label) => {
+      if (!rows || rows.length === 0) return '<div style="color:var(--muted);font-size:11px;padding:4px">no data</div>';
+      return `<table style="width:100%;font-size:12px">
+        <thead><tr><th>${label}</th><th>Win Rate</th><th>Avg PnL</th><th>n</th></tr></thead>
+        <tbody>${rows.map(r => {
+          const wrCls = r.winRate >= 0.6 ? 'pos' : r.winRate >= 0.45 ? '' : 'neg';
+          const pnlCls = r.avgPnl >= 0 ? 'pos' : 'neg';
+          const qBadge = r.qualified ? '' : ' <span style="font-size:9px;color:var(--muted)">(thin)</span>';
+          return `<tr>
+            <td style="font-family:monospace">${r.key}${qBadge}</td>
+            <td class="${wrCls}">${(r.winRate*100).toFixed(0)}%</td>
+            <td class="${pnlCls}">${r.avgPnl >= 0 ? '+' : ''}$${r.avgPnl.toFixed(2)}</td>
+            <td style="color:var(--muted)">${r.sampleSize}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>`;
+    };
+    document.getElementById('learn-byDte').innerHTML   = renderTable(data.byDte, 'DTE');
+    document.getElementById('learn-byDelta').innerHTML = renderTable(data.byDelta, 'Delta');
+    document.getElementById('learn-byIv').innerHTML    = renderTable(data.byIv, 'IV');
+    document.getElementById('learn-buckets').innerHTML = renderTable(
+      (data.buckets || []).filter(b => b.qualified).slice(0, 12),
+      'DTE × Delta'
+    );
+  } catch (e) {
+    document.getElementById('learn-summary').textContent = 'Error: ' + e.message;
   }
 }
 

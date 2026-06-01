@@ -153,11 +153,43 @@ export function saveRegimeParams(strategy, regime, params, stats = {}) {
 
 // ── Record a closed trade ─────────────────────────────────────────────────────
 
+// Bucket helpers — keep cardinality low so each bucket gets useful sample size.
+export function dteBucket(dte) {
+  if (dte == null)   return null;
+  if (dte <= 1)      return "0-1d";
+  if (dte <= 4)      return "2-4d";
+  if (dte <= 9)      return "5-9d";
+  if (dte <= 21)     return "10-21d";
+  return "22d+";
+}
+export function deltaBucket(delta) {
+  if (delta == null) return null;
+  const d = Math.abs(delta);
+  if (d < 0.3)       return "<0.3";
+  if (d < 0.4)       return "0.30-0.40";
+  if (d < 0.55)      return "0.40-0.55";
+  if (d < 0.7)       return "0.55-0.70";
+  return ">=0.70";
+}
+export function ivBucket(iv) {
+  if (iv == null)    return null;
+  // iv expected as decimal (0.25 = 25%)
+  if (iv < 0.18)     return "low";
+  if (iv < 0.35)     return "normal";
+  return "high";
+}
+
 export function recordTradeClosed({
   symbol, strategy, side,
   entryPrice, exitPrice,
   entryTime, exitTime, exitReason,
   regime = null, hourET = null,
+  // Options-specific (passed when pos.isOption is true)
+  isOption = false, contractSymbol = null,
+  optionType = null, optionStrike = null,
+  optionDte = null, optionDelta = null, optionIv = null,
+  entryPremium = null, exitPremium = null, optionsPnL = null,
+  agentSource = null, agentReasoning = null, agentConfidence = null,
 }) {
   let history = [];
   if (existsSync(HISTORY_FILE)) {
@@ -177,6 +209,16 @@ export function recordTradeClosed({
     hourET = new Date(d.getTime() + offsetMin * 60_000).getUTCHours();
   }
 
+  // Derive options bucket fields from entry context when present
+  const strikeDistPct = (isOption && optionStrike != null && entryPrice)
+    ? +(((optionStrike - entryPrice) / entryPrice) * 100).toFixed(3)
+    : null;
+  const premiumPctOfSpot = (isOption && entryPremium != null && entryPrice)
+    ? +((entryPremium / entryPrice) * 100).toFixed(3)
+    : null;
+  // Effective win for options is the option leg PnL, NOT the stock direction
+  const optionsWin = isOption && optionsPnL != null ? optionsPnL > 0 : null;
+
   history.push({
     symbol, strategy, side,
     entryPrice, exitPrice,
@@ -184,6 +226,18 @@ export function recordTradeClosed({
     win,
     entryTime, exitTime, exitReason,
     regime, hourET,
+    ...(isOption ? {
+      isOption: true, contractSymbol,
+      optionType, optionStrike,
+      optionDte, optionDelta, optionIv,
+      entryPremium, exitPremium, optionsPnL,
+      optionsWin,
+      strikeDistPct, premiumPctOfSpot,
+      dteBucket:    dteBucket(optionDte),
+      deltaBucket:  deltaBucket(optionDelta),
+      ivBucket:     ivBucket(optionIv),
+      agentSource, agentReasoning, agentConfidence,
+    } : {}),
     recordedAt: new Date().toISOString(),
   });
 
@@ -275,4 +329,80 @@ export function runLearner(strategy) {
   };
   writeFileSync(PARAMS_FILE, JSON.stringify(all, null, 2));
   return params;
+}
+
+// ── Options learning ──────────────────────────────────────────────────────────
+//
+// Aggregates closed options trades by (DTE bucket × delta bucket) so the
+// Options Strategist agent can boost contracts that historically won.
+
+export function getOptionsHistoryStats({ strategy = null, symbol = null, minSampleSize = 5 } = {}) {
+  if (!existsSync(HISTORY_FILE)) return { buckets: [], byDte: {}, byDelta: {}, byIv: {}, total: 0 };
+  let history = [];
+  try { history = JSON.parse(readFileSync(HISTORY_FILE, "utf8")); } catch { return { buckets: [], total: 0 }; }
+  let sub = history.filter(t => t.isOption);
+  if (strategy) sub = sub.filter(t => t.strategy === strategy);
+  if (symbol)   sub = sub.filter(t => t.symbol === symbol);
+
+  const bucketAcc = new Map();
+  const oneD = new Map();   // by single dimension
+  const oneDelta = new Map();
+  const oneIv = new Map();
+
+  function bump(map, key, win, pnl) {
+    if (!key) return;
+    const s = map.get(key) || { key, wins: 0, total: 0, sumPnl: 0 };
+    s.total += 1;
+    s.sumPnl += pnl || 0;
+    if (win) s.wins += 1;
+    map.set(key, s);
+  }
+
+  for (const t of sub) {
+    const win  = t.optionsWin ?? (t.optionsPnL || 0) > 0;
+    const pnl  = t.optionsPnL || 0;
+    const dB   = t.dteBucket   || dteBucket(t.optionDte);
+    const dlB  = t.deltaBucket || deltaBucket(t.optionDelta);
+    const ivB  = t.ivBucket    || ivBucket(t.optionIv);
+    if (dB && dlB) {
+      const k = `${dB} · ${dlB}`;
+      bump(bucketAcc, k, win, pnl);
+    }
+    bump(oneD,     dB,  win, pnl);
+    bump(oneDelta, dlB, win, pnl);
+    bump(oneIv,    ivB, win, pnl);
+  }
+
+  const compact = (map) => [...map.values()]
+    .filter(s => s.total >= 0)
+    .map(s => ({
+      key:        s.key,
+      sampleSize: s.total,
+      winRate:    s.total > 0 ? +(s.wins / s.total).toFixed(3) : 0,
+      avgPnl:     s.total > 0 ? +(s.sumPnl / s.total).toFixed(2) : 0,
+      qualified:  s.total >= minSampleSize,
+    }))
+    .sort((a, b) => b.winRate - a.winRate || b.sampleSize - a.sampleSize);
+
+  return {
+    total:      sub.length,
+    minSampleSize,
+    buckets:    compact(bucketAcc),
+    byDte:      compact(oneD),
+    byDelta:    compact(oneDelta),
+    byIv:       compact(oneIv),
+    strategy, symbol,
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+// Lookup: given a candidate contract's DTE+delta, return the historical
+// win rate the agent should use to bias its score (null if no qualifying data).
+export function lookupOptionsBucketWinRate({ strategy, symbol, dte, delta, minSampleSize = 5 }) {
+  const dB  = dteBucket(dte);
+  const dlB = deltaBucket(delta);
+  if (!dB || !dlB) return null;
+  const stats = getOptionsHistoryStats({ strategy, symbol, minSampleSize });
+  const hit = stats.buckets.find(b => b.key === `${dB} · ${dlB}` && b.qualified);
+  return hit ? { winRate: hit.winRate, sampleSize: hit.sampleSize, avgPnl: hit.avgPnl } : null;
 }

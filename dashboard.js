@@ -22,7 +22,7 @@ import { meta as vwapReclaimMeta }     from "./strategies/vwap-reclaim.js";
 import { meta as firstHourFadeMeta }   from "./strategies/first-hour-fade.js";
 import { fetchChain, fetchExpiryDates, fetchContracts, getLiveOptionsParams } from "./options.js";
 import { AlpacaStream } from "./stream.js";
-import { loadAllLearning, getAllRegimeStats, saveRegimeParams, getRegimeStats } from "./learner.js";
+import { loadAllLearning, getAllRegimeStats, saveRegimeParams, getRegimeStats, getOptionsHistoryStats } from "./learner.js";
 import { classifyRegime } from "./regime.js";
 import { runHermesAnalysis, loadAllInsights, suggestParamChanges, explainTrades, deriveWinOnlyFilters } from "./hermes.js";
 
@@ -349,12 +349,24 @@ function backtestTradesToHistory(trades, strategy, symbol, { source = "backtest"
     forced:      !!t.forced,
     source,
     // Options fields (present when mode === "options")
+    isOption:      t.optionType ? true : false,
     optionType:    t.optionType    || null,
     optionStrike:  t.optionStrike  || null,
+    optionDte:     t.optionDTE     ?? null,
+    optionIv:      t.optionIv      ?? null,
     entryPremium:  t.entryPremium  != null ? +t.entryPremium.toFixed(4)  : null,
     exitPremium:   t.exitPremium   != null ? +t.exitPremium.toFixed(4)   : null,
     optionsPnL:    t.optionsPnL    != null ? +t.optionsPnL.toFixed(2)    : null,
     optionsPnLPct: t.optionsPnLPct != null ? +t.optionsPnLPct.toFixed(4) : null,
+    optionsWin:    t.optionsPnL != null ? t.optionsPnL > 0 : null,
+    // Buckets so the learner doesn't need to recompute them on read
+    dteBucket:     t.optionDTE == null ? null :
+                   t.optionDTE <= 1 ? "0-1d" :
+                   t.optionDTE <= 4 ? "2-4d" :
+                   t.optionDTE <= 9 ? "5-9d" :
+                   t.optionDTE <= 21 ? "10-21d" : "22d+",
+    strikeDistPct: (t.optionStrike != null && t.entry) ? +(((t.optionStrike - t.entry) / t.entry) * 100).toFixed(3) : null,
+    premiumPctOfSpot: (t.entryPremium != null && t.entry) ? +((t.entryPremium / t.entry) * 100).toFixed(3) : null,
     recordedAt: new Date().toISOString(),
   }));
 }
@@ -938,6 +950,19 @@ app.post("/api/backtest/cpcv", async (req, res) => {
     console.error("[CPCV] error:", e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ─── Options Strategist learning ──────────────────────────────────────────────
+//
+// What the agent has learned from closed options trades — bucket stats by
+// DTE × delta, plus single-dimension breakdowns. The Options Backtest tab
+// renders this so you can see which contract profiles actually win.
+
+app.get("/api/options/learning", (req, res) => {
+  const strategy = req.query?.strategy || null;
+  const symbol   = req.query?.symbol   || null;
+  const min      = parseInt(req.query?.minSampleSize || "5");
+  res.json(getOptionsHistoryStats({ strategy, symbol, minSampleSize: min }));
 });
 
 // ─── Strategy Router ───────────────────────────────────────────────────────────

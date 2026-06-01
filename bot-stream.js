@@ -898,6 +898,25 @@ async function closeRouterPosition(sym, exitPrice, exitReason) {
     exitReason,
     regime: pos.regime,
     hourET,
+    // Options metadata so the agent can learn from outcomes
+    ...(pos.isOption ? {
+      isOption:       true,
+      contractSymbol: pos.contractSymbol,
+      optionType:     pos.contract?.type,
+      optionStrike:   pos.contract?.strike,
+      optionDte:      pos.contract?.dte,
+      optionDelta:    pos.contract?.delta,
+      optionIv:       pos.entryIv,
+      entryPremium:   pos.entryPremium,
+      // exitPremium / optionsPnL aren't known exactly here — Alpaca's close
+      // order fill arrives async. We approximate via the underlying move and
+      // record the contract type so the agent learns from directional outcome
+      // even before fill prices land.
+      optionsPnL:     null,
+      agentSource:    pos.agentSource,
+      agentReasoning: pos.agentReasoning,
+      agentConfidence: pos.agentConfidence,
+    } : {}),
   });
   s.position = null;
 }

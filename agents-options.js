@@ -25,7 +25,8 @@
  *     { exit: boolean, reason: string }
  */
 
-import { fetchChain, fetchSnapshots } from "./options.js";
+import { fetchChain, fetchSnapshots }     from "./options.js";
+import { lookupOptionsBucketWinRate }     from "./learner.js";
 
 // ── Claude call ────────────────────────────────────────────────────────────────
 
@@ -69,17 +70,32 @@ function buildOptionsPrompt(signal, stockPrice, chainContext) {
     .sort((a, b) => a.dist - b.dist)
     .slice(0, 8);
 
-  const compact = nearAtm.map(c => ({
-    sym:    c.symbol,
-    strike: c.strike,
-    bid:    c.bid,
-    ask:    c.ask,
-    mid:    c.mid,
-    oi:     c.oi,
-    iv:     c.iv,
-    delta:  c.greeks?.delta,
-    theta:  c.greeks?.theta,
-  }));
+  const compact = nearAtm.map(c => {
+    const delta = c.greeks?.delta ?? null;
+    let hist = null;
+    try {
+      hist = lookupOptionsBucketWinRate({
+        strategy: signal.strategy,
+        symbol:   chainContext.symbol,
+        dte:      chainContext.dte,
+        delta,
+        minSampleSize: 5,
+      });
+    } catch {}
+    return {
+      sym:    c.symbol,
+      strike: c.strike,
+      bid:    c.bid,
+      ask:    c.ask,
+      mid:    c.mid,
+      oi:     c.oi,
+      iv:     c.iv,
+      delta,
+      theta:  c.greeks?.theta,
+      // Historical performance of contracts in this (DTE × delta) bucket
+      history: hist ? `${(hist.winRate*100).toFixed(0)}% WR (n=${hist.sampleSize})` : "no data",
+    };
+  });
 
   return `You are an options trading specialist deciding the best contract for an approved ${signal.side.toUpperCase()} signal.
 
@@ -98,6 +114,7 @@ TASK: pick the SINGLE best contract. Optimize for:
 - Delta 0.35-0.65 (gives leverage without excessive gamma risk)
 - Premium ≤ 5% of stock price for cost control
 - Realistic to reach the stock target before theta erodes the premium
+- IMPORTANT: when the "history" field shows a high win rate with sample ≥ 5, that bucket has earned its way in — favor it. Treat "no data" as neutral, not as a negative.
 
 Then set exit triggers tuned to the contract's DTE and the strategy's typical hold time.
 
@@ -137,7 +154,28 @@ function ruleBasedPickContract(signal, stockPrice, chainContext) {
     if (delta < 0.3 || delta > 0.75) score -= 0.4;           // delta band
     if (mid > stockPrice * 0.08) score -= 0.5;               // penalize > 8% of stock price
 
-    return { ...c, mid, delta, score, _spreadPct: spread };
+    // ── Historical bias: look up the (DTE bucket × delta bucket) win rate
+    //    from past trades on this (strategy × symbol). Boost candidates whose
+    //    bucket historically wins; penalize the ones that lose. Only kicks in
+    //    once we have ≥ 5 trades in that bucket.
+    let historyBias = 0;
+    let histInfo    = null;
+    try {
+      const hit = lookupOptionsBucketWinRate({
+        strategy: signal.strategy,
+        symbol:   chainContext.symbol,
+        dte:      chainContext.dte,
+        delta,
+        minSampleSize: 5,
+      });
+      if (hit) {
+        historyBias = (hit.winRate - 0.5) * Math.sqrt(Math.min(hit.sampleSize, 30) / 30);
+        histInfo    = hit;
+      }
+    } catch { /* learner not ready */ }
+    score += historyBias;
+
+    return { ...c, mid, delta, score, _spreadPct: spread, _hist: histInfo, _historyBias: historyBias };
   }).sort((a, b) => b.score - a.score);
 
   const top = scored[0];
@@ -170,9 +208,12 @@ function ruleBasedPickContract(signal, stockPrice, chainContext) {
       timeExitMinutes,
       ivCrushPct: 25,
     },
-    reasoning: `ATM-ish ${wantCalls ? "call" : "put"} at $${top.strike} with delta ${top.delta?.toFixed(2)}, spread ${(top._spreadPct * 100).toFixed(1)}%, OI ${top.oi || "?"}.`,
+    reasoning: `ATM-ish ${wantCalls ? "call" : "put"} at $${top.strike} with delta ${top.delta?.toFixed(2)}, spread ${(top._spreadPct * 100).toFixed(1)}%, OI ${top.oi || "?"}.` +
+      (top._hist ? ` History: ${(top._hist.winRate*100).toFixed(0)}% WR over ${top._hist.sampleSize} trades in this DTE/delta bucket.` : " No history yet — using heuristic only."),
     confidence: Math.min(1, Math.max(0.3, top.score + 0.5)),
-    source: "rule-based",
+    source: top._hist ? "rule-based+history" : "rule-based",
+    historyBias: top._historyBias,
+    historyStats: top._hist,
   };
 }
 
