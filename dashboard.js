@@ -60,6 +60,127 @@ app.use(express.json());
 app.use(express.static(__dirname));
 app.get("/", (req, res) => res.sendFile(join(__dirname, "dashboard.html")));
 
+// ─── Runtime bot config (toggleable from the dashboard) ───────────────────────
+//
+// bot-config.json overrides env vars for: routerEnabled, activeStrategies,
+// cryptoSymbols, consensusMin, maxConcurrentPositions. bot-stream.js polls
+// this file every 30s so the toggle flips live; symbol changes require a
+// service restart (we surface a "restart required" flag in the response).
+
+const CONFIG_FILE = join(__dirname, "bot-config.json");
+
+function loadBotConfig() {
+  const defaults = {
+    routerEnabled:          process.env.ROUTER_ENABLED === "true",
+    consensusMin:           parseInt(process.env.CONSENSUS_MIN || "1"),
+    maxConcurrentPositions: parseInt(process.env.MAX_CONCURRENT_POSITIONS || "5"),
+    activeStrategies:       (process.env.ACTIVE_STRATEGIES || "hybrid10,vwap-reclaim")
+                              .split(",").map(s => s.trim().toLowerCase()).filter(Boolean),
+    cryptoSymbols:          (process.env.CRYPTO_SYMBOLS || "")
+                              .split(",").map(s => s.trim().toUpperCase()).filter(Boolean),
+    updatedAt:              null,
+  };
+  if (!existsSync(CONFIG_FILE)) return defaults;
+  try {
+    const fileCfg = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
+    return { ...defaults, ...fileCfg };
+  } catch { return defaults; }
+}
+
+function saveBotConfig(patch) {
+  const current = loadBotConfig();
+  const next    = { ...current, ...patch, updatedAt: new Date().toISOString() };
+  writeFileSync(CONFIG_FILE, JSON.stringify(next, null, 2));
+  return next;
+}
+
+app.get("/api/config", (req, res) => {
+  res.json({ ...loadBotConfig(), configFile: CONFIG_FILE });
+});
+
+app.patch("/api/config", (req, res) => {
+  const allowed = ["routerEnabled", "consensusMin", "maxConcurrentPositions", "activeStrategies", "cryptoSymbols"];
+  const patch = {};
+  for (const k of allowed) if (req.body?.[k] !== undefined) patch[k] = req.body[k];
+  // Coerce types
+  if (patch.routerEnabled !== undefined)          patch.routerEnabled = !!patch.routerEnabled;
+  if (patch.consensusMin !== undefined)           patch.consensusMin = Math.max(1, parseInt(patch.consensusMin) || 1);
+  if (patch.maxConcurrentPositions !== undefined) patch.maxConcurrentPositions = Math.max(1, parseInt(patch.maxConcurrentPositions) || 5);
+  if (Array.isArray(patch.activeStrategies))      patch.activeStrategies = patch.activeStrategies.map(s => String(s).trim().toLowerCase()).filter(Boolean);
+  if (Array.isArray(patch.cryptoSymbols))         patch.cryptoSymbols    = patch.cryptoSymbols.map(s => String(s).trim().toUpperCase()).filter(Boolean);
+
+  // Determine if a bot-stream restart is needed (symbol changes require it)
+  const before = loadBotConfig();
+  const cryptoChanged = patch.cryptoSymbols && JSON.stringify(patch.cryptoSymbols) !== JSON.stringify(before.cryptoSymbols);
+  const stratChanged  = patch.activeStrategies && JSON.stringify(patch.activeStrategies) !== JSON.stringify(before.activeStrategies);
+  const restartRequired = cryptoChanged || stratChanged;
+
+  const next = saveBotConfig(patch);
+  res.json({ ok: true, config: next, restartRequired, changed: Object.keys(patch) });
+});
+
+// Add a stock to the user's Alpaca watchlist (first watchlist for now)
+app.post("/api/watchlist/add", async (req, res) => {
+  const symbol = String(req.body?.symbol || "").trim().toUpperCase();
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+  if (symbol.includes("/")) return res.status(400).json({ error: "Crypto symbols (with /) belong in the Crypto Symbols section, not the stock watchlist" });
+  try {
+    const lists = await alpaca("/v2/watchlists");
+    if (!lists?.length) return res.status(404).json({ error: "No Alpaca watchlist exists — create one in the Alpaca dashboard first" });
+    const wlId = lists[0].id;
+    const r = await fetch(`${ALPACA_BASE}/v2/watchlists/${wlId}`, {
+      method: "POST",
+      headers: ALPACA_HEADERS,
+      body:    JSON.stringify({ symbol }),
+    });
+    const data = await r.json();
+    if (!r.ok) return res.status(r.status).json({ error: data?.message || JSON.stringify(data) });
+    res.json({ ok: true, symbol, watchlistId: wlId, restartRequired: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete("/api/watchlist/:symbol", async (req, res) => {
+  const symbol = String(req.params.symbol || "").trim().toUpperCase();
+  try {
+    const lists = await alpaca("/v2/watchlists");
+    if (!lists?.length) return res.status(404).json({ error: "No Alpaca watchlist exists" });
+    const wlId = lists[0].id;
+    const r = await fetch(`${ALPACA_BASE}/v2/watchlists/${wlId}/${symbol}`, {
+      method: "DELETE",
+      headers: ALPACA_HEADERS,
+    });
+    if (!r.ok && r.status !== 422 && r.status !== 404) {
+      const text = await r.text();
+      return res.status(r.status).json({ error: text });
+    }
+    res.json({ ok: true, symbol, restartRequired: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/crypto/add", (req, res) => {
+  const symbol = String(req.body?.symbol || "").trim().toUpperCase();
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+  // Normalize: if user typed BTCUSD, convert to BTC/USD
+  const normalized = symbol.includes("/") ? symbol :
+    /^(BTC|ETH|SOL|DOGE|AVAX|LINK|MATIC|DOT|UNI|BCH|LTC|XRP|ADA|XLM|SHIB|AAVE)([A-Z]{3,4})$/.test(symbol)
+      ? symbol.replace(/^(\w+)(USD|USDT|USDC|EUR)$/, "$1/$2")
+      : null;
+  if (!normalized) return res.status(400).json({ error: "Symbol must be in BASE/QUOTE format (e.g. BTC/USD)" });
+  const cfg = loadBotConfig();
+  if (cfg.cryptoSymbols.includes(normalized)) return res.json({ ok: true, symbol: normalized, alreadyPresent: true, config: cfg });
+  const next = saveBotConfig({ cryptoSymbols: [...cfg.cryptoSymbols, normalized] });
+  res.json({ ok: true, symbol: normalized, config: next, restartRequired: true });
+});
+
+app.delete("/api/crypto/:symbol", (req, res) => {
+  // The URL param will have an encoded slash for BTC%2FUSD
+  const symbol = decodeURIComponent(String(req.params.symbol || "")).toUpperCase();
+  const cfg = loadBotConfig();
+  if (!cfg.cryptoSymbols.includes(symbol)) return res.status(404).json({ error: "symbol not in config" });
+  const next = saveBotConfig({ cryptoSymbols: cfg.cryptoSymbols.filter(s => s !== symbol) });
+  res.json({ ok: true, symbol, config: next, restartRequired: true });
+});
+
 // ─── Test trade — fire a tiny paper order to confirm execution path works ──
 // POST /api/test-trade  { symbol, side, notional, type?, tif? }
 // Defaults: notional=$2, type=market. For crypto symbols (with "/"), tif=gtc.
@@ -856,13 +977,18 @@ app.get("/api/router/state", async (req, res) => {
       activeStrategies,
       perSymbol,
       regimeStats,
-      config: {
-        routerEnabled:        process.env.ROUTER_ENABLED === "true",
-        strictRouter:         process.env.STRICT_ROUTER === "true",
-        consensusMin:         Math.max(1, parseInt(process.env.CONSENSUS_MIN || "1")),
-        maxConcurrentPositions: parseInt(process.env.MAX_CONCURRENT_POSITIONS || "5"),
-        agentDebate:          process.env.AGENT_DEBATE === "true",
-      },
+      config: (() => {
+        const cfg = loadBotConfig();
+        return {
+          routerEnabled:        cfg.routerEnabled,
+          strictRouter:         process.env.STRICT_ROUTER === "true",
+          consensusMin:         cfg.consensusMin,
+          maxConcurrentPositions: cfg.maxConcurrentPositions,
+          activeStrategies:     cfg.activeStrategies,
+          cryptoSymbols:        cfg.cryptoSymbols,
+          agentDebate:          process.env.AGENT_DEBATE === "true",
+        };
+      })(),
       generatedAt: new Date().toISOString(),
     });
   } catch (e) {

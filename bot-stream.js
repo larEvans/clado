@@ -25,17 +25,48 @@ import { chooseSignal }   from "./router.js";
 import { getRegimeStats, getAllRegimeStats } from "./learner.js";
 import { runAgentDebate, debateEnabled } from "./agents.js";
 
-const ROUTER_ENABLED   = process.env.ROUTER_ENABLED === "true";
-const STRICT_ROUTER    = process.env.STRICT_ROUTER === "true";
-const ACTIVE_STRATS    = (process.env.ACTIVE_STRATEGIES || "hybrid,hybrid10,hybrid-reversal,reversal,vwap")
-  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
-const MAX_CONCURRENT   = parseInt(process.env.MAX_CONCURRENT_POSITIONS || "5");
+// Runtime config — bot-config.json overrides these env-var defaults and is
+// reloaded periodically so the dashboard can toggle the router live.
+const CONFIG_FILE = "bot-config.json";
 
-// Crypto symbols (comma-separated, with slash like "BTC/USD,ETH/USD"). When
-// set, the bot opens a second WebSocket to the crypto feed in parallel with
-// stocks and routes/places crypto orders 24/7.
-const CRYPTO_SYMBOLS = (process.env.CRYPTO_SYMBOLS || "")
-  .split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+function loadRuntimeConfig() {
+  const defaults = {
+    routerEnabled:          process.env.ROUTER_ENABLED === "true",
+    consensusMin:           parseInt(process.env.CONSENSUS_MIN || "1"),
+    maxConcurrentPositions: parseInt(process.env.MAX_CONCURRENT_POSITIONS || "5"),
+    activeStrategies:       (process.env.ACTIVE_STRATEGIES || "hybrid,hybrid10,hybrid-reversal,reversal,vwap")
+                              .split(",").map(s => s.trim().toLowerCase()).filter(Boolean),
+    cryptoSymbols:          (process.env.CRYPTO_SYMBOLS || "")
+                              .split(",").map(s => s.trim().toUpperCase()).filter(Boolean),
+  };
+  if (!existsSync(CONFIG_FILE)) return defaults;
+  try {
+    const fileCfg = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
+    return { ...defaults, ...fileCfg };
+  } catch { return defaults; }
+}
+
+let runtimeCfg = loadRuntimeConfig();
+
+// Reload the config file every 30 s so dashboard toggles take effect without
+// restarting the bot process. Symbol changes still need a restart (would
+// require resubscribing the WebSocket); routerEnabled toggles live.
+setInterval(() => {
+  try {
+    const next = loadRuntimeConfig();
+    const flipped = next.routerEnabled !== runtimeCfg.routerEnabled;
+    runtimeCfg = next;
+    if (flipped) console.log(`[Bot] runtime config: routerEnabled → ${runtimeCfg.routerEnabled}`);
+  } catch {}
+}, 30_000);
+
+// Convenience getters used through the bar handler so each tick reads the
+// latest config without us threading it everywhere.
+const ROUTER_ENABLED   = () => runtimeCfg.routerEnabled;
+const ACTIVE_STRATS    = () => runtimeCfg.activeStrategies;
+const MAX_CONCURRENT   = () => runtimeCfg.maxConcurrentPositions;
+const STRICT_ROUTER    = process.env.STRICT_ROUTER === "true";
+const CRYPTO_SYMBOLS   = runtimeCfg.cryptoSymbols;
 
 // Crypto helpers
 const isCryptoSymbol = sym => typeof sym === "string" && sym.includes("/");
@@ -517,7 +548,7 @@ if (!process.env.ALPACA_API_KEY || !process.env.ALPACA_SECRET_KEY) {
 const startParams = loadLearnedParams(STRATEGY) || getDefaultParams(STRATEGY);
 console.log(`[Bot] Active ${STRATEGY} params:`, startParams);
 
-saveState({ symbol: SYMBOL, strategy: STRATEGY, botStarted: new Date().toISOString(), routerEnabled: ROUTER_ENABLED });
+saveState({ symbol: SYMBOL, strategy: STRATEGY, botStarted: new Date().toISOString(), routerEnabled: ROUTER_ENABLED() });
 
 // ── Router mode: multi-symbol per-bar regime-based dispatch ─────────────────
 //
@@ -661,7 +692,7 @@ async function onRouterBar(bar) {
 
   // Capacity check: don't exceed max concurrent positions
   const openCount = [...routerStates.values()].filter(x => x.position).length;
-  if (openCount >= MAX_CONCURRENT) return;
+  if (openCount >= MAX_CONCURRENT()) return;
 
   const r = classifyRegime(s.bars);
   s.lastRegime = r.tag;
@@ -669,8 +700,8 @@ async function onRouterBar(bar) {
   // Crypto narrows to strategies that don't depend on a 9:30 ET open.
   // Mean-reversion / divergence strategies apply 24/7; ORB-based ones don't.
   const eligibleStrats = crypto
-    ? ACTIVE_STRATS.filter(x => ["reversal", "vwap-reclaim", "hybrid-reversal"].includes(x))
-    : ACTIVE_STRATS;
+    ? ACTIVE_STRATS().filter(x => ["reversal", "vwap-reclaim", "hybrid-reversal"].includes(x))
+    : ACTIVE_STRATS();
   const candidates = eligibleStrats.map(strategy => ({
     strategy,
     signal: candidateSignals(strategy, sym, s.bars),
@@ -727,7 +758,7 @@ async function onRouterBar(bar) {
 
 async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultiplier = 1.0) {
   const s = getSymState(sym);
-  const perPositionUSD = (TRADE_USD / Math.min(MAX_CONCURRENT, routerStates.size || 1)) * sizeMultiplier;
+  const perPositionUSD = (TRADE_USD / Math.min(MAX_CONCURRENT(), routerStates.size || 1)) * sizeMultiplier;
   if (IS_PAPER) {
     console.log(`[Router] PAPER ${signal.side.toUpperCase()} ${sym} via ${strategy} $${perPositionUSD.toFixed(2)} @ ~${bar.close.toFixed(2)} [regime: ${regime}]`);
   } else {
@@ -770,8 +801,8 @@ async function closeRouterPosition(sym, exitPrice, exitReason) {
 // ── Wire up the stream ────────────────────────────────────────────────────────
 
 let resolvedSymbols = [SYMBOL];
-if (ROUTER_ENABLED) {
-  console.log(`[Router] ENABLED — strategies: ${ACTIVE_STRATS.join(", ")} — fetching watchlist…`);
+if (ROUTER_ENABLED()) {
+  console.log(`[Router] ENABLED — strategies: ${ACTIVE_STRATS().join(", ")} — fetching watchlist…`);
   try {
     const wlRes = await fetch(`${ALPACA_BASE}/v2/watchlists`, { headers: ALPACA_HEADERS });
     const wl    = wlRes.ok ? await wlRes.json() : [];
@@ -784,7 +815,7 @@ if (ROUTER_ENABLED) {
   } catch (e) { console.warn("[Router] watchlist fetch failed:", e.message); }
   console.log(`[Router] subscribing to ${resolvedSymbols.length} symbols: ${resolvedSymbols.join(", ")}`);
 } else {
-  console.log(`[Bot] single-strategy mode (${STRATEGY} on ${SYMBOL}) — set ROUTER_ENABLED=true for multi-strategy routing`);
+  console.log(`[Bot] single-strategy mode (${STRATEGY} on ${SYMBOL}) — toggle Router ON in dashboard or set ROUTER_ENABLED=true to multi-strategy route`);
 }
 
 // Split symbols by feed: stocks go to the IEX stream, crypto to the v1beta3 stream.
@@ -793,19 +824,26 @@ const cryptoSymbols = [...new Set([...resolvedSymbols.filter(isCryptoSymbol), ..
 
 const streams = [];
 
+// Dispatcher reads the LATEST routerEnabled flag on every bar event so the
+// dashboard toggle flips behavior live without restarting the bot process.
+async function dispatchStockBar(bar) {
+  if (ROUTER_ENABLED()) return onRouterBar(bar);
+  return onBar(bar);
+}
+
 if (stockSymbols.length > 0) {
   const s = new AlpacaStream(stockSymbols, { feed: "stocks" });
   s.on("connected",    () => console.log(`[Bot] STOCKS stream connected — ${stockSymbols.join(", ")}`));
   s.on("disconnected", () => console.log("[Bot] STOCKS stream disconnected — auto-reconnecting"));
   s.on("error",        err => console.error("[Bot] STOCKS stream error:", err.message));
-  s.on("bar",          ROUTER_ENABLED ? onRouterBar : onBar);
+  s.on("bar",          dispatchStockBar);
   s.connect();
   streams.push(s);
 }
 
 if (cryptoSymbols.length > 0) {
-  if (!ROUTER_ENABLED) {
-    console.log(`[Bot] CRYPTO_SYMBOLS set but ROUTER_ENABLED is off — crypto bars will stream but only the router consumes them. Set ROUTER_ENABLED=true to trade crypto.`);
+  if (!ROUTER_ENABLED()) {
+    console.log(`[Bot] CRYPTO_SYMBOLS set but Router is off — crypto bars will stream but no trades will fire. Toggle Router ON in the dashboard.`);
   }
   const s = new AlpacaStream(cryptoSymbols, { feed: "crypto" });
   s.on("connected",    () => console.log(`[Bot] CRYPTO stream connected — ${cryptoSymbols.join(", ")}`));

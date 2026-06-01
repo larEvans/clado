@@ -183,13 +183,69 @@
     <div class="chart-wrap"><canvas id="equity-chart"></canvas></div>
   </div>
 
+  <!-- Bot Controls -->
+  <div class="section">
+    <div class="section-header" style="justify-content:space-between">
+      Bot Controls
+      <span style="font-size:11px;font-weight:400;color:var(--muted)">live toggles — no restart needed for router</span>
+    </div>
+    <div style="padding:14px 18px;display:flex;gap:24px;flex-wrap:wrap;align-items:center">
+      <!-- Router toggle -->
+      <label style="display:flex;gap:10px;align-items:center;cursor:pointer">
+        <input type="checkbox" id="cfg-router" onchange="toggleRouter()" style="width:18px;height:18px;cursor:pointer">
+        <div>
+          <div style="font-weight:600;font-size:13px">Strategy Router</div>
+          <div style="font-size:11px;color:var(--muted)" id="cfg-router-hint">loading…</div>
+        </div>
+      </label>
+
+      <!-- Consensus min -->
+      <div style="display:flex;gap:6px;align-items:center">
+        <span style="font-size:11px;color:var(--muted)">Consensus min</span>
+        <input id="cfg-consensus" type="number" min="1" max="8" value="1" class="inp" style="width:60px" onchange="saveConfigField('consensusMin', parseInt(this.value))">
+      </div>
+
+      <!-- Max concurrent positions -->
+      <div style="display:flex;gap:6px;align-items:center">
+        <span style="font-size:11px;color:var(--muted)">Max concurrent</span>
+        <input id="cfg-max" type="number" min="1" max="20" value="5" class="inp" style="width:60px" onchange="saveConfigField('maxConcurrentPositions', parseInt(this.value))">
+      </div>
+
+      <div id="cfg-status" style="font-size:11px;color:var(--muted);margin-left:auto"></div>
+    </div>
+  </div>
+
   <!-- Actively Tracked Symbols -->
   <div class="section">
     <div class="section-header" style="justify-content:space-between">
-      Actively Tracked Symbols
-      <span style="font-size:11px;font-weight:400;color:var(--muted)">symbols the bot is streaming live</span>
+      <span>Actively Tracked Symbols</span>
+      <span style="font-size:11px;font-weight:400;color:var(--muted)">streaming live — symbol changes require bot restart</span>
     </div>
-    <div id="active-symbols" style="padding:12px;display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px">
+
+    <!-- Add Stock + Add Crypto forms -->
+    <div style="padding:12px 14px;display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end;border-bottom:1px solid var(--border)">
+      <div>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.6px">Add Stock (options auto)</div>
+        <div style="display:flex;gap:6px">
+          <input id="add-stock" type="text" placeholder="AAPL" class="inp" style="width:100px;text-transform:uppercase" onkeydown="if(event.key==='Enter')addStock()">
+          <button class="btn btn-primary" onclick="addStock()" style="font-size:12px;padding:4px 12px">Add</button>
+        </div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.6px">Add Crypto</div>
+        <div style="display:flex;gap:6px">
+          <input id="add-crypto" type="text" placeholder="BTC/USD" class="inp" style="width:120px;text-transform:uppercase" onkeydown="if(event.key==='Enter')addCrypto()">
+          <button class="btn btn-primary" onclick="addCrypto()" style="font-size:12px;padding:4px 12px">Add</button>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-left:auto;line-height:1.5">
+        Stocks are added to your Alpaca watchlist.<br>
+        Crypto is saved to <code>bot-config.json</code>.<br>
+        Options trades use whichever stock symbol fires.
+      </div>
+    </div>
+
+    <div id="active-symbols" style="padding:12px;display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px">
       <div style="color:var(--muted);font-size:13px;padding:8px">Loading…</div>
     </div>
     <div id="active-symbols-summary" style="padding:8px 14px;font-size:11px;color:var(--muted);border-top:1px solid var(--border)"></div>
@@ -1913,6 +1969,96 @@ async function runCPCV(stratId) {
   }
 }
 
+// ─── Bot Controls (router toggle + symbol management) ───────────────────────
+async function loadBotControls() {
+  try {
+    const cfg = await fetch("/api/config").then(r => r.json());
+    document.getElementById("cfg-router").checked    = !!cfg.routerEnabled;
+    document.getElementById("cfg-consensus").value   = cfg.consensusMin || 1;
+    document.getElementById("cfg-max").value         = cfg.maxConcurrentPositions || 5;
+    const hint = document.getElementById("cfg-router-hint");
+    if (cfg.routerEnabled) {
+      hint.textContent  = `ON · ${(cfg.activeStrategies||[]).join(', ')}`;
+      hint.style.color  = "var(--green)";
+    } else {
+      hint.textContent  = "OFF · single-strategy mode";
+      hint.style.color  = "var(--yellow)";
+    }
+  } catch (e) {
+    document.getElementById("cfg-router-hint").textContent = "Error: " + e.message;
+  }
+}
+
+async function toggleRouter() {
+  const enabled = document.getElementById("cfg-router").checked;
+  flashStatus("Saving…");
+  try {
+    const r = await fetch("/api/config", { method: "PATCH", headers: { "Content-Type":"application/json" }, body: JSON.stringify({ routerEnabled: enabled }) }).then(r => r.json());
+    flashStatus(enabled ? "Router ON — applies within 30s (no restart needed)" : "Router OFF");
+    loadBotControls();
+  } catch (e) { flashStatus("Failed: " + e.message); }
+}
+
+async function saveConfigField(field, value) {
+  flashStatus("Saving…");
+  try {
+    await fetch("/api/config", { method: "PATCH", headers: { "Content-Type":"application/json" }, body: JSON.stringify({ [field]: value }) });
+    flashStatus(`${field} = ${value} saved`);
+    loadBotControls();
+  } catch (e) { flashStatus("Failed: " + e.message); }
+}
+
+function flashStatus(msg) {
+  const el = document.getElementById("cfg-status");
+  if (!el) return;
+  el.textContent = msg;
+  setTimeout(() => { if (el.textContent === msg) el.textContent = ""; }, 5000);
+}
+
+async function addStock() {
+  const sym = (document.getElementById("add-stock").value || "").trim().toUpperCase();
+  if (!sym) return;
+  try {
+    const r = await fetch("/api/watchlist/add", { method: "POST", headers: { "Content-Type":"application/json" }, body: JSON.stringify({ symbol: sym }) }).then(r => r.json());
+    if (r.error) return flashStatus("Add failed: " + r.error);
+    document.getElementById("add-stock").value = "";
+    flashStatus(`${sym} added to watchlist · restart bot-stream service to apply`);
+    loadActiveSymbols();
+  } catch (e) { flashStatus("Error: " + e.message); }
+}
+
+async function addCrypto() {
+  const sym = (document.getElementById("add-crypto").value || "").trim().toUpperCase();
+  if (!sym) return;
+  try {
+    const r = await fetch("/api/crypto/add", { method: "POST", headers: { "Content-Type":"application/json" }, body: JSON.stringify({ symbol: sym }) }).then(r => r.json());
+    if (r.error) return flashStatus("Add failed: " + r.error);
+    document.getElementById("add-crypto").value = "";
+    flashStatus(`${r.symbol} added · restart bot-stream service to start streaming`);
+    loadActiveSymbols();
+  } catch (e) { flashStatus("Error: " + e.message); }
+}
+
+async function removeStock(sym) {
+  if (!confirm(`Remove ${sym} from your Alpaca watchlist?`)) return;
+  try {
+    const r = await fetch("/api/watchlist/" + encodeURIComponent(sym), { method: "DELETE" }).then(r => r.json());
+    if (r.error) return flashStatus("Remove failed: " + r.error);
+    flashStatus(`${sym} removed · restart bot-stream to apply`);
+    loadActiveSymbols();
+  } catch (e) { flashStatus("Error: " + e.message); }
+}
+
+async function removeCrypto(sym) {
+  if (!confirm(`Remove ${sym} from crypto config?`)) return;
+  try {
+    const r = await fetch("/api/crypto/" + encodeURIComponent(sym), { method: "DELETE" }).then(r => r.json());
+    if (r.error) return flashStatus("Remove failed: " + r.error);
+    flashStatus(`${sym} removed · restart bot-stream to apply`);
+    loadActiveSymbols();
+  } catch (e) { flashStatus("Error: " + e.message); }
+}
+
 // ─── Actively Tracked Symbols (Account tab) ──────────────────────────────────
 async function loadActiveSymbols(botState) {
   const target = document.getElementById("active-symbols");
@@ -1956,9 +2102,13 @@ async function loadActiveSymbols(botState) {
       ? `<div style="font-size:11px;margin-top:6px;color:${pos.side==='buy'?'var(--green)':'var(--red)'}">${pos.side.toUpperCase()} @ $${(pos.entryPrice||0).toFixed(2)}</div>`
       : '<div style="font-size:11px;margin-top:6px;color:var(--muted)">no position</div>';
 
+    const removeFn = isCrypto
+      ? `removeCrypto('${s.symbol}')`
+      : `removeStock('${s.symbol}')`;
     return `
-      <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px 12px">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px 12px;position:relative">
+        <button onclick="${removeFn}" title="Remove" style="position:absolute;top:6px;right:6px;background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:14px;line-height:1;padding:2px 6px;border-radius:3px">×</button>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;padding-right:18px">
           <strong style="font-size:14px">${s.symbol}</strong>
           ${typeBadge}
         </div>
@@ -2131,8 +2281,10 @@ connectLiveStream();
 loadAll();
 loadBotStatus();
 loadHermesInsights();
+loadBotControls();
 setInterval(loadAll, 30000);
 setInterval(loadBotStatus, 10000);
+setInterval(loadBotControls, 30000);
 </script>
 </body>
 </html>
