@@ -183,6 +183,18 @@
     <div class="chart-wrap"><canvas id="equity-chart"></canvas></div>
   </div>
 
+  <!-- Actively Tracked Symbols -->
+  <div class="section">
+    <div class="section-header" style="justify-content:space-between">
+      Actively Tracked Symbols
+      <span style="font-size:11px;font-weight:400;color:var(--muted)">symbols the bot is streaming live</span>
+    </div>
+    <div id="active-symbols" style="padding:12px;display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px">
+      <div style="color:var(--muted);font-size:13px;padding:8px">Loading…</div>
+    </div>
+    <div id="active-symbols-summary" style="padding:8px 14px;font-size:11px;color:var(--muted);border-top:1px solid var(--border)"></div>
+  </div>
+
   <!-- Bot Status & Learning -->
   <div class="section">
     <div class="section-header" style="justify-content:space-between">
@@ -424,6 +436,69 @@
 
 <!-- ══ STRATEGY ROUTER PANEL ═════════════════════════════════════════════════ -->
 <div id="tab-router" class="panel">
+
+  <!-- How to read this page -->
+  <details style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:6px 14px">
+    <summary style="cursor:pointer;font-size:13px;font-weight:600;padding:6px 0">📘 How to read this page (click to expand)</summary>
+    <div style="font-size:13px;line-height:1.6;color:#cbd5e1;padding:10px 4px 14px">
+
+      <p style="margin:0 0 12px"><strong>What this is:</strong> the router decides — on every bar — which strategy should fire for which symbol, based on the current market regime and each strategy's historical win rate in that regime. It runs automatically when <code>ROUTER_ENABLED=true</code> is set on Railway.</p>
+
+      <div style="margin:0 0 14px">
+        <strong>Current Regime by Symbol (cards):</strong>
+        <ul style="margin:6px 0;padding-left:24px">
+          <li>Each card shows one symbol and its <em>current</em> regime tag (computed fresh on every refresh).</li>
+          <li>Tag format: <code>trend:vol:gap:orbQ</code> — e.g. <code>trend-up:high-vol:gap-up</code>.</li>
+          <li>Colored chips break out the parts: <span style="color:#22c55e">trend-up</span> / <span style="color:#ef4444">trend-down</span> / <span style="color:#f59e0b">high-vol</span> / <span style="color:#64748b">low-vol</span> / <span style="color:#10b981">gap-up</span> / <span style="color:#f87171">gap-down</span>.</li>
+          <li>If you see <code>unknown</code> or empty chips, the bot doesn't have enough recent bars to classify yet (needs ~25 bars).</li>
+        </ul>
+      </div>
+
+      <div style="margin:0 0 14px">
+        <strong>Win-Rate Heatmap (table):</strong>
+        <ul style="margin:6px 0;padding-left:24px">
+          <li>Rows = active strategies. Columns = regime tags seen in trade history.</li>
+          <li>Each cell shows <strong>win rate</strong> on top and <strong>sample size</strong> below (<code>n=15</code> means 15 trades in that bucket).</li>
+          <li><span style="color:#86efac">Green</span> ≥ 65% win rate · <span style="color:#fbbf24">amber</span> ≥ 50% · <span style="color:#fca5a5">red</span> &lt; 50% · dash = no data.</li>
+          <li>Sample sizes &lt; 10 are noisy — the router still uses them but weights them down with a √(n/30) confidence multiplier.</li>
+          <li>The router picks the strategy with the <strong>highest score</strong> in the symbol's current regime column. Score = winRate × √(min(samples,30)/30) × diversification multiplier.</li>
+        </ul>
+      </div>
+
+      <div style="margin:0 0 14px">
+        <strong>What the buttons do:</strong>
+        <ul style="margin:6px 0;padding-left:24px">
+          <li><strong>Bootstrap from Backtest</strong> — runs every active strategy across every watchlist symbol on recent data. Populates the heatmap so the router has stats to work with. <em>Run this first.</em></li>
+          <li><strong>Year Backtest (Options)</strong> — heavier version: ~1 year of 5-min bars in options mode. Pulls live IV/DTE from Alpaca per symbol. Adds ~1-3 min runtime but gives you more samples per regime bucket.</li>
+          <li><strong>Optimize All by Regime</strong> — for each (strategy × regime) bucket with ≥ 10 historical trades, runs Hermes to tune the strategy's params separately for that bucket. Stored under <code>byRegime[tag].params</code> in <code>learned-params.json</code>.</li>
+          <li><strong>Refresh</strong> — re-classifies regimes and re-fetches the heatmap. Click after the bot has been running for a while to see updated stats.</li>
+        </ul>
+      </div>
+
+      <div style="margin:0 0 14px">
+        <strong>Recommended workflow:</strong>
+        <ol style="margin:6px 0;padding-left:24px">
+          <li>Click <strong>Bootstrap from Backtest</strong> (or <strong>Year Backtest</strong> for more data).</li>
+          <li>Look at the heatmap — find which strategies have green cells in many regimes.</li>
+          <li>Open the <strong>Strategies &amp; Backtest</strong> tab → click <strong>Validate (CPCV)</strong> on each candidate. Only trust strategies that come back <code>ROBUST</code> or <code>OK</code>. <code>LIKELY_OVERFIT</code> = don't trade.</li>
+          <li>Set <code>ACTIVE_STRATEGIES</code> env var to just the validated survivors (e.g. <code>hybrid10,vwap-reclaim</code>).</li>
+          <li>Click <strong>Optimize All by Regime</strong> to tune surviving strategies per bucket.</li>
+          <li>Set <code>ROUTER_ENABLED=true</code> on Railway, restart bot service, watch the logs.</li>
+        </ol>
+      </div>
+
+      <div>
+        <strong>Live decision log format</strong> (in Railway → bot-stream logs):
+        <pre style="background:var(--bg);padding:8px 12px;border-radius:4px;font-size:11px;overflow-x:auto;margin:6px 0">[Router] QQQ trend-up:high-vol → hybrid10 chosen: 73% win rate (22 samples, regime) · beat vwap-reclaim (51%)</pre>
+        <ul style="margin:6px 0;padding-left:24px">
+          <li><code>source: "regime"</code> = the router used a regime-specific win rate.</li>
+          <li><code>source: "global"</code> = fell back to that strategy's overall win rate because no per-regime data yet.</li>
+          <li><code>source: "prior"</code> = no data at all, used a neutral 0.5 prior with low confidence.</li>
+          <li><code>diversification ×0.8</code> = strategy was already used today on another symbol, score discounted to spread risk.</li>
+        </ul>
+      </div>
+    </div>
+  </details>
 
   <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 18px;display:flex;gap:12px;flex-wrap:wrap;align-items:center">
     <div style="font-size:13px;color:var(--muted)">
@@ -1401,6 +1476,9 @@ async function loadBotStatus() {
     apEl.style.color  = ap == null ? "var(--muted)" : ap >= 0 ? "var(--green)" : "var(--red)";
     document.getElementById("bot-strategy").textContent = state?.strategy?.toUpperCase() || "—";
 
+    // Refresh the Actively Tracked Symbols panel alongside bot status
+    loadActiveSymbols(state).catch(() => {});
+
     // Learning table
     const learningBody = document.getElementById("learning-body");
     const rows = Object.entries(d.learning || {});
@@ -1833,6 +1911,72 @@ async function runCPCV(stratId) {
     document.getElementById('bt-content').style.display = '';
     document.getElementById('bt-metrics').innerHTML = `<div style="color:var(--red);padding:12px">Error: ${e.message}</div>`;
   }
+}
+
+// ─── Actively Tracked Symbols (Account tab) ──────────────────────────────────
+async function loadActiveSymbols(botState) {
+  const target = document.getElementById("active-symbols");
+  const summary = document.getElementById("active-symbols-summary");
+  if (!target) return;
+
+  let data;
+  try { data = await fetch("/api/router/state").then(r => r.json()); }
+  catch (e) { target.innerHTML = `<div style="color:var(--muted)">Error loading symbols: ${e.message}</div>`; return; }
+  if (data.error) { target.innerHTML = `<div style="color:var(--red);font-size:13px">${data.error}</div>`; return; }
+
+  const syms = data.perSymbol || [];
+  if (syms.length === 0) {
+    target.innerHTML = '<div style="color:var(--muted);font-size:13px;padding:8px">No symbols configured. Add a watchlist in Alpaca or set CRYPTO_SYMBOLS on Railway.</div>';
+    summary.textContent = "";
+    return;
+  }
+
+  // Tag each symbol as stock or crypto by symbol format
+  target.innerHTML = syms.map(s => {
+    const isCrypto = s.symbol.includes("/");
+    const typeBadge = isCrypto
+      ? '<span style="font-size:9px;padding:2px 6px;border-radius:3px;background:rgba(245,158,11,.15);color:#fbbf24">CRYPTO 24/7</span>'
+      : '<span style="font-size:9px;padding:2px 6px;border-radius:3px;background:rgba(59,130,246,.15);color:#60a5fa">STOCK</span>';
+
+    const parts = s.parts || {};
+    const chips = [parts.trend, parts.vol, parts.gap, parts.orbQ].filter(Boolean).map(t => {
+      const c = t === 'trend-up'   ? '#22c55e' :
+                t === 'trend-down' ? '#ef4444' :
+                t === 'high-vol'   ? '#f59e0b' :
+                t === 'low-vol'    ? '#64748b' :
+                t === 'gap-up'     ? '#10b981' :
+                t === 'gap-down'   ? '#f87171' :
+                                     '#94a3b8';
+      return `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:${c}22;color:${c}">${t}</span>`;
+    }).join(' ');
+
+    // Position indicator from bot state (best-effort match)
+    const pos = botState?.position?.symbol === s.symbol ? botState.position : null;
+    const posChip = pos
+      ? `<div style="font-size:11px;margin-top:6px;color:${pos.side==='buy'?'var(--green)':'var(--red)'}">${pos.side.toUpperCase()} @ $${(pos.entryPrice||0).toFixed(2)}</div>`
+      : '<div style="font-size:11px;margin-top:6px;color:var(--muted)">no position</div>';
+
+    return `
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px 12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <strong style="font-size:14px">${s.symbol}</strong>
+          ${typeBadge}
+        </div>
+        <div style="font-family:monospace;font-size:10px;color:var(--muted);margin-bottom:6px">${s.regime || 'classifying…'}</div>
+        <div style="display:flex;flex-wrap:wrap;gap:3px">${chips || '<span style="color:var(--muted);font-size:10px">no regime data yet</span>'}</div>
+        ${posChip}
+      </div>`;
+  }).join('');
+
+  const stockCount  = syms.filter(s => !s.symbol.includes('/')).length;
+  const cryptoCount = syms.filter(s =>  s.symbol.includes('/')).length;
+  const routerOn    = data.config?.routerEnabled;
+  summary.innerHTML =
+    `<strong>${syms.length}</strong> symbol${syms.length === 1 ? '' : 's'} active · ` +
+    `${stockCount} stock${stockCount === 1 ? '' : 's'} · ` +
+    `${cryptoCount} crypto · ` +
+    `router <strong style="color:${routerOn ? 'var(--green)' : 'var(--yellow)'}">${routerOn ? 'ENABLED' : 'OFF'}</strong>` +
+    (routerOn ? '' : ' — set ROUTER_ENABLED=true on Railway to start trading these');
 }
 
 // ─── Strategy Router tab ──────────────────────────────────────────────────────
