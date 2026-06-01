@@ -211,6 +211,19 @@
         <input id="cfg-max" type="number" min="1" max="20" value="5" class="inp" style="width:60px" onchange="saveConfigField('maxConcurrentPositions', parseInt(this.value))">
       </div>
 
+      <!-- Options Strategist toggle -->
+      <label style="display:flex;gap:10px;align-items:center;cursor:pointer;border-left:1px solid var(--border);padding-left:18px">
+        <input type="checkbox" id="cfg-options" onchange="toggleOptions()" style="width:18px;height:18px;cursor:pointer">
+        <div>
+          <div style="font-weight:600;font-size:13px">Options Strategist</div>
+          <div style="font-size:11px;color:var(--muted)" id="cfg-options-hint">stock signals route through the options agent</div>
+        </div>
+      </label>
+      <div style="display:flex;gap:6px;align-items:center">
+        <span style="font-size:11px;color:var(--muted)">DTE</span>
+        <input id="cfg-opt-dte" type="number" min="0" max="60" value="7" class="inp" style="width:55px" onchange="saveConfigField('optionsDte', parseInt(this.value))">
+      </div>
+
       <div id="cfg-status" style="font-size:11px;color:var(--muted);margin-left:auto"></div>
     </div>
   </div>
@@ -1976,6 +1989,8 @@ async function loadBotControls() {
     document.getElementById("cfg-router").checked    = !!cfg.routerEnabled;
     document.getElementById("cfg-consensus").value   = cfg.consensusMin || 1;
     document.getElementById("cfg-max").value         = cfg.maxConcurrentPositions || 5;
+    document.getElementById("cfg-options").checked   = !!cfg.optionsMode;
+    document.getElementById("cfg-opt-dte").value     = cfg.optionsDte || 7;
     const hint = document.getElementById("cfg-router-hint");
     if (cfg.routerEnabled) {
       hint.textContent  = `ON · ${(cfg.activeStrategies||[]).join(', ')}`;
@@ -1984,9 +1999,27 @@ async function loadBotControls() {
       hint.textContent  = "OFF · single-strategy mode";
       hint.style.color  = "var(--yellow)";
     }
+    const optHint = document.getElementById("cfg-options-hint");
+    if (cfg.optionsMode) {
+      optHint.textContent = `ON · agent picks contracts (DTE ${cfg.optionsDte}d)`;
+      optHint.style.color = "var(--green)";
+    } else {
+      optHint.textContent = "OFF · stock-only trades";
+      optHint.style.color = "var(--muted)";
+    }
   } catch (e) {
     document.getElementById("cfg-router-hint").textContent = "Error: " + e.message;
   }
+}
+
+async function toggleOptions() {
+  const enabled = document.getElementById("cfg-options").checked;
+  flashStatus("Saving…");
+  try {
+    await fetch("/api/config", { method: "PATCH", headers: { "Content-Type":"application/json" }, body: JSON.stringify({ optionsMode: enabled }) });
+    flashStatus(enabled ? "Options Strategist ON — next stock signal routes through agent" : "Options Strategist OFF — stock trades only");
+    loadBotControls();
+  } catch (e) { flashStatus("Failed: " + e.message); }
 }
 
 async function toggleRouter() {

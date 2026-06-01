@@ -78,6 +78,8 @@ function loadBotConfig() {
                               .split(",").map(s => s.trim().toLowerCase()).filter(Boolean),
     cryptoSymbols:          (process.env.CRYPTO_SYMBOLS || "")
                               .split(",").map(s => s.trim().toUpperCase()).filter(Boolean),
+    optionsMode:            process.env.OPTIONS_MODE === "true",
+    optionsDte:             parseInt(process.env.OPTIONS_DTE || "7"),
     updatedAt:              null,
   };
   if (!existsSync(CONFIG_FILE)) return defaults;
@@ -99,13 +101,15 @@ app.get("/api/config", (req, res) => {
 });
 
 app.patch("/api/config", (req, res) => {
-  const allowed = ["routerEnabled", "consensusMin", "maxConcurrentPositions", "activeStrategies", "cryptoSymbols"];
+  const allowed = ["routerEnabled", "consensusMin", "maxConcurrentPositions", "activeStrategies", "cryptoSymbols", "optionsMode", "optionsDte"];
   const patch = {};
   for (const k of allowed) if (req.body?.[k] !== undefined) patch[k] = req.body[k];
   // Coerce types
   if (patch.routerEnabled !== undefined)          patch.routerEnabled = !!patch.routerEnabled;
   if (patch.consensusMin !== undefined)           patch.consensusMin = Math.max(1, parseInt(patch.consensusMin) || 1);
   if (patch.maxConcurrentPositions !== undefined) patch.maxConcurrentPositions = Math.max(1, parseInt(patch.maxConcurrentPositions) || 5);
+  if (patch.optionsMode !== undefined)            patch.optionsMode = !!patch.optionsMode;
+  if (patch.optionsDte !== undefined)             patch.optionsDte  = Math.max(0, parseInt(patch.optionsDte) || 7);
   if (Array.isArray(patch.activeStrategies))      patch.activeStrategies = patch.activeStrategies.map(s => String(s).trim().toLowerCase()).filter(Boolean);
   if (Array.isArray(patch.cryptoSymbols))         patch.cryptoSymbols    = patch.cryptoSymbols.map(s => String(s).trim().toUpperCase()).filter(Boolean);
 

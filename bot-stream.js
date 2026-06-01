@@ -23,6 +23,8 @@ import { pickStop, nearTargetTrigger } from "./backtest.js";
 import { classifyRegime } from "./regime.js";
 import { chooseSignal }   from "./router.js";
 import { getRegimeStats, getAllRegimeStats } from "./learner.js";
+import { planOptionsTrade, shouldExitOption } from "./agents-options.js";
+import { placeOptionsOrder, fetchSnapshots }  from "./options.js";
 import { runAgentDebate, debateEnabled } from "./agents.js";
 
 // Runtime config — bot-config.json overrides these env-var defaults and is
@@ -38,6 +40,11 @@ function loadRuntimeConfig() {
                               .split(",").map(s => s.trim().toLowerCase()).filter(Boolean),
     cryptoSymbols:          (process.env.CRYPTO_SYMBOLS || "")
                               .split(",").map(s => s.trim().toUpperCase()).filter(Boolean),
+    // When true, every stock signal routes through the Options Strategist
+    // agent which picks the contract and exit triggers. Crypto symbols
+    // always trade the underlying — Alpaca doesn't offer crypto options.
+    optionsMode:            process.env.OPTIONS_MODE === "true",
+    optionsDte:             parseInt(process.env.OPTIONS_DTE || "7"),
   };
   if (!existsSync(CONFIG_FILE)) return defaults;
   try {
@@ -65,6 +72,8 @@ setInterval(() => {
 const ROUTER_ENABLED   = () => runtimeCfg.routerEnabled;
 const ACTIVE_STRATS    = () => runtimeCfg.activeStrategies;
 const MAX_CONCURRENT   = () => runtimeCfg.maxConcurrentPositions;
+const OPTIONS_MODE     = () => runtimeCfg.optionsMode;
+const OPTIONS_DTE      = () => runtimeCfg.optionsDte || 7;
 const STRICT_ROUTER    = process.env.STRICT_ROUTER === "true";
 const CRYPTO_SYMBOLS   = runtimeCfg.cryptoSymbols;
 
@@ -666,6 +675,7 @@ async function onRouterBar(bar) {
   if (s.position) {
     const pos = s.position;
     let exitPrice = null, exitReason = null;
+    // Underlying stop/target on the stock price (works for both stock and option positions)
     if (pos.side === "buy") {
       if (bar.low  <= pos.stop)   { exitReason = "stop";   exitPrice = pos.stop;   }
       if (bar.high >= pos.target) { exitReason = "target"; exitPrice = pos.target; }
@@ -677,6 +687,38 @@ async function onRouterBar(bar) {
       const nt = nearTargetTrigger(pos.side, pos.entry, pos.target, bar);
       if (nt != null) { exitReason = "near-target"; exitPrice = nt; }
     }
+
+    // Options-specific exit triggers: profit-target %, max-loss %, time, IV crush.
+    // Checked roughly once per minute (every ~5 bars at 1-min cadence) to avoid
+    // hammering the snapshot endpoint.
+    if (!exitReason && pos.isOption && pos.contractSymbol) {
+      const lastCheck = pos._lastOptionCheck || 0;
+      const ageMs = Date.now() - lastCheck;
+      if (ageMs >= 60_000) {
+        pos._lastOptionCheck = Date.now();
+        try {
+          const snaps = await fetchSnapshots(sym, {
+            type:      pos.contract.type,
+            expDate:   pos.contract.expiry,
+            strikeGte: pos.contract.strike - 0.5,
+            strikeLte: pos.contract.strike + 0.5,
+          });
+          const snap = snaps[pos.contractSymbol];
+          const cur  = snap?.latestQuote ? { bid: snap.latestQuote.bp, ask: snap.latestQuote.ap, mid: (snap.latestQuote.bp + snap.latestQuote.ap) / 2, iv: snap.impliedVolatility } : null;
+          const verdict = shouldExitOption(pos, bar.close, cur);
+          if (verdict.exit) {
+            exitReason = verdict.reason;
+            // For options exits we still pass the stock price (the trade record
+            // tracks underlying price); the options PnL is computed from the
+            // contract's bid/ask if we had it. Detailed options PnL needs the
+            // close-order fill price which Alpaca returns asynchronously.
+            exitPrice = bar.close;
+            console.log(`[OptionsAgent] ${sym} ${pos.contractSymbol} exit: ${verdict.reason}${verdict.pnlPct != null ? ` (option PnL ${verdict.pnlPct.toFixed(1)}%)` : ""}`);
+          }
+        } catch (e) { /* snapshot fetch is best-effort */ }
+      }
+    }
+
     if (exitReason) {
       console.log(`[Router] ${sym} exit: ${exitReason} @ $${exitPrice.toFixed(2)}`);
       await closeRouterPosition(sym, exitPrice, exitReason);
@@ -759,22 +801,81 @@ async function onRouterBar(bar) {
 async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultiplier = 1.0) {
   const s = getSymState(sym);
   const perPositionUSD = (TRADE_USD / Math.min(MAX_CONCURRENT(), routerStates.size || 1)) * sizeMultiplier;
-  if (IS_PAPER) {
-    console.log(`[Router] PAPER ${signal.side.toUpperCase()} ${sym} via ${strategy} $${perPositionUSD.toFixed(2)} @ ~${bar.close.toFixed(2)} [regime: ${regime}]`);
-  } else {
-    try { await placeOrder(sym, signal.side, perPositionUSD); }
-    catch (e) { console.error(`[Router] ${sym} order failed:`, e.message); return; }
+  const crypto = isCryptoSymbol(sym);
+
+  // Options Strategist routes ALL stock-direction trades through the agent
+  // when OPTIONS_MODE is on. Crypto is excluded (Alpaca has no crypto options).
+  let optionsPlan = null;
+  if (OPTIONS_MODE() && !crypto) {
+    try {
+      optionsPlan = await planOptionsTrade(
+        { ...signal, symbol: sym, strategy, regime },
+        bar.close,
+        { dte: OPTIONS_DTE(), underlying: sym },
+      );
+      if (optionsPlan?.contract) {
+        console.log(`[OptionsAgent] ${sym} → ${optionsPlan.contract.symbol} (${optionsPlan.contract.type} ${optionsPlan.contract.strike}@${optionsPlan.contract.expiry}, premium $${(optionsPlan.contract.mid||0).toFixed(2)}, delta ${optionsPlan.contract.delta?.toFixed(2)}) · ${optionsPlan.reasoning}`);
+      } else {
+        console.warn(`[OptionsAgent] ${sym} — no contract qualified, skipping trade`);
+        return;  // refuse the trade if the agent can't find a clean contract
+      }
+    } catch (e) {
+      console.warn(`[OptionsAgent] ${sym} planning failed: ${e.message} — falling back to stock entry`);
+      optionsPlan = null;
+    }
   }
-  s.position = {
-    side:   signal.side,
-    entry:  signal.entry,
-    stop:   signal.stop,
-    target: signal.target,
-    strategy,
-    regime,
-    entryTime: new Date().toISOString(),
-    entryBar:  bar,
-  };
+
+  // Execute the trade
+  if (optionsPlan?.contract) {
+    // Options leg
+    const contractMid = optionsPlan.contract.mid || optionsPlan.contract.ask || 1;
+    const numContracts = Math.max(1, Math.floor(perPositionUSD / (contractMid * 100)));
+    if (IS_PAPER) {
+      console.log(`[Router] PAPER BUY ${numContracts}× ${optionsPlan.contract.symbol} (~$${(numContracts * contractMid * 100).toFixed(2)}) for stock ${signal.side.toUpperCase()} ${sym} [regime: ${regime}]`);
+    } else {
+      try { await placeOptionsOrder(optionsPlan.contract.symbol, "buy", numContracts); }
+      catch (e) { console.error(`[Router] ${sym} options order failed:`, e.message); return; }
+    }
+    s.position = {
+      side:           signal.side,
+      entry:          signal.entry,
+      stop:           signal.stop,
+      target:         signal.target,
+      strategy, regime,
+      entryTime:      new Date().toISOString(),
+      entryBar:       bar,
+      // Options-specific
+      isOption:       true,
+      contract:       optionsPlan.contract,
+      contractSymbol: optionsPlan.contract.symbol,
+      numContracts,
+      entryPremium:   contractMid,
+      entryIv:        optionsPlan.contract.iv,
+      exitTriggers:   optionsPlan.exitTriggers,
+      agentReasoning: optionsPlan.reasoning,
+      agentConfidence: optionsPlan.confidence,
+      agentSource:    optionsPlan.source,
+    };
+  } else {
+    // Stock leg (existing path)
+    if (IS_PAPER) {
+      console.log(`[Router] PAPER ${signal.side.toUpperCase()} ${sym} via ${strategy} $${perPositionUSD.toFixed(2)} @ ~${bar.close.toFixed(2)} [regime: ${regime}]`);
+    } else {
+      try { await placeOrder(sym, signal.side, perPositionUSD); }
+      catch (e) { console.error(`[Router] ${sym} order failed:`, e.message); return; }
+    }
+    s.position = {
+      side:   signal.side,
+      entry:  signal.entry,
+      stop:   signal.stop,
+      target: signal.target,
+      strategy, regime,
+      entryTime: new Date().toISOString(),
+      entryBar:  bar,
+      isOption:  false,
+    };
+  }
+
   s.tradedToday = true;
   routerDay.strategiesFiredToday.add(strategy);
 }
@@ -784,7 +885,10 @@ async function closeRouterPosition(sym, exitPrice, exitReason) {
   const pos = s.position;
   if (!pos) return;
   if (!IS_PAPER) {
-    try { await closeAlpacaPosition(sym); } catch (e) { console.error(`[Router] ${sym} close failed:`, e.message); }
+    // For option positions, close the option contract directly (its OCC symbol),
+    // not the underlying stock symbol.
+    const closeSymbol = pos.isOption && pos.contractSymbol ? pos.contractSymbol : sym;
+    try { await closeAlpacaPosition(closeSymbol); } catch (e) { console.error(`[Router] ${closeSymbol} close failed:`, e.message); }
   }
   const hourET = etMinutesOf(new Date(pos.entryTime || Date.now())) / 60 | 0;
   recordTradeClosed({
