@@ -191,7 +191,6 @@ Create a `.env` file on the VPS with everything from `.env.example`:
 | `MAX_TRADES_PER_DAY` | 3 |
 | `PAPER_TRADING` | true (set to false when ready; false sends Alpaca orders to `ALPACA_BASE_URL`) |
 | `ROUTER_ENABLED` | true (bot starts active immediately; set false for single-symbol mode) |
-| `ACTIVE_STRATEGIES` | hybrid,hybrid10,smc,orb — includes the SMC supply/demand strategy |
 | `SYMBOL` | BTCUSDT |
 | `TIMEFRAME` | 4H |
 
