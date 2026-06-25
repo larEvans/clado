@@ -5,7 +5,7 @@
   "type": "module",
   "main": "bot.js",
   "scripts": {
-    "start": "node dashboard.js",
+    "start": "node start.js",
     "bot": "node bot-stream.js",
     "legacy-bot": "node bot.js",
     "backtest": "node backtest.js"

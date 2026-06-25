@@ -31,9 +31,17 @@ import { runAgentDebate, debateEnabled } from "./agents.js";
 // reloaded periodically so the dashboard can toggle the router live.
 const CONFIG_FILE = "bot-config.json";
 
+function parseEnvBool(value, defaultValue = false) {
+  if (value == null || value === "") return defaultValue;
+  const normalized = String(value).trim().toLowerCase();
+  if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "n", "off"].includes(normalized)) return false;
+  return defaultValue;
+}
+
 function loadRuntimeConfig() {
   const defaults = {
-    routerEnabled:          process.env.ROUTER_ENABLED === "true",
+    routerEnabled:          parseEnvBool(process.env.ROUTER_ENABLED, true),
     consensusMin:           parseInt(process.env.CONSENSUS_MIN || "1"),
     maxConcurrentPositions: parseInt(process.env.MAX_CONCURRENT_POSITIONS || "5"),
     activeStrategies:       (process.env.ACTIVE_STRATEGIES || "hybrid,hybrid10,hybrid-reversal,reversal,vwap")
@@ -43,7 +51,7 @@ function loadRuntimeConfig() {
     // When true, every stock signal routes through the Options Strategist
     // agent which picks the contract and exit triggers. Crypto symbols
     // always trade the underlying — Alpaca doesn't offer crypto options.
-    optionsMode:            process.env.OPTIONS_MODE === "true",
+    optionsMode:            parseEnvBool(process.env.OPTIONS_MODE, false),
     optionsDte:             parseInt(process.env.OPTIONS_DTE || "7"),
   };
   if (!existsSync(CONFIG_FILE)) return defaults;
@@ -86,8 +94,20 @@ const CONSENSUS_MIN    = Math.max(1, parseInt(process.env.CONSENSUS_MIN || "1"))
 const SYMBOL      = (process.env.SYMBOL   || "SPY").toUpperCase();
 const STRATEGY    = (process.env.STRATEGY || "hybrid").toLowerCase();
 const TRADE_USD   = parseFloat(process.env.MAX_TRADE_SIZE_USD || "200");
-const IS_PAPER    = process.env.PAPER_TRADING !== "false";
-const ALPACA_BASE = process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets";
+function normalizeAlpacaBase(raw) {
+  if (!raw) return "https://paper-api.alpaca.markets";
+  return String(raw)
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/v\d[^/]*$/, "");
+}
+
+function describeAlpacaAccount(baseUrl) {
+  return /paper-api\.alpaca\.markets$/i.test(baseUrl) ? "PAPER ACCOUNT" : "LIVE ACCOUNT";
+}
+
+const IS_PAPER    = parseEnvBool(process.env.PAPER_TRADING, true);
+const ALPACA_BASE = normalizeAlpacaBase(process.env.ALPACA_BASE_URL);
 const LOG_FILE    = "safety-check-log.json";
 const STATE_FILE  = "bot-state.json";
 
@@ -545,12 +565,23 @@ console.log("  Alpaca Streaming Bot");
 console.log(`  Symbol   : ${SYMBOL}`);
 console.log(`  Strategy : ${STRATEGY}`);
 console.log(`  Trade $  : $${TRADE_USD}`);
-console.log(`  Mode     : ${IS_PAPER ? "PAPER (safe)" : "LIVE"}`);
+console.log(`  Mode     : ${IS_PAPER ? "PAPER (no orders sent)" : "ORDERS ENABLED"}`);
+console.log(`  Alpaca   : ${describeAlpacaAccount(ALPACA_BASE)} (${ALPACA_BASE})`);
 console.log("=".repeat(60));
 
 if (!process.env.ALPACA_API_KEY || !process.env.ALPACA_SECRET_KEY) {
   console.error("ERROR: ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env");
   process.exit(1);
+}
+
+if (!IS_PAPER && !/^https:\/\/(paper-api|api)\.alpaca\.markets$/i.test(ALPACA_BASE)) {
+  console.error(`ERROR: Refusing to send Alpaca orders to unsupported ALPACA_BASE_URL: ${ALPACA_BASE}`);
+  console.error("Use https://paper-api.alpaca.markets for Alpaca paper orders or https://api.alpaca.markets for live Alpaca orders.");
+  process.exit(1);
+}
+
+if (!IS_PAPER && describeAlpacaAccount(ALPACA_BASE) === "PAPER ACCOUNT") {
+  console.warn("[Bot] PAPER_TRADING=false, but ALPACA_BASE_URL points at Alpaca paper. Orders will execute in the Alpaca paper account, not the live brokerage account.");
 }
 
 // Show current learned params at startup
