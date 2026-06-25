@@ -69,16 +69,24 @@ app.get("/", (req, res) => res.sendFile(join(__dirname, "dashboard.html")));
 
 const CONFIG_FILE = join(__dirname, "bot-config.json");
 
+function parseEnvBool(value, defaultValue = false) {
+  if (value == null || value === "") return defaultValue;
+  const normalized = String(value).trim().toLowerCase();
+  if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "n", "off"].includes(normalized)) return false;
+  return defaultValue;
+}
+
 function loadBotConfig() {
   const defaults = {
-    routerEnabled:          process.env.ROUTER_ENABLED === "true",
+    routerEnabled:          parseEnvBool(process.env.ROUTER_ENABLED, true),
     consensusMin:           parseInt(process.env.CONSENSUS_MIN || "1"),
     maxConcurrentPositions: parseInt(process.env.MAX_CONCURRENT_POSITIONS || "5"),
     activeStrategies:       (process.env.ACTIVE_STRATEGIES || "hybrid10,vwap-reclaim")
                               .split(",").map(s => s.trim().toLowerCase()).filter(Boolean),
     cryptoSymbols:          (process.env.CRYPTO_SYMBOLS || "")
                               .split(",").map(s => s.trim().toUpperCase()).filter(Boolean),
-    optionsMode:            process.env.OPTIONS_MODE === "true",
+    optionsMode:            parseEnvBool(process.env.OPTIONS_MODE, false),
     optionsDte:             parseInt(process.env.OPTIONS_DTE || "7"),
     updatedAt:              null,
   };

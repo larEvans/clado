@@ -2,4 +2,4 @@
 nixPkgs = ["nodejs_22"]
 
 [start]
-cmd = "node dashboard.js"
+cmd = "node start.js"

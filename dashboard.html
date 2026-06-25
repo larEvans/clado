@@ -512,7 +512,7 @@
     <summary style="cursor:pointer;font-size:13px;font-weight:600;padding:6px 0">📘 How to read this page (click to expand)</summary>
     <div style="font-size:13px;line-height:1.6;color:#cbd5e1;padding:10px 4px 14px">
 
-      <p style="margin:0 0 12px"><strong>What this is:</strong> the router decides — on every bar — which strategy should fire for which symbol, based on the current market regime and each strategy's historical win rate in that regime. It runs automatically when <code>ROUTER_ENABLED=true</code> is set on Railway.</p>
+      <p style="margin:0 0 12px"><strong>What this is:</strong> the router decides — on every bar — which strategy should fire for which symbol, based on the current market regime and each strategy's historical win rate in that regime. It runs automatically by default when the bot starts; set <code>ROUTER_ENABLED=false</code> only if you want single-symbol mode.</p>
 
       <div style="margin:0 0 14px">
         <strong>Current Regime by Symbol (cards):</strong>
@@ -553,7 +553,7 @@
           <li>Open the <strong>Strategies &amp; Backtest</strong> tab → click <strong>Validate (CPCV)</strong> on each candidate. Only trust strategies that come back <code>ROBUST</code> or <code>OK</code>. <code>LIKELY_OVERFIT</code> = don't trade.</li>
           <li>Set <code>ACTIVE_STRATEGIES</code> env var to just the validated survivors (e.g. <code>hybrid10,vwap-reclaim</code>).</li>
           <li>Click <strong>Optimize All by Regime</strong> to tune surviving strategies per bucket.</li>
-          <li>Set <code>ROUTER_ENABLED=true</code> on Railway, restart bot service, watch the logs.</li>
+          <li>Router starts on by default. To disable it, set <code>ROUTER_ENABLED=false</code>; otherwise restart the bot service and watch the logs.</li>
         </ol>
       </div>
 
@@ -2297,7 +2297,7 @@ async function loadActiveSymbols(botState) {
     `${stockCount} stock${stockCount === 1 ? '' : 's'} · ` +
     `${cryptoCount} crypto · ` +
     `router <strong style="color:${routerOn ? 'var(--green)' : 'var(--yellow)'}">${routerOn ? 'ENABLED' : 'OFF'}</strong>` +
-    (routerOn ? '' : ' — set ROUTER_ENABLED=true on Railway to start trading these');
+    (routerOn ? '' : ' — router is OFF; toggle it on to trade these');
 }
 
 // ─── Strategy Router tab ──────────────────────────────────────────────────────
