@@ -1,0 +1,54 @@
+//@version=5
+indicator("SMC Supply/Demand + Liquidity + Order Flow", overlay=true, max_boxes_count=50, max_lines_count=50, max_labels_count=50)
+
+swingLen = input.int(5, "Swing lookback", minval=2)
+emaLen   = input.int(48, "HTF/Bias EMA", minval=10)
+rr       = input.float(2.5, "Reward/Risk", minval=0.5, step=0.25)
+
+biasEma = ta.ema(close, emaLen)
+bullBias = close >= biasEma
+bearBias = close < biasEma
+plot(biasEma, "Bias EMA", color=bullBias ? color.new(color.green, 0) : color.new(color.red, 0), linewidth=2)
+
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low, swingLen, swingLen)
+var float lastSwingHigh = na
+var float lastSwingLow = na
+if not na(ph)
+    lastSwingHigh := ph
+if not na(pl)
+    lastSwingLow := pl
+
+plot(lastSwingHigh, "Buy-side liquidity", color=color.new(color.red, 35), style=plot.style_linebr)
+plot(lastSwingLow, "Sell-side liquidity", color=color.new(color.green, 35), style=plot.style_linebr)
+
+buySweep  = not na(lastSwingHigh) and high > lastSwingHigh and close < lastSwingHigh
+sellSweep = not na(lastSwingLow) and low < lastSwingLow and close > lastSwingLow
+bullBos   = not na(lastSwingHigh) and close > lastSwingHigh
+bearBos   = not na(lastSwingLow) and close < lastSwingLow
+
+// Crude order-flow proxy: displacement candle + volume expansion.
+volMa = ta.sma(volume, 20)
+bodyPct = math.abs(close - open) / math.max(high - low, syminfo.mintick)
+orderFlowUp = close > open and bodyPct > 0.55 and volume > volMa * 1.2
+orderFlowDn = close < open and bodyPct > 0.55 and volume > volMa * 1.2
+
+longSignal  = sellSweep[1] and bullBos and bullBias and orderFlowUp
+shortSignal = buySweep[1] and bearBos and bearBias and orderFlowDn
+
+var box demandBox = na
+var box supplyBox = na
+if longSignal
+    demandBox := box.new(left=bar_index - 1, top=high[1], right=bar_index + 20, bottom=low[1], bgcolor=color.new(color.green, 85), border_color=color.new(color.green, 20))
+    label.new(bar_index, low, "DEMAND\nSell-side liquidity swept\nBOS + bullish order flow", style=label.style_label_up, textcolor=color.white, color=color.new(color.green, 0))
+if shortSignal
+    supplyBox := box.new(left=bar_index - 1, top=high[1], right=bar_index + 20, bottom=low[1], bgcolor=color.new(color.red, 85), border_color=color.new(color.red, 20))
+    label.new(bar_index, high, "SUPPLY\nBuy-side liquidity swept\nBOS + bearish order flow", style=label.style_label_down, textcolor=color.white, color=color.new(color.red, 0))
+
+plotshape(sellSweep, title="Sell-side sweep", style=shape.triangleup, location=location.belowbar, color=color.lime, text="SSL")
+plotshape(buySweep, title="Buy-side sweep", style=shape.triangledown, location=location.abovebar, color=color.red, text="BSL")
+plotshape(orderFlowUp, title="Bull order flow", style=shape.circle, location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+plotshape(orderFlowDn, title="Bear order flow", style=shape.circle, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny)
+
+alertcondition(longSignal, "SMC Long", "SMC long: demand zone + liquidity sweep + BOS + bullish order flow")
+alertcondition(shortSignal, "SMC Short", "SMC short: supply zone + liquidity sweep + BOS + bearish order flow")

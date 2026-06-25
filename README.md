@@ -194,6 +194,10 @@ Create a `.env` file on the VPS with everything from `.env.example`:
 | `SYMBOL` | BTCUSDT |
 | `TIMEFRAME` | 4H |
 
+### SMC supply/demand strategy
+
+The bot includes an `smc` strategy that illustrates and trades supply/demand zones, buy-side/sell-side liquidity sweeps, break of structure, and an order-flow displacement proxy. Its TradingView overlay is available as `pinescript/smc.pine`, and the dashboard can serve it from `/api/pinescript/smc`.
+
 ### 4. Set a cron schedule
 
 The bot runs one check and exits, so schedule it with the VPS's built-in cron. Run `crontab -e` and add one line matching your chart timeframe (all run from the repo dir and log to `bot.log`):

@@ -18,7 +18,7 @@
 import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import { AlpacaStream } from "./stream.js";
-import { getDefaultParams, loadLearnedParams, recordTradeClosed, runLearner } from "./learner.js";
+import { getDefaultParams, loadLearnedParams, recordTradeClosed, runLearner, getEarlyExitConfig } from "./learner.js";
 import { pickStop, nearTargetTrigger } from "./backtest.js";
 import { classifyRegime } from "./regime.js";
 import { chooseSignal }   from "./router.js";
@@ -26,6 +26,7 @@ import { getRegimeStats, getAllRegimeStats } from "./learner.js";
 import { planOptionsTrade, shouldExitOption } from "./agents-options.js";
 import { placeOptionsOrder, fetchSnapshots }  from "./options.js";
 import { runAgentDebate, debateEnabled } from "./agents.js";
+import { checkSignal as smcSignal } from "./strategies/smc.js";
 
 // Runtime config — bot-config.json overrides these env-var defaults and is
 // reloaded periodically so the dashboard can toggle the router live.
@@ -44,7 +45,7 @@ function loadRuntimeConfig() {
     routerEnabled:          parseEnvBool(process.env.ROUTER_ENABLED, true),
     consensusMin:           parseInt(process.env.CONSENSUS_MIN || "1"),
     maxConcurrentPositions: parseInt(process.env.MAX_CONCURRENT_POSITIONS || "5"),
-    activeStrategies:       (process.env.ACTIVE_STRATEGIES || "hybrid,hybrid10,hybrid-reversal,reversal,vwap")
+    activeStrategies:       (process.env.ACTIVE_STRATEGIES || "hybrid,hybrid10,smc,hybrid-reversal,reversal,vwap")
                               .split(",").map(s => s.trim().toLowerCase()).filter(Boolean),
     cryptoSymbols:          (process.env.CRYPTO_SYMBOLS || "")
                               .split(",").map(s => s.trim().toUpperCase()).filter(Boolean),
@@ -380,6 +381,10 @@ function evaluateSignal(barBuffer) {
   return null;
 }
 
+function learnedNearTargetPct(strategy, regime = null) {
+  return getEarlyExitConfig(strategy, regime).nearTargetPct;
+}
+
 // ── Position entry ────────────────────────────────────────────────────────────
 
 async function enterTrade(signal, bar) {
@@ -533,10 +538,10 @@ async function onBar(bar) {
       if (bar.low  <= pos.target) { exitReason = "target"; exitPrice = pos.target; }
     }
 
-    // Near-target early exit: if price comes within 5% of the planned target,
-    // lock in the win rather than waiting for the exact tag.
+    // Learned near-target early exit: each strategy can tune how soon to
+    // lock in the win rather than waiting for the exact target tag.
     if (!exitReason) {
-      const nt = nearTargetTrigger(pos.side, pos.entry, pos.target, bar);
+      const nt = nearTargetTrigger(pos.side, pos.entry, pos.target, bar, learnedNearTargetPct(pos.strategy || STRATEGY));
       if (nt != null) { exitReason = "near-target"; exitPrice = nt; }
     }
 
@@ -610,6 +615,7 @@ function getSymState(sym) {
       ema21: new RollingEMA(21),
       position: null,
       tradedToday: false,
+      strategiesTradedToday: new Set(),
       date: "",
       lastRegime: null,
       lastChoice: null,
@@ -627,6 +633,7 @@ function saveRouterState() {
       date:         s.date,
       lastRegime:   s.lastRegime,
       lastChoice:   s.lastChoice,
+      strategiesTradedToday: [...(s.strategiesTradedToday || [])],
       barCount:     s.bars.length,
     };
   }
@@ -647,6 +654,7 @@ function resetRouterDayIfNew(today) {
     routerDay.strategiesFiredToday = new Set();
     for (const [, s] of routerStates.entries()) {
       s.tradedToday = false;
+      s.strategiesTradedToday = new Set();
       s.date = today;
     }
   }
@@ -667,6 +675,7 @@ function candidateSignals(strategy, sym, barBuffer) {
   try {
     if (strategy === "hybrid"   || strategy === "hybrid10")  return evalHybrid(barBuffer);
     if (strategy === "orb")                                  return evalORB(barBuffer);
+    if (strategy === "smc")                                  return smcSignal(barBuffer, loadLearnedParams("smc") || undefined);
     // For strategies that aren't natively in this bot file yet, return null —
     // they're still tracked in stats from backtests but live signals only fire
     // for the two evaluators above.
@@ -715,7 +724,7 @@ async function onRouterBar(bar) {
       if (bar.low  <= pos.target) { exitReason = "target"; exitPrice = pos.target; }
     }
     if (!exitReason) {
-      const nt = nearTargetTrigger(pos.side, pos.entry, pos.target, bar);
+      const nt = nearTargetTrigger(pos.side, pos.entry, pos.target, bar, learnedNearTargetPct(pos.strategy, pos.regime));
       if (nt != null) { exitReason = "near-target"; exitPrice = nt; }
     }
 
@@ -759,7 +768,9 @@ async function onRouterBar(bar) {
   }
 
   // ── Entry: classify regime, gather candidates, route ──────────────────
-  if (s.tradedToday) return;
+  // Allow each active strategy to fire once per symbol per day.
+  // We still keep only one open position per symbol at a time.
+  if (ACTIVE_STRATS().every(strategy => s.strategiesTradedToday?.has(strategy))) return;
   if (!crypto && etMins < ORB_READY) return;  // ORB-gated entries are stocks-only
   if (s.bars.length < 20) return;
 
@@ -775,10 +786,12 @@ async function onRouterBar(bar) {
   const eligibleStrats = crypto
     ? ACTIVE_STRATS().filter(x => ["reversal", "vwap-reclaim", "hybrid-reversal"].includes(x))
     : ACTIVE_STRATS();
-  const candidates = eligibleStrats.map(strategy => ({
-    strategy,
-    signal: candidateSignals(strategy, sym, s.bars),
-  }));
+  const candidates = eligibleStrats
+    .filter(strategy => !s.strategiesTradedToday?.has(strategy))
+    .map(strategy => ({
+      strategy,
+      signal: candidateSignals(strategy, sym, s.bars),
+    }));
 
   const decision = chooseSignal({
     candidates,
@@ -908,6 +921,8 @@ async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultipli
   }
 
   s.tradedToday = true;
+  s.strategiesTradedToday = s.strategiesTradedToday || new Set();
+  s.strategiesTradedToday.add(strategy);
   routerDay.strategiesFiredToday.add(strategy);
 }
 

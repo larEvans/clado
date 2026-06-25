@@ -20,9 +20,10 @@ import { meta as hybrid10Meta }        from "./strategies/hybrid10.js";
 import { meta as gapFillMeta }         from "./strategies/gap-fill.js";
 import { meta as vwapReclaimMeta }     from "./strategies/vwap-reclaim.js";
 import { meta as firstHourFadeMeta }   from "./strategies/first-hour-fade.js";
+import { meta as smcMeta }             from "./strategies/smc.js";
 import { fetchChain, fetchExpiryDates, fetchContracts, getLiveOptionsParams } from "./options.js";
 import { AlpacaStream } from "./stream.js";
-import { loadAllLearning, getAllRegimeStats, saveRegimeParams, getRegimeStats, getOptionsHistoryStats } from "./learner.js";
+import { loadAllLearning, getAllRegimeStats, saveRegimeParams, getRegimeStats, getOptionsHistoryStats, suggestEarlyExitPct } from "./learner.js";
 import { classifyRegime } from "./regime.js";
 import { runHermesAnalysis, loadAllInsights, suggestParamChanges, explainTrades, deriveWinOnlyFilters } from "./hermes.js";
 
@@ -324,13 +325,13 @@ app.get("/api/strategies", (req, res) => {
   const all = [
     hybridMeta, hybridReversalMeta, hybrid10Meta,
     reversalMeta, vwapMeta, vwapReclaimMeta,
-    gapFillMeta, firstHourFadeMeta,
+    gapFillMeta, firstHourFadeMeta, smcMeta,
     orbMeta, trendMeta, meanrevMeta, momentumMeta,
   ];
   if (req.query?.all === "1") return res.json(all);
   // Hybrid family + Reversal + VWAP family + new ≥50% strategies active by default.
   const whitelist = (process.env.ACTIVE_STRATEGIES ||
-    "hybrid,hybrid-reversal,hybrid10,reversal,vwap,vwap-reclaim,gap-fill,first-hour-fade")
+    "hybrid,hybrid-reversal,hybrid10,smc,reversal,vwap,vwap-reclaim,gap-fill,first-hour-fade")
     .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
   const active = all
     .filter(m => whitelist.includes(m.id))
@@ -450,6 +451,7 @@ app.get("/api/pinescript/:id", (req, res) => {
     hybrid:           "pinescript/hybrid.pine",
     reversal:         "pinescript/reversal.pine",
     "options-overlay": "pinescript/options-overlay.pine",
+    smc:               "pinescript/smc.pine",
   };
   const file  = files[req.params.id];
   if (!file) return res.status(404).json({ error: "Unknown strategy" });
@@ -1139,11 +1141,11 @@ app.post("/api/router/optimize-by-regime", async (req, res) => {
 
 // ─── Backtest optimization loop ───────────────────────────────────────────────
 
-const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m", reversal: "5m", "hybrid-reversal": "5m", hybrid10: "5m", "gap-fill": "5m", "vwap-reclaim": "5m", "first-hour-fade": "5m" };
+const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m", reversal: "5m", "hybrid-reversal": "5m", hybrid10: "5m", "gap-fill": "5m", "vwap-reclaim": "5m", "first-hour-fade": "5m", smc: "15m" };
 const STRATEGY_META = {
   orb: orbMeta, vwap: vwapMeta, trend: trendMeta, meanrev: meanrevMeta, momentum: momentumMeta,
   hybrid: hybridMeta, reversal: reversalMeta, "hybrid-reversal": hybridReversalMeta, hybrid10: hybrid10Meta,
-  "gap-fill": gapFillMeta, "vwap-reclaim": vwapReclaimMeta, "first-hour-fade": firstHourFadeMeta,
+  "gap-fill": gapFillMeta, "vwap-reclaim": vwapReclaimMeta, "first-hour-fade": firstHourFadeMeta, smc: smcMeta,
 };
 
 function findBestIteration(iters) {
@@ -1291,6 +1293,10 @@ app.post("/api/backtest/optimize", async (req, res) => {
       // explainTrades expects pnlPct present on the trade
     }));
     const bestTradesAnnotated = explainTrades(bestTradesRaw).slice(-200);
+    const bestParamsWithExit = {
+      ...iterResults[bestIdx].params,
+      nearTargetPct: suggestEarlyExitPct(bestTradesRaw, iterResults[bestIdx].params.nearTargetPct),
+    };
 
     // Auto-deploy best params to learned-params.json so the live bot picks
     // them up on the next signal. Set autoDeploy:false to opt out.
@@ -1301,7 +1307,7 @@ app.post("/api/backtest/optimize", async (req, res) => {
       try { if (existsSync(learnFile)) learned = JSON.parse(readFileSync(learnFile, "utf8")); } catch {}
       learned[strategy] = {
         ...(learned[strategy] || {}),
-        params:        iterResults[bestIdx].params,
+        params:        bestParamsWithExit,
         source:        "hermes-auto-deploy",
         bestReturnPct: iterResults[bestIdx].returnPct,
         targetReturnPct: targetPct,
@@ -1311,10 +1317,10 @@ app.post("/api/backtest/optimize", async (req, res) => {
       writeFileSync(learnFile, JSON.stringify(learned, null, 2));
       autoDeployed = {
         strategy,
-        params:    iterResults[bestIdx].params,
+        params:    bestParamsWithExit,
         returnPct: iterResults[bestIdx].returnPct,
       };
-      console.log(`[Optimize] 🚀 Auto-deployed best params for ${strategy} → ${JSON.stringify(iterResults[bestIdx].params)}`);
+      console.log(`[Optimize] 🚀 Auto-deployed best params for ${strategy} → ${JSON.stringify(bestParamsWithExit)}`);
     }
 
     // Strip the trades array off iterations before returning (keep payload small)

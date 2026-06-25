@@ -12,6 +12,12 @@ import { readFileSync, writeFileSync, existsSync } from "fs";
 const HISTORY_FILE = "trade-history.json";
 const PARAMS_FILE  = "learned-params.json";
 
+const EARLY_EXIT_DEFAULTS = {
+  nearTargetPct: 5,      // exit after capturing 95% of planned move
+  minPct:        3,
+  maxPct:        25,
+};
+
 // ── Default starting parameters ───────────────────────────────────────────────
 
 const DEFAULTS = {
@@ -149,6 +155,62 @@ export function saveRegimeParams(strategy, regime, params, stats = {}) {
     updatedAt:  new Date().toISOString(),
   };
   writeFileSync(PARAMS_FILE, JSON.stringify(all, null, 2));
+}
+
+
+function clampNumber(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+/**
+ * Learn how aggressively to lock in winners before the exact target.
+ *
+ * `nearTargetPct` means "exit when price is within this % of the remaining
+ * entry→target distance". 5 captures 95% of the target move; 20 captures 80%,
+ * so larger values get out earlier. The learner is intentionally conservative:
+ * it only uses closed-trade outcomes already in trade-history.json and nudges
+ * all strategies through the same param so every strategy can adapt.
+ */
+export function suggestEarlyExitPct(trades, currentPct = EARLY_EXIT_DEFAULTS.nearTargetPct) {
+  const sample = (trades || [])
+    .filter(t => Number.isFinite(Number(t.pnlPct)))
+    .slice(-30);
+  const current = clampNumber(currentPct, EARLY_EXIT_DEFAULTS.minPct, EARLY_EXIT_DEFAULTS.maxPct, EARLY_EXIT_DEFAULTS.nearTargetPct);
+  if (sample.length < 5) return current;
+
+  const wins = sample.filter(t => t.win || (t.pnlPct || 0) > 0);
+  const losses = sample.filter(t => !(t.win || (t.pnlPct || 0) > 0));
+  const avgPnl = sample.reduce((sum, t) => sum + (t.pnlPct || 0), 0) / sample.length;
+  const targetWins = wins.filter(t => t.exitReason === "target").length;
+  const nearTargetWins = wins.filter(t => t.exitReason === "near-target").length;
+  const stalledLosses = losses.filter(t => ["time", "eod", "timeout", "session_end", "next-session-close"].includes(t.exitReason)).length;
+  const stopLosses = losses.filter(t => ["stop", "trail-stop", "overnight-stop"].includes(t.exitReason)).length;
+
+  let next = current;
+
+  // If trades keep stalling or average P&L is weak, lock gains sooner.
+  if (stalledLosses >= Math.max(2, losses.length * 0.35) || avgPnl < 0) next += 5;
+
+  // If stops dominate, a slightly earlier lock can protect trades that almost
+  // worked without overpowering stop placement/entry learning.
+  if (stopLosses >= Math.max(3, losses.length * 0.6)) next += 2;
+
+  // If exact targets are being reached reliably, let winners breathe longer.
+  if (targetWins >= Math.max(3, wins.length * 0.5) && avgPnl > 0.2) next -= 3;
+
+  // If near-target exits are already the source of wins, keep leaning into them.
+  if (nearTargetWins >= Math.max(2, wins.length * 0.35) && avgPnl > 0) next += 1;
+
+  return +clampNumber(next, EARLY_EXIT_DEFAULTS.minPct, EARLY_EXIT_DEFAULTS.maxPct, current).toFixed(2);
+}
+
+export function getEarlyExitConfig(strategy, regime = null) {
+  const params = loadLearnedParams(strategy, regime) || getDefaultParams(strategy);
+  return {
+    nearTargetPct: clampNumber(params.nearTargetPct, EARLY_EXIT_DEFAULTS.minPct, EARLY_EXIT_DEFAULTS.maxPct, EARLY_EXIT_DEFAULTS.nearTargetPct),
+  };
 }
 
 // ── Record a closed trade ─────────────────────────────────────────────────────
@@ -315,6 +377,12 @@ export function runLearner(strategy) {
       changed = true;
     }
     if (changed) console.log(`[Learner] Relaxed ${strategy} params (win rate strong):`, params);
+  }
+
+  const previousEarlyExitPct = params.nearTargetPct ?? current.nearTargetPct ?? EARLY_EXIT_DEFAULTS.nearTargetPct;
+  params.nearTargetPct = suggestEarlyExitPct(trades, previousEarlyExitPct);
+  if (params.nearTargetPct !== previousEarlyExitPct) {
+    console.log(`[Learner] ${strategy}: nearTargetPct → ${params.nearTargetPct}% (learned early-exit lock)`);
   }
 
   // Persist learning data
