@@ -175,6 +175,8 @@ git clone <your-repo-url> bot && cd bot
 npm install
 ```
 
+The default start command runs both the streaming bot and dashboard through `start.js`, so the bot connects as soon as the app starts.
+
 ### 3. Set your environment variables
 
 Create a `.env` file on the VPS with everything from `.env.example`:
@@ -187,9 +189,15 @@ Create a `.env` file on the VPS with everything from `.env.example`:
 | `PORTFOLIO_VALUE_USD` | 1000 |
 | `MAX_TRADE_SIZE_USD` | 100 |
 | `MAX_TRADES_PER_DAY` | 3 |
-| `PAPER_TRADING` | true (set to false when ready) |
+| `PAPER_TRADING` | true (set to false when ready; false sends Alpaca orders to `ALPACA_BASE_URL`) |
+| `ROUTER_ENABLED` | true (bot starts active immediately; set false for single-symbol mode) |
+| `ACTIVE_STRATEGIES` | hybrid,hybrid10,smc,orb — includes the SMC supply/demand strategy |
 | `SYMBOL` | BTCUSDT |
 | `TIMEFRAME` | 4H |
+
+### SMC supply/demand strategy
+
+The bot includes an `smc` strategy that illustrates and trades supply/demand zones, buy-side/sell-side liquidity sweeps, break of structure, and an order-flow displacement proxy. Its TradingView overlay is available as `pinescript/smc.pine`, and the dashboard can serve it from `/api/pinescript/smc`.
 
 ### 4. Set a cron schedule
 
@@ -203,7 +211,7 @@ The bot runs one check and exits, so schedule it with the VPS's built-in cron. R
 
 ### 5. Start in paper trading mode
 
-`PAPER_TRADING=true` logs every decision but never places real orders. Watch a few days of paper trades, confirm the logic matches what you expect, then flip it to `false`.
+`PAPER_TRADING=true` logs every decision but never places Alpaca orders. Watch a few days of paper trades, confirm the logic matches what you expect, then flip it to `false`. With `PAPER_TRADING=false`, orders are sent to whichever Alpaca account URL is configured: `https://paper-api.alpaca.markets` for Alpaca paper-account orders or `https://api.alpaca.markets` for live brokerage orders.
 
 ---
 

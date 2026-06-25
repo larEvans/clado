@@ -8,7 +8,15 @@
 
 import "dotenv/config";
 
-const TRADE_BASE = process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets";
+function normalizeAlpacaBase(raw) {
+  if (!raw) return "https://paper-api.alpaca.markets";
+  return String(raw)
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/v\d[^/]*$/, "");
+}
+
+const TRADE_BASE = normalizeAlpacaBase(process.env.ALPACA_BASE_URL);
 const DATA_BASE  = "https://data.alpaca.markets";
 
 const H = () => ({

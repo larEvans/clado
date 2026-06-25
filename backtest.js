@@ -19,6 +19,7 @@ import { meta as hybrid10Meta }       from "./strategies/hybrid10.js";
 import { meta as gapFillMeta }        from "./strategies/gap-fill.js";
 import { meta as vwapReclaimMeta }    from "./strategies/vwap-reclaim.js";
 import { meta as firstHourFadeMeta }  from "./strategies/first-hour-fade.js";
+import { meta as smcMeta, checkSignal as smcSignal } from "./strategies/smc.js";
 import { classifyRegime }              from "./regime.js";
 
 // ─── Market data ──────────────────────────────────────────────────────────────
@@ -1718,6 +1719,55 @@ function runFirstHourFadeBacktest(allCandles, params = {}, opts = {}) {
   return trades;
 }
 
+
+function runSMCBacktest(allCandles, params = {}, opts = {}) {
+  const p = { ...smcMeta.params, ...params };
+  const days = groupByDay(allCandles);
+  const trades = [];
+  for (const { date, candles } of days) {
+    if (candles.length < 20) continue;
+    const sessEnd = candles[candles.length - 1].time;
+    let openTrade = null;
+    for (let i = 0; i < candles.length; i++) {
+      const bar = candles[i];
+      const hist = allCandles.filter(c => c.time <= bar.time).slice(-120);
+      if (!openTrade && hist.length >= Math.max(50, p.htfEmaPeriod || 48)) {
+        const sig = smcSignal(hist, p);
+        if (sig) {
+          const optInfo = makeOptionInfo(sig.side, bar.close, opts);
+          openTrade = { side: sig.side, entry: bar.close, stop: sig.stop, target: sig.target, entryTime: bar.time, entrySignal: sig.entrySignal, liquidity: sig.liquidity, orderBlock: sig.orderBlock, supplyDemand: sig.supplyDemand, ...optInfo };
+          continue;
+        }
+      }
+      if (!openTrade) continue;
+      let exitPrice = null, exitReason = null;
+      if (openTrade.side === "buy") {
+        if (bar.low <= openTrade.stop) { exitPrice = openTrade.stop; exitReason = "stop"; }
+        else if (bar.high >= openTrade.target) { exitPrice = openTrade.target; exitReason = "target"; }
+      } else {
+        if (bar.high >= openTrade.stop) { exitPrice = openTrade.stop; exitReason = "stop"; }
+        else if (bar.low <= openTrade.target) { exitPrice = openTrade.target; exitReason = "target"; }
+      }
+      if (!exitPrice && bar.time >= sessEnd) { exitPrice = bar.close; exitReason = "time"; }
+      if (exitPrice) {
+        const risk = Math.abs(openTrade.entry - openTrade.stop);
+        const pnlUSD = openTrade.side === "buy" ? exitPrice - openTrade.entry : openTrade.entry - exitPrice;
+        let optResult = {};
+        if (opts.mode === "options" && openTrade.optionType) {
+          const elapsed = Math.max((bar.time - openTrade.entryTime) / 86_400_000, 0);
+          const iv = opts.iv || 0.25;
+          const exitPremium = optionPremium(exitPrice, openTrade.optionStrike, Math.max(openTrade.entryDTE - elapsed, 0.01), iv, openTrade.optionType);
+          const optPnL = (exitPremium - openTrade.entryPremium) * 100 * (opts.numContracts || 1);
+          optResult = { optionType: openTrade.optionType, optionStrike: openTrade.optionStrike, entryPremium: openTrade.entryPremium, exitPremium, optionsPnL: optPnL, optionsPnLPct: openTrade.entryPremium > 0 ? ((exitPremium - openTrade.entryPremium) / openTrade.entryPremium) * 100 : 0, optionDTE: openTrade.entryDTE };
+        }
+        trades.push({ date, entryTime: openTrade.entryTime, exitTime: bar.time, side: openTrade.side, entry: openTrade.entry, stop: openTrade.stop, target: openTrade.target, exit: exitPrice, exitReason, pnlR: risk > 0 ? pnlUSD / risk : 0, pnlPct: (pnlUSD / openTrade.entry) * 100, entrySignal: openTrade.entrySignal, liquidity: openTrade.liquidity, orderBlock: openTrade.orderBlock, supplyDemand: openTrade.supplyDemand, stopSource: openTrade.orderBlock ? "order-block" : "liquidity-sweep", ...optResult });
+        break;
+      }
+    }
+  }
+  return trades;
+}
+
 // ─── Metrics ──────────────────────────────────────────────────────────────────
 
 export function calcMetrics(trades, mode = "stock") {
@@ -1785,7 +1835,7 @@ export function calcMetrics(trades, mode = "stock") {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export async function runBacktest(strategyId, symbol, opts = {}) {
-  const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m", reversal: "5m", "hybrid-reversal": "5m", hybrid10: "5m", "gap-fill": "5m", "vwap-reclaim": "5m", "first-hour-fade": "5m" };
+  const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m", reversal: "5m", "hybrid-reversal": "5m", hybrid10: "5m", "gap-fill": "5m", "vwap-reclaim": "5m", "first-hour-fade": "5m", smc: "15m" };
   const timeframe  = TIMEFRAMES[strategyId] || "1H";
   console.log(`Backtesting ${strategyId.toUpperCase()} on ${symbol} (${timeframe}) — mode: ${opts.mode || "stock"}`);
   const candles = opts._candles || await fetchCandles(symbol, timeframe, { yearWindow: !!opts.yearWindow });
@@ -1805,6 +1855,7 @@ export async function runBacktest(strategyId, symbol, opts = {}) {
   else if (strategyId === "gap-fill")        trades = runGapFillBacktest(candles, params, opts);
   else if (strategyId === "vwap-reclaim")    trades = runVWAPReclaimBacktest(candles, params, opts);
   else if (strategyId === "first-hour-fade") trades = runFirstHourFadeBacktest(candles, params, opts);
+  else if (strategyId === "smc")             trades = runSMCBacktest(candles, params, opts);
   else throw new Error(`Unknown strategy: ${strategyId}`);
 
   // Tag each trade with the market regime at its entry time. Same classifier
