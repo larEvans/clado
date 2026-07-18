@@ -19,14 +19,16 @@
 
 import { ema, atr } from "./indicators.js";
 
-// Group bars by ET calendar date.
+// Group bars by ET calendar date (DST-correct via the IANA timezone).
+// en-CA yields YYYY-MM-DD, which sorts lexicographically.
+const ET_DAY_FMT = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
+});
+
 function groupByDay(bars) {
   const groups = new Map();
   for (const b of bars) {
-    const d = new Date(b.time);
-    // approximate ET shift; close enough for daily bucketing
-    const etMs  = b.time - (d.getUTCMonth() >= 2 && d.getUTCMonth() <= 10 ? 4 : 5) * 3600_000;
-    const key   = new Date(etMs).toISOString().slice(0, 10);
+    const key = ET_DAY_FMT.format(b.time);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(b);
   }
