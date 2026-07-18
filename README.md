@@ -175,9 +175,10 @@ The repo ships Railway config (`railway.json`, `nixpacks.toml`, `Procfile`):
 3. Keep `PAPER_TRADING=true` until you've watched it behave for a while
 
 State files (`trade-history.json`, `learned-params.json`, `bot-config.json`,
-`trades.csv`, …) are written to the working directory, which on Railway is
-wiped on every deploy. Attach a Railway volume (or export regularly) if you
-want learning and trade history to survive deploys.
+`trades.csv`, …) default to the repo directory, which on Railway is wiped on
+every deploy. To keep learning and trade history across deploys, attach a
+Railway volume and set `DATA_DIR` to its mount path (e.g. `DATA_DIR=/data`) —
+all state reads/writes go through it.
 
 ## Tests
 

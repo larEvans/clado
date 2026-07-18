@@ -21,6 +21,7 @@ import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import crypto from "crypto";
 import { execSync } from "child_process";
 import { selectContract, placeOptionsOrder } from "./options.js";
+import { dataPath } from "./state.js";
 
 const WEBULL_TOKEN_FILE = ".webull-token.json";
 const WEBULL_DEVICE_FILE = ".webull-device.json";
@@ -68,7 +69,7 @@ function checkOnboarding() {
     }
   }
 
-  const csvPath = new URL("trades.csv", import.meta.url).pathname;
+  const csvPath = dataPath("trades.csv");
   console.log(`\n📄 Trade log: ${csvPath}`);
   console.log(
     `   Open in Google Sheets or Excel any time — or tell Claude to move it:\n` +
@@ -109,7 +110,7 @@ const CONFIG = {
   },
 };
 
-const LOG_FILE = "safety-check-log.json";
+const LOG_FILE = dataPath("safety-check-log.json");
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 
@@ -810,7 +811,7 @@ async function interactiveWebullLogin() {
 
 // ─── Tax CSV Logging ─────────────────────────────────────────────────────────
 
-const CSV_FILE = "trades.csv";
+const CSV_FILE = dataPath("trades.csv");
 
 // Always ensure trades.csv exists with headers — open it in Excel/Sheets any time
 function initCsv() {

@@ -27,6 +27,7 @@ import { AlpacaStream } from "./stream.js";
 import { loadAllLearning, getAllRegimeStats, saveRegimeParams, getRegimeStats, getOptionsHistoryStats, suggestEarlyExitPct } from "./learner.js";
 import { classifyRegime } from "./regime.js";
 import { runHermesAnalysis, loadAllInsights, suggestParamChanges, explainTrades, deriveWinOnlyFilters } from "./hermes.js";
+import { dataPath } from "./state.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app  = express();
@@ -131,7 +132,7 @@ app.get("/", (req, res) => res.sendFile(join(__dirname, "dashboard.html")));
 // this file every 30s so the toggle flips live; symbol changes require a
 // service restart (we surface a "restart required" flag in the response).
 
-const CONFIG_FILE = join(__dirname, "bot-config.json");
+const CONFIG_FILE = dataPath("bot-config.json");
 
 function parseEnvBool(value, defaultValue = false) {
   if (value == null || value === "") return defaultValue;
@@ -368,7 +369,7 @@ app.get("/api/history",   async (req, res) => { try { res.json(await alpaca("/v2
 // ─── Bot log ──────────────────────────────────────────────────────────────────
 
 app.get("/api/bot-log", (req, res) => {
-  const logPath = join(__dirname, "safety-check-log.json");
+  const logPath = dataPath("safety-check-log.json");
   if (!existsSync(logPath)) return res.json([]);
   try {
     const raw = readFileSync(logPath, "utf8").trim();
@@ -445,7 +446,7 @@ function backtestTradesToHistory(trades, strategy, symbol, { source = "backtest"
 
 function appendToTradeHistory(records) {
   if (!records || records.length === 0) return 0;
-  const histFile = join(__dirname, "trade-history.json");
+  const histFile = dataPath("trade-history.json");
   let history = [];
   try { if (existsSync(histFile)) history = JSON.parse(readFileSync(histFile, "utf8")); } catch {}
   history.push(...records);
@@ -580,7 +581,7 @@ app.post("/api/hermes/analyze", async (req, res) => {
 app.get("/api/hermes/explain-trades", (req, res) => {
   const strategy = req.query?.strategy || "hybrid";
   const limit    = Math.min(parseInt(req.query?.limit) || 50, 500);
-  const histFile = join(__dirname, "trade-history.json");
+  const histFile = dataPath("trade-history.json");
   if (!existsSync(histFile)) return res.json({ trades: [], filters: { filters: [] }, message: "No trade history yet" });
   try {
     const all = JSON.parse(readFileSync(histFile, "utf8"));
@@ -605,14 +606,14 @@ app.get("/api/hermes/explain-trades", (req, res) => {
 // Apply the win-only filters as live bot config so future entries skip the loser profile.
 app.post("/api/hermes/apply-filters", (req, res) => {
   const strategy = req.body?.strategy || "hybrid";
-  const histFile = join(__dirname, "trade-history.json");
+  const histFile = dataPath("trade-history.json");
   if (!existsSync(histFile)) return res.status(400).json({ error: "No trade history" });
   try {
     const all = JSON.parse(readFileSync(histFile, "utf8"));
     const trades = all.filter(t => t.strategy === strategy);
     const { filters, blockedLosers, totalLosers, estWinRateAfter } = deriveWinOnlyFilters(trades);
 
-    const learnFile = join(__dirname, "learned-params.json");
+    const learnFile = dataPath("learned-params.json");
     let learned = {};
     try { if (existsSync(learnFile)) learned = JSON.parse(readFileSync(learnFile, "utf8")); } catch {}
     learned[strategy] = {
@@ -690,8 +691,8 @@ if (!process.env.NO_DASHBOARD_STREAM && process.env.ALPACA_API_KEY && process.en
 // ─── Bot status ────────────────────────────────────────────────────────────────
 
 app.get("/api/bot-status", (req, res) => {
-  const stateFile   = join(__dirname, "bot-state.json");
-  const historyFile = join(__dirname, "trade-history.json");
+  const stateFile   = dataPath("bot-state.json");
+  const historyFile = dataPath("trade-history.json");
 
   let state   = null;
   let history = [];
@@ -1181,7 +1182,7 @@ app.post("/api/router/optimize-by-regime", async (req, res) => {
         try {
           const seedParams = STRATEGY_META[strategy]?.params || {};
           // Fabricate a minimum-viable trades summary by re-loading history.
-          const histPath = join(__dirname, "trade-history.json");
+          const histPath = dataPath("trade-history.json");
           let history = [];
           try { history = JSON.parse(readFileSync(histPath, "utf8")); } catch {}
           const subset = history.filter(t => t.strategy === strategy && t.regime === regime);
@@ -1365,7 +1366,7 @@ app.post("/api/backtest/optimize", async (req, res) => {
     // them up on the next signal. Set autoDeploy:false to opt out.
     let autoDeployed = null;
     if (req.body.autoDeploy !== false) {
-      const learnFile = join(__dirname, "learned-params.json");
+      const learnFile = dataPath("learned-params.json");
       let learned = {};
       try { if (existsSync(learnFile)) learned = JSON.parse(readFileSync(learnFile, "utf8")); } catch {}
       learned[strategy] = {
@@ -1404,7 +1405,7 @@ app.post("/api/backtest/optimize", async (req, res) => {
       optimizedAt:   new Date().toISOString(),
     };
 
-    const histFile = join(__dirname, "backtest-history.json");
+    const histFile = dataPath("backtest-history.json");
     let history = {};
     try { if (existsSync(histFile)) history = JSON.parse(readFileSync(histFile, "utf8")); } catch {}
     history[`${strategy}-${symbol}`] = output;
@@ -1418,7 +1419,7 @@ app.post("/api/backtest/optimize", async (req, res) => {
 });
 
 app.get("/api/backtest/history", (req, res) => {
-  const histFile = join(__dirname, "backtest-history.json");
+  const histFile = dataPath("backtest-history.json");
   if (!existsSync(histFile)) return res.json({});
   try { res.json(JSON.parse(readFileSync(histFile, "utf8"))); } catch { res.json({}); }
 });
@@ -1429,7 +1430,7 @@ app.post("/api/deploy", async (req, res) => {
   const { strategy, params } = req.body;
   if (!strategy || !params) return res.status(400).json({ error: "strategy and params required" });
 
-  const learnFile = join(__dirname, "learned-params.json");
+  const learnFile = dataPath("learned-params.json");
   let learned = {};
   try { if (existsSync(learnFile)) learned = JSON.parse(readFileSync(learnFile, "utf8")); } catch {}
 

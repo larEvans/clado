@@ -27,10 +27,11 @@ import { planOptionsTrade, shouldExitOption } from "./agents-options.js";
 import { placeOptionsOrder, fetchSnapshots }  from "./options.js";
 import { runAgentDebate, debateEnabled } from "./agents.js";
 import { checkSignal as smcSignal } from "./strategies/smc.js";
+import { dataPath } from "./state.js";
 
 // Runtime config — bot-config.json overrides these env-var defaults and is
 // reloaded periodically so the dashboard can toggle the router live.
-const CONFIG_FILE = "bot-config.json";
+const CONFIG_FILE = dataPath("bot-config.json");
 
 function parseEnvBool(value, defaultValue = false) {
   if (value == null || value === "") return defaultValue;
@@ -109,8 +110,8 @@ function describeAlpacaAccount(baseUrl) {
 
 const IS_PAPER    = parseEnvBool(process.env.PAPER_TRADING, true);
 const ALPACA_BASE = normalizeAlpacaBase(process.env.ALPACA_BASE_URL);
-const LOG_FILE    = "safety-check-log.json";
-const STATE_FILE  = "bot-state.json";
+const LOG_FILE    = dataPath("safety-check-log.json");
+const STATE_FILE  = dataPath("bot-state.json");
 
 const ALPACA_HEADERS = {
   "APCA-API-KEY-ID":     process.env.ALPACA_API_KEY,
@@ -605,7 +606,7 @@ saveState({ symbol: SYMBOL, strategy: STRATEGY, botStarted: new Date().toISOStri
 // Position state is tracked per symbol in routerStates Map.
 
 const routerStates = new Map(); // symbol → { bars, ema9, ema21, position, tradedToday, lastRegime, lastChoice }
-const ROUTER_STATE_FILE = "bot-router-state.json";
+const ROUTER_STATE_FILE = dataPath("bot-router-state.json");
 
 function getSymState(sym) {
   if (!routerStates.has(sym)) {
