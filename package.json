@@ -6,6 +6,7 @@
   "main": "bot.js",
   "scripts": {
     "start": "node start.js",
+    "test": "node --test 'tests/*.test.js'",
     "bot": "node bot-stream.js",
     "legacy-bot": "node bot.js",
     "backtest": "node backtest.js"
