@@ -60,6 +60,10 @@ async function alpaca(path) {
 
 app.use(express.json());
 
+// Unauthenticated liveness probe for Railway's healthcheck (must stay above
+// the auth middleware — the healthcheck has no token).
+app.get("/healthz", (req, res) => res.json({ ok: true }));
+
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 //
 // Set DASHBOARD_TOKEN in the environment to protect every route — pages,

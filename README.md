@@ -1,295 +1,198 @@
-# Claude + TradingView MCP — Automated Trading
+# Multi-Strategy Trading Bot
 
-> **New to this?** Watch the previous video first — it sets up the TradingView MCP connection this builds on.
+An automated intraday trading system for stocks, crypto, and options on
+**Alpaca**. It streams 1-minute bars, classifies the current market regime,
+evaluates a portfolio of strategies, routes the highest-probability signal,
+and learns from every closed trade. A web dashboard handles monitoring,
+backtesting, and live configuration.
 
-[![How To Connect Claude to TradingView (Insanely Cool)](https://img.youtube.com/vi/vIX6ztULs4U/maxresdefault.jpg)](https://youtu.be/vIX6ztULs4U)
+> This project grew out of the "Claude + TradingView MCP" tutorial series.
+> The original tutorial (BitGet, TradingView MCP, cron-based `bot.js`) still
+> works and is documented in [docs/legacy.md](docs/legacy.md).
 
-[![Claude Code + TradingView Now Actually Executes Real Trades](https://img.youtube.com/vi/aDWJ6lLemJU/maxresdefault.jpg)](https://www.youtube.com/watch?v=aDWJ6lLemJU)
-
----
-
-## What This Does
-
-**Five things you get from this setup:**
-
-1. **Claude connected to your exchange** — reads your TradingView chart and executes trades on BitGet automatically
-2. **A safety check** — every condition in your strategy must pass before a single trade goes through
-3. **24/7 cloud execution** — deploy to a Hostinger VPS and it runs on a schedule, even when your laptop is closed
-4. **Automatic tax accounting** — every trade logged to `trades.csv` with date, price, fees, and net amount, ready for your accountant
-5. **Free** — no email, no course, no upsell. Everything is in this repo.
+**This is not financial advice.** Backtest, paper trade, and never risk more
+than you can afford to lose.
 
 ---
 
-## The One-Shot Prompt
+## How It Works
 
-> **This is the thing you paste.** Open Claude Code in this directory, paste the entire contents of [`prompts/02-one-shot-trade.md`](prompts/02-one-shot-trade.md), and Claude will do the rest.
-
-Here's what it does when you run it:
-
-| Step | What Claude does |
-|------|-----------------|
-| 1 | Reads your `rules.json` strategy |
-| 2 | Pulls live price + indicator data from TradingView |
-| 3 | Calculates MACD from raw candle data |
-| 4 | Evaluates market bias (bullish / bearish / neutral) |
-| 4b | Checks trade limits — daily cap and max trade size |
-| 5 | Runs the safety check — every entry condition checked |
-| 6 | Executes the trade via BitGet if all conditions pass |
-| 7 | Logs the trade to `trades.csv` — date, price, fees, net amount (tax-ready) |
-| 8 | Saves full decision log to `safety-check-log.json` |
-
-If anything fails the safety check, it stops and tells you exactly which condition failed and the actual values. No trade goes through unless everything lines up.
-
----
-
-## Getting Started
-
-### Step 1 — Paste the one-shot prompt into Claude Code
-
-Copy the entire contents of [`prompts/02-one-shot-trade.md`](prompts/02-one-shot-trade.md) and paste it into your Claude Code terminal.
-
-That's it. Claude acts as your onboarding agent — it clones the repo, walks you through connecting BitGet, sets your trading preferences, connects TradingView, optionally builds a strategy from a YouTube channel, deploys it to a Hostinger VPS, and runs the bot for the first time. Every step is interactive. It pauses when it needs something from you and handles everything else automatically.
-
----
-
-## What's Happening Under the Hood
-
-For anyone who wants to understand the steps manually, or troubleshoot a specific part:
-
-### Prerequisites
-
-- **TradingView MCP** must already be set up — built in the [first video](https://youtu.be/vIX6ztULs4U)
-- **Claude Code** installed and running
-- **A BitGet account** — [sign up here]([https://partner.bitget.com/bg/LewisJackson](https://bonus.bitget.com/LewisJackson)) for a $1,000 bonus on your first deposit
-- **Node.js 18+** — check with `node --version`
-
----
-
-### Clone the repo
-
-**Mac / Linux:**
-```bash
-git clone https://github.com/jackson-video-resources/claude-tradingview-mcp-trading
-cd claude-tradingview-mcp-trading
-```
-
-**Windows:**
-```powershell
-git clone https://github.com/jackson-video-resources/claude-tradingview-mcp-trading
-cd claude-tradingview-mcp-trading
-```
-
----
-
-### Add your BitGet API credentials
-
-**Mac / Linux:**
-```bash
-cp .env.example .env
-```
-
-**Windows:**
-```powershell
-Copy-Item .env.example .env
-```
-
-Open `.env` and fill in:
+On every completed bar, the streaming bot runs this pipeline:
 
 ```
-BITGET_API_KEY=your_api_key_here
-BITGET_SECRET_KEY=your_secret_key_here
-BITGET_PASSPHRASE=your_passphrase_here
-PORTFOLIO_VALUE_USD=1000
-MAX_TRADE_SIZE_USD=100
-MAX_TRADES_PER_DAY=3
+1-min bars (Alpaca WebSocket)
+        │
+        ▼
+regime.js      classify market: "trend-up:high-vol:gap-up" etc.
+        │
+        ▼
+strategies/    every active strategy evaluates the bars → signal or null
+        │
+        ▼
+router.js      score fired signals by per-regime win rate × confidence,
+               apply diversification discount + optional consensus vote
+        │
+        ▼
+agents.js      optional Bull/Bear/Risk-Manager LLM debate veto
+agents-options.js  optional Options Strategist picks the contract
+        │
+        ▼
+execution      Alpaca order (or paper log) → stop/target management
+        │
+        ▼
+learner.js     record the closed trade, update per-regime stats,
+               adapt parameters — feeds back into the router
 ```
 
-**Getting your API key:**
+### Modules
 
-Step-by-step guides for all supported exchanges:
+| File | Role |
+|------|------|
+| `start.js` | Production launcher — supervises `bot-stream.js` + `dashboard.js`, auto-restarts on crash |
+| `bot-stream.js` | Live trading engine (WebSocket bars, order execution, position management) |
+| `stream.js` | Alpaca WebSocket wrapper (stocks + crypto feeds) |
+| `regime.js` | Market regime classifier (trend / volatility / gap / ORB quality) |
+| `router.js` | Strategy selection: per-regime win-rate scoring, consensus mode, diversification |
+| `strategies/*.js` | Pluggable strategies — each exports `meta` + a signal function |
+| `learner.js` | Trade history, per-regime stats, adaptive parameter learning |
+| `backtest.js` | Backtesting engine + indicator math |
+| `cpcv.js` | Combinatorially Purged Cross-Validation (overfitting check) |
+| `agents.js` | Bull / Bear / Risk-Manager debate (Claude API, optional) |
+| `agents-options.js` | Options Strategist — contract selection + exit triggers |
+| `options.js` | Alpaca options chain / order helpers |
+| `hermes.js` | Post-trade analyst (Ollama → Claude API → rule-based fallback) |
+| `dashboard.js` + `dashboard.html` | Express dashboard: live status, backtests, config toggles |
+| `pinescript/*.pine` | TradingView overlays matching each strategy |
+| `bot.js` | **Legacy** one-shot cron bot from the tutorial ([docs/legacy.md](docs/legacy.md)) |
 
-| Exchange | Guide |
-|----------|-------|
-| BitGet *(used in the video)* | [docs/exchanges/bitget.md](docs/exchanges/bitget.md) |
-| Binance | [docs/exchanges/binance.md](docs/exchanges/binance.md) |
-| Bybit | [docs/exchanges/bybit.md](docs/exchanges/bybit.md) |
-| OKX | [docs/exchanges/okx.md](docs/exchanges/okx.md) |
-| Coinbase Advanced | [docs/exchanges/coinbase.md](docs/exchanges/coinbase.md) |
-| Kraken | [docs/exchanges/kraken.md](docs/exchanges/kraken.md) |
-| KuCoin | [docs/exchanges/kucoin.md](docs/exchanges/kucoin.md) |
-| Gate.io | [docs/exchanges/gateio.md](docs/exchanges/gateio.md) |
-| MEXC | [docs/exchanges/mexc.md](docs/exchanges/mexc.md) |
-| Bitfinex | [docs/exchanges/bitfinex.md](docs/exchanges/bitfinex.md) |
+### Strategies
 
-Two rules that apply to every exchange — **withdrawals OFF, IP whitelist ON**.
+| ID | Name | Timeframe |
+|----|------|-----------|
+| `orb` | Opening Range Breakout | 5m |
+| `hybrid` | Hybrid ORB + VWAP + EMA | 5m |
+| `hybrid10` | Hybrid-10 (10-min ORB + overnight hold) | 5m |
+| `reversal` | Reversal + dynamic stop | 5m |
+| `hybrid-reversal` | Hybrid + reversal + dynamic stop | 5m |
+| `smc` | Smart Money Concepts (liquidity sweeps + BOS) | 15m |
+| `vwap` | VWAP + EMA momentum | 1H |
+| `vwap-reclaim` | VWAP reclaim | 5m |
+| `gap-fill` | Gap fill fade | 5m |
+| `first-hour-fade` | First-hour fade | 5m |
+| `trend` | EMA trend following | 1D |
+| `meanrev` | Mean reversion (Bollinger + RSI) | 1D |
+| `momentum` | Momentum (MACD + RSI) | 1D |
 
 ---
 
-### Launch TradingView and connect the MCP
+## Quick Start
 
-**Mac:**
-```bash
-tv_launch
-tv_health_check
-```
-
-**Windows:** See [docs/setup-windows.md](docs/setup-windows.md)
-
-**Linux:** See [docs/setup-linux.md](docs/setup-linux.md)
-
-Verify with `tv_health_check` — should return `cdp_connected: true`.
-
----
-
-### Run the bot manually
+Requires **Node.js 22+** and an [Alpaca](https://alpaca.markets) account
+(paper trading is free).
 
 ```bash
-node bot.js
-```
-
----
-
-## Deploy to a Hostinger VPS (Run in the Cloud 24/7)
-
-The local setup runs when your laptop is open. A Hostinger VPS lets the bot check for setups around the clock — even while you sleep.
-
-> **Note:** Cloud mode pulls candle data directly from Binance's free market API instead of TradingView. No TradingView Desktop needed in the cloud. The strategy logic and safety check are identical.
-
-### 1. Get a VPS
-
-Grab a Hostinger VPS — the cheapest KVM plan is plenty, from ~$5/mo: **https://hostinger.com/lewisjackson10**
-
-Once it's provisioned, Hostinger gives you an IP and root password. SSH in:
-
-```bash
-ssh root@YOUR_VPS_IP
-```
-
-### 2. Deploy
-
-On the VPS:
-
-```bash
-apt update && apt install -y nodejs npm git
-git clone <your-repo-url> bot && cd bot
+git clone <this-repo>
+cd <repo-dir>
 npm install
+cp .env.example .env   # fill in your Alpaca keys
+npm start              # runs bot-stream.js + dashboard.js
 ```
 
-The default start command runs both the streaming bot and dashboard through `start.js`, so the bot connects as soon as the app starts.
+Open http://localhost:3000 for the dashboard.
 
-### 3. Set your environment variables
-
-Create a `.env` file on the VPS with everything from `.env.example`:
-
-| Variable | Example |
-|----------|---------|
-| `BITGET_API_KEY` | your key |
-| `BITGET_SECRET_KEY` | your secret |
-| `BITGET_PASSPHRASE` | your passphrase |
-| `PORTFOLIO_VALUE_USD` | 1000 |
-| `MAX_TRADE_SIZE_USD` | 100 |
-| `MAX_TRADES_PER_DAY` | 3 |
-| `PAPER_TRADING` | true (set to false when ready; false sends Alpaca orders to `ALPACA_BASE_URL`) |
-| `ROUTER_ENABLED` | true (bot starts active immediately; set false for single-symbol mode) |
-| `SYMBOL` | BTCUSDT |
-| `TIMEFRAME` | 4H |
-
-### SMC supply/demand strategy
-
-The bot includes an `smc` strategy that illustrates and trades supply/demand zones, buy-side/sell-side liquidity sweeps, break of structure, and an order-flow displacement proxy. Its TradingView overlay is available as `pinescript/smc.pine`, and the dashboard can serve it from `/api/pinescript/smc`.
-
-### 4. Set a cron schedule
-
-The bot runs one check and exits, so schedule it with the VPS's built-in cron. Run `crontab -e` and add one line matching your chart timeframe (all run from the repo dir and log to `bot.log`):
-
-| Timeframe | Crontab line | What it means |
-|-----------|----------|----------------|
-| 4H chart | `0 */4 * * * cd /root/bot && /usr/bin/node bot.js >> bot.log 2>&1` | Every 4 hours |
-| 1D chart | `0 9 * * * cd /root/bot && /usr/bin/node bot.js >> bot.log 2>&1` | Once a day at 9am UTC |
-| 1H chart | `0 * * * * cd /root/bot && /usr/bin/node bot.js >> bot.log 2>&1` | Every hour |
-
-### 5. Start in paper trading mode
-
-`PAPER_TRADING=true` logs every decision but never places Alpaca orders. Watch a few days of paper trades, confirm the logic matches what you expect, then flip it to `false`. With `PAPER_TRADING=false`, orders are sent to whichever Alpaca account URL is configured: `https://paper-api.alpaca.markets` for Alpaca paper-account orders or `https://api.alpaca.markets` for live brokerage orders.
-
----
-
-## Build Your Own Strategy (Optional)
-
-The example `rules.json` uses the van de Poppe + Tone Vays BTC strategy. To build one from any trader's public videos:
-
-1. Go to [Apify](https://apify.com?fpr=3ly3yd) and search the actor store for **YouTube Transcript Scraper** — takes about 30 seconds per channel
-2. Paste the output into `prompts/01-extract-strategy.md`
-3. Run that prompt in Claude Code — it generates a `rules.json` tailored to that trader's methodology
-
----
-
-## Files
-
-| File | What it does |
-|------|-------------|
-| `rules.json` | Your strategy — indicators, entry rules, risk rules |
-| `.env` | Your BitGet credentials (gitignored — never commits) |
-| `prompts/01-extract-strategy.md` | Build rules.json from trader transcripts |
-| `prompts/02-one-shot-trade.md` | **The one-shot prompt — paste this to trade** |
-| `safety-check-log.json` | Auto-generated log of every trade decision |
-| `trades.csv` | Tax-ready trade record — auto-written on every execution |
-| `docs/setup-windows.md` | Windows-specific MCP setup |
-| `docs/setup-linux.md` | Linux-specific MCP setup |
-
----
-
-## Tax Accounting
-
-Every trade the bot places is automatically written to `trades.csv` with the columns your accountant needs:
-
-| Column | Description |
-|--------|-------------|
-| Date | ISO date of the trade |
-| Time | UTC time |
-| Exchange | BitGet |
-| Symbol | e.g. BTCUSDT |
-| Side | Buy / Sell |
-| Quantity | Units traded |
-| Price | Price per unit at execution |
-| Total USD | Gross trade value |
-| Fee (est.) | Estimated exchange fee |
-| Net Amount | Total USD minus fee |
-| Order ID | Exchange reference |
-| Mode | Paper / Live |
-
-At tax time: open the file, hand it to your accountant, or import it directly into your accounting software. Nothing to reconstruct.
-
-For a quick summary of your trading activity, run:
+Other entry points:
 
 ```bash
-node bot.js --tax-summary
+npm run bot        # streaming bot only
+npm run backtest   # backtesting CLI
+npm test           # unit tests
+node dashboard.js  # dashboard only
 ```
 
-This prints total trades, volume, and fees paid.
+## Configuration
 
----
+Everything lives in `.env` (see [.env.example](.env.example) for the full
+annotated list). The important ones:
 
-## Safety
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` | — | Alpaca credentials |
+| `ALPACA_BASE_URL` | paper URL | `https://paper-api.alpaca.markets` or the live URL |
+| `PAPER_TRADING` | `true` | `true` logs decisions only; `false` submits real orders to `ALPACA_BASE_URL` |
+| `DASHBOARD_TOKEN` | *(empty)* | **Set this on any internet-reachable deployment.** Protects the whole dashboard; open `/?token=...` once or send an `x-dashboard-token` header |
+| `ROUTER_ENABLED` | `true` | Multi-strategy router vs. single-strategy mode |
+| `ACTIVE_STRATEGIES` | `hybrid,hybrid10,smc,...` | Comma list of strategy IDs the router evaluates |
+| `STRATEGY` / `SYMBOL` / `TIMEFRAME` | `hybrid` / `SPY` / `1H` | Single-strategy mode settings |
+| `CRYPTO_SYMBOLS` | *(empty)* | e.g. `BTC/USD,ETH/USD` — adds a 24/7 crypto stream |
+| `CONSENSUS_MIN` | `1` | Require ≥ N strategies agreeing on a side before trading |
+| `MAX_CONCURRENT_POSITIONS` | `5` | Open-position cap |
+| `MAX_TRADE_SIZE_USD` / `MAX_TRADES_PER_DAY` | `100` / `3` | Hard risk caps |
+| `PORTFOLIO_VALUE_USD` | `1000` | Position sizing basis (max 1% risk per trade) |
+| `OPTIONS_MODE` | `false` | Route stock signals through the Options Strategist (buys calls/puts) |
+| `OPTIONS_DTE` / `OPTIONS_MAX_PREMIUM` / `OPTIONS_CONTRACTS` | `7` / `500` / `1` | Options trade shape |
+| `ANTHROPIC_API_KEY` | *(empty)* | Enables the agent debate + Hermes LLM analysis |
+| `OLLAMA_HOST` | *(empty)* | Use a local model for Hermes instead |
 
-The safety check conditions are not fixed — they come directly from your `rules.json`. If you build a strategy from a YouTube trader's transcripts using the Apify prompt, your safety check will reflect that trader's entry logic. If you use the example strategy, it reflects those conditions. They're yours, not a generic filter.
+The dashboard writes runtime toggles (router on/off, active strategies,
+crypto symbols, consensus, options mode) to `bot-config.json`, which the bot
+re-reads every 30 seconds — no restart needed. Symbol changes still require a
+restart (WebSocket resubscription).
 
-Every condition in your `entry_rules` must pass before a trade goes through. One fails — nothing happens. The bot tells you exactly which condition failed and the actual value it saw.
+## Dashboard
 
-Additional guardrails that apply regardless of strategy:
-- Maximum trade size capped at `MAX_TRADE_SIZE_USD` in `.env`
-- Maximum trades per day capped at `MAX_TRADES_PER_DAY` in `.env`
-- Position sizing calculated from your portfolio value — max 1% risk per trade
-- Every decision logged to `safety-check-log.json` with exact indicator values
-- Every executed trade recorded in `trades.csv` for accounting
+- Live bot status, account, positions, orders, P&L history
+- Per-strategy backtests and a dedicated options backtest tab
+- CPCV validation runs
+- Regime statistics and learned parameters, with one-click deploy to the bot
+- Hermes trade analysis and parameter suggestions
+- Strategy router controls: toggle, consensus mode, symbol management
+- Pine Script overlays served per strategy (e.g. `/api/pinescript/smc`)
 
-**This is not financial advice.** Build your strategy properly. Run the backtest. Paper trade before going live. Never put in more than you can afford to lose.
+**Auth:** set `DASHBOARD_TOKEN` and open the dashboard as
+`https://your-app/?token=YOUR_TOKEN` (the server sets a cookie; API clients
+use the `x-dashboard-token` header). Without a token the dashboard is open —
+fine locally, not on the internet. `/healthz` is always unauthenticated for
+platform healthchecks.
 
----
+## Backtesting
 
-## Resources
+```bash
+npm run backtest                      # defaults
+STRATEGY=orb SYMBOL=SPY node backtest.js
+```
 
-- [First video — Connect Claude to TradingView](https://youtu.be/vIX6ztULs4U)
-- [TradingView MCP repo (first video)](https://github.com/jackson-video-resources/tradingview-mcp-jackson)
-- [Apify](https://apify.com?fpr=3ly3yd) — search actor store for "YouTube Transcript Scraper"
-- [BitGet — $1,000 bonus on first deposit]([https://partner.bitget.com/bg/LewisJackson](https://bonus.bitget.com/LewisJackson))
+The dashboard's Backtest tab runs the same engine, and the CPCV tab runs
+Combinatorially Purged Cross-Validation to estimate how much of a strategy's
+edge is overfitting.
+
+## Deploying (Railway)
+
+The repo ships Railway config (`railway.json`, `nixpacks.toml`, `Procfile`):
+`node start.js` runs both processes, and the healthcheck hits `/healthz`.
+
+1. Create a Railway project from this repo
+2. Set the env vars from the table above — **including `DASHBOARD_TOKEN`**
+3. Keep `PAPER_TRADING=true` until you've watched it behave for a while
+
+State files (`trade-history.json`, `learned-params.json`, `bot-config.json`,
+`trades.csv`, …) are written to the working directory, which on Railway is
+wiped on every deploy. Attach a Railway volume (or export regularly) if you
+want learning and trade history to survive deploys.
+
+## Tests
+
+```bash
+npm test
+```
+
+Unit tests cover the router's selection logic and the regime classifier, and
+run in CI on every push/PR. When touching decision logic (`router.js`,
+`regime.js`, `strategies/`), add a test alongside in `tests/`.
+
+## Safety Guardrails
+
+- `PAPER_TRADING=true` by default — nothing real is submitted until you flip it
+- Hard caps: `MAX_TRADE_SIZE_USD`, `MAX_TRADES_PER_DAY`, `MAX_CONCURRENT_POSITIONS`
+- Position sizing risks at most 1% of `PORTFOLIO_VALUE_USD` per trade
+- Optional consensus mode requires multiple strategies to agree
+- Every decision is logged; every fill lands in `trades.csv` (tax-ready columns)
