@@ -17,28 +17,7 @@
  * classifier runs in both backtest (historical bars) and live (rolling).
  */
 
-// ── Small standalone indicator helpers (kept here so regime.js has no
-//    circular dependency on backtest.js) ───────────────────────────────────
-
-function atr(bars, period = 14) {
-  if (bars.length < period + 1) return null;
-  const trs = [];
-  for (let i = bars.length - period; i < bars.length; i++) {
-    if (i === 0) continue;
-    const h = bars[i].high, l = bars[i].low, pc = bars[i - 1].close;
-    trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
-  }
-  if (trs.length === 0) return null;
-  return trs.reduce((a, b) => a + b, 0) / trs.length;
-}
-
-function ema(values, period) {
-  if (values.length < period) return null;
-  const k = 2 / (period + 1);
-  let e = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < values.length; i++) e = values[i] * k + e * (1 - k);
-  return e;
-}
+import { ema, atr } from "./indicators.js";
 
 // Group bars by ET calendar date.
 function groupByDay(bars) {

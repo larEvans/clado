@@ -7,6 +7,7 @@
  */
 
 import "dotenv/config";
+import { ema as calcEMA } from "./indicators.js";
 import { meta as orbMeta, calcRange, checkSignal as orbSignal }       from "./strategies/orb.js";
 import { meta as vwapMeta, checkSignal as vwapSignal, checkBiasFlip } from "./strategies/vwap.js";
 import { meta as trendMeta }   from "./strategies/trend.js";
@@ -270,14 +271,6 @@ export function pickStop(side, entryPrice, bars, orbHigh, orbLow, opts = {}) {
 }
 
 // ─── Indicators ───────────────────────────────────────────────────────────────
-
-function calcEMA(closes, period) {
-  if (closes.length < period) return null;
-  const k = 2 / (period + 1);
-  let ema = closes.slice(0, period).reduce((a,b) => a+b, 0) / period;
-  for (let i = period; i < closes.length; i++) ema = closes[i]*k + ema*(1-k);
-  return ema;
-}
 
 function calcRSI(closes, period) {
   if (closes.length < period + 1) return null;
