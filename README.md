@@ -127,6 +127,7 @@ annotated list). The important ones:
 | `CONSENSUS_MIN` | `1` | Require ≥ N strategies agreeing on a side before trading |
 | `MAX_CONCURRENT_POSITIONS` | `5` | Open-position cap |
 | `MAX_TRADE_SIZE_USD` / `MAX_TRADES_PER_DAY` | `100` / `3` | Hard risk caps |
+| `MAX_DAILY_LOSS_PCT` | `0` (off) | Kill switch: halt new entries for the day once realized P&L hits −N% |
 | `PORTFOLIO_VALUE_USD` | `1000` | Position sizing basis (max 1% risk per trade) |
 | `OPTIONS_MODE` | `false` | Route stock signals through the Options Strategist (buys calls/puts) |
 | `OPTIONS_DTE` / `OPTIONS_MAX_PREMIUM` / `OPTIONS_CONTRACTS` | `7` / `500` / `1` | Options trade shape |
@@ -194,6 +195,7 @@ run in CI on every push/PR. When touching decision logic (`router.js`,
 
 - `PAPER_TRADING=true` by default — nothing real is submitted until you flip it
 - Hard caps: `MAX_TRADE_SIZE_USD`, `MAX_TRADES_PER_DAY`, `MAX_CONCURRENT_POSITIONS`
+- Daily loss kill switch: `MAX_DAILY_LOSS_PCT` halts new entries once the day's realized P&L drops that far (set it — e.g. `5`)
 - Position sizing risks at most 1% of `PORTFOLIO_VALUE_USD` per trade
 - Optional consensus mode requires multiple strategies to agree
 - Every decision is logged; every fill lands in `trades.csv` (tax-ready columns)
