@@ -1,5 +1,6 @@
 import express from "express";
 import fetch from "node-fetch";
+import { timingSafeEqual } from "crypto";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -58,6 +59,64 @@ async function alpaca(path) {
 }
 
 app.use(express.json());
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+//
+// Set DASHBOARD_TOKEN in the environment to protect every route — pages,
+// static files and /api/*. Open the dashboard once as /?token=YOUR_TOKEN and
+// the server sets an HttpOnly cookie so the page's own fetch() calls keep
+// working without any frontend changes. API clients can send the token in an
+// "x-dashboard-token" header instead. Without DASHBOARD_TOKEN set, the
+// dashboard stays open (and warns loudly) so existing setups don't break.
+
+const DASHBOARD_TOKEN = (process.env.DASHBOARD_TOKEN || "").trim();
+const TOKEN_COOKIE    = "dashboard_token";
+
+if (!DASHBOARD_TOKEN) {
+  console.warn(
+    "[Dashboard] WARNING: DASHBOARD_TOKEN is not set — the dashboard (account data, " +
+    "config toggles, trade endpoints) is reachable by anyone with the URL. " +
+    "Set DASHBOARD_TOKEN in your environment to require a token."
+  );
+}
+
+function tokenMatches(candidate) {
+  if (!candidate) return false;
+  const a = Buffer.from(String(candidate));
+  const b = Buffer.from(DASHBOARD_TOKEN);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function cookieToken(req) {
+  const header = req.headers.cookie;
+  if (!header) return null;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() === TOKEN_COOKIE) {
+      try { return decodeURIComponent(part.slice(eq + 1).trim()); } catch { return null; }
+    }
+  }
+  return null;
+}
+
+app.use((req, res, next) => {
+  if (!DASHBOARD_TOKEN) return next();
+  const queryToken = typeof req.query.token === "string" ? req.query.token : null;
+  const supplied   = req.get("x-dashboard-token") || queryToken || cookieToken(req);
+  if (!tokenMatches(supplied)) {
+    return res.status(401).type("text/plain")
+      .send("Unauthorized. Open the dashboard as /?token=YOUR_DASHBOARD_TOKEN, or send an x-dashboard-token header.");
+  }
+  if (queryToken) {
+    // Persist the token as a cookie so subsequent page requests and the
+    // dashboard's own API calls authenticate without the query param.
+    res.setHeader("Set-Cookie",
+      `${TOKEN_COOKIE}=${encodeURIComponent(queryToken)}; HttpOnly; Path=/; SameSite=Strict; Max-Age=2592000`);
+  }
+  next();
+});
+
 app.use(express.static(__dirname));
 app.get("/", (req, res) => res.sendFile(join(__dirname, "dashboard.html")));
 
