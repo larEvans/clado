@@ -1,12 +1,19 @@
 /**
- * Claude + TradingView MCP — Automated Trading Bot
+ * ⚠ LEGACY — Claude + TradingView MCP one-shot bot (run once per cron tick).
+ *
+ * This is the original tutorial bot (docs/legacy.md). The maintained,
+ * production path is bot-stream.js (started by start.js / npm start): it
+ * streams live bars, routes across all strategies per market regime, and
+ * feeds the learner. This file is kept for the cron + BitGet/Webull
+ * workflow only and does NOT receive new strategy/router/learner features.
+ * Prefer bot-stream.js for anything new.
  *
  * Exchanges: BitGet (crypto) or Webull (stocks/ETFs) — set EXCHANGE= in .env
  * Market data: Binance/Kraken (crypto) or Yahoo Finance (stocks)
  *
- * Local mode: node bot.js
+ * Local mode: npm run legacy-bot   (node bot.js)
  * One-time Webull login: node bot.js --webull-login
- * Cloud mode: deploy to Railway/VPS, set env vars, run on cron schedule
+ * Cloud mode: deploy to a VPS, set env vars, run on cron schedule
  */
 
 import "dotenv/config";
