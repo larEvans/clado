@@ -8,9 +8,10 @@
  */
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
+import { dataPath } from "./state.js";
 
-const HISTORY_FILE = "trade-history.json";
-const PARAMS_FILE  = "learned-params.json";
+const HISTORY_FILE = dataPath("trade-history.json");
+const PARAMS_FILE  = dataPath("learned-params.json");
 
 const EARLY_EXIT_DEFAULTS = {
   nearTargetPct: 5,      // exit after capturing 95% of planned move

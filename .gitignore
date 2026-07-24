@@ -1,6 +1,16 @@
 .env
 *.log
-safety-check-log.json
 node_modules/
 .webull-token.json
 .webull-device.json
+
+# Runtime state — written by the bot/dashboard (lives in DATA_DIR if set)
+safety-check-log.json
+trades.csv
+trade-history.json
+learned-params.json
+hermes-insights.json
+bot-config.json
+bot-state.json
+bot-router-state.json
+backtest-history.json

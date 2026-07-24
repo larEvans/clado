@@ -27,10 +27,11 @@ import { planOptionsTrade, shouldExitOption } from "./agents-options.js";
 import { placeOptionsOrder, fetchSnapshots }  from "./options.js";
 import { runAgentDebate, debateEnabled } from "./agents.js";
 import { checkSignal as smcSignal } from "./strategies/smc.js";
+import { dataPath } from "./state.js";
 
 // Runtime config — bot-config.json overrides these env-var defaults and is
 // reloaded periodically so the dashboard can toggle the router live.
-const CONFIG_FILE = "bot-config.json";
+const CONFIG_FILE = dataPath("bot-config.json");
 
 function parseEnvBool(value, defaultValue = false) {
   if (value == null || value === "") return defaultValue;
@@ -92,6 +93,32 @@ const isCryptoSymbol = sym => typeof sym === "string" && sym.includes("/");
 // before the router lets a trade through. Off (=1) by default.
 const CONSENSUS_MIN    = Math.max(1, parseInt(process.env.CONSENSUS_MIN || "1"));
 
+// ── Daily loss kill switch ────────────────────────────────────────────────────
+// Once the day's realized P&L (sum of closed-trade pnlPct across all symbols
+// and strategies) drops to -MAX_DAILY_LOSS_PCT or below, no new positions are
+// opened until the next trading day. Exits and EOD closes still process.
+// 0 disables the switch. Tally is in-memory: a process restart resets it.
+const MAX_DAILY_LOSS_PCT = Math.max(0, parseFloat(process.env.MAX_DAILY_LOSS_PCT || "0"));
+const dayPnl = { date: "", totalPct: 0, halted: false };
+
+function recordDayPnl(pnlPct) {
+  const today = todayET(new Date());
+  if (dayPnl.date !== today) { dayPnl.date = today; dayPnl.totalPct = 0; dayPnl.halted = false; }
+  dayPnl.totalPct += pnlPct;
+  if (MAX_DAILY_LOSS_PCT > 0 && !dayPnl.halted && dayPnl.totalPct <= -MAX_DAILY_LOSS_PCT) {
+    dayPnl.halted = true;
+    console.log(
+      `[Bot] DAILY LOSS LIMIT HIT: ${dayPnl.totalPct.toFixed(2)}% ≤ -${MAX_DAILY_LOSS_PCT}% ` +
+      `— halting new entries until the next trading day`
+    );
+  }
+}
+
+function dailyLossHalted() {
+  if (MAX_DAILY_LOSS_PCT <= 0) return false;
+  return dayPnl.halted && dayPnl.date === todayET(new Date());
+}
+
 const SYMBOL      = (process.env.SYMBOL   || "SPY").toUpperCase();
 const STRATEGY    = (process.env.STRATEGY || "hybrid").toLowerCase();
 const TRADE_USD   = parseFloat(process.env.MAX_TRADE_SIZE_USD || "200");
@@ -109,8 +136,8 @@ function describeAlpacaAccount(baseUrl) {
 
 const IS_PAPER    = parseEnvBool(process.env.PAPER_TRADING, true);
 const ALPACA_BASE = normalizeAlpacaBase(process.env.ALPACA_BASE_URL);
-const LOG_FILE    = "safety-check-log.json";
-const STATE_FILE  = "bot-state.json";
+const LOG_FILE    = dataPath("safety-check-log.json");
+const STATE_FILE  = dataPath("bot-state.json");
 
 const ALPACA_HEADERS = {
   "APCA-API-KEY-ID":     process.env.ALPACA_API_KEY,
@@ -470,6 +497,7 @@ async function closePosition(pos, exitPrice, exitReason) {
     exitTime:   Date.now(),
     exitReason,
   });
+  recordDayPnl(pnlPct);
 
   const pnlPerShare = pos.side === "buy" ? exitPrice - pos.entryPrice : pos.entryPrice - exitPrice;
   console.log(
@@ -553,6 +581,7 @@ async function onBar(bar) {
   }
 
   // ── Look for entry signal ─────────────────────────────────────────────────
+  if (dailyLossHalted()) return;   // daily loss limit hit — no new entries
   if (state.tradedToday) return;   // one trade per day
   if (etMins < ORB_READY) return;  // wait for ORB to form
   if (bars.length < 20) return;    // need enough history
@@ -605,7 +634,7 @@ saveState({ symbol: SYMBOL, strategy: STRATEGY, botStarted: new Date().toISOStri
 // Position state is tracked per symbol in routerStates Map.
 
 const routerStates = new Map(); // symbol → { bars, ema9, ema21, position, tradedToday, lastRegime, lastChoice }
-const ROUTER_STATE_FILE = "bot-router-state.json";
+const ROUTER_STATE_FILE = dataPath("bot-router-state.json");
 
 function getSymState(sym) {
   if (!routerStates.has(sym)) {
@@ -774,6 +803,9 @@ async function onRouterBar(bar) {
   if (!crypto && etMins < ORB_READY) return;  // ORB-gated entries are stocks-only
   if (s.bars.length < 20) return;
 
+  // Daily loss limit — stop opening new positions for the rest of the day
+  if (dailyLossHalted()) return;
+
   // Capacity check: don't exceed max concurrent positions
   const openCount = [...routerStates.values()].filter(x => x.position).length;
   if (openCount >= MAX_CONCURRENT()) return;
@@ -937,7 +969,7 @@ async function closeRouterPosition(sym, exitPrice, exitReason) {
     try { await closeAlpacaPosition(closeSymbol); } catch (e) { console.error(`[Router] ${closeSymbol} close failed:`, e.message); }
   }
   const hourET = etMinutesOf(new Date(pos.entryTime || Date.now())) / 60 | 0;
-  recordTradeClosed({
+  const { pnlPct } = recordTradeClosed({
     symbol: sym, strategy: pos.strategy, side: pos.side,
     entryPrice: pos.entry, exitPrice,
     entryTime: pos.entryTime, exitTime: new Date().toISOString(),
@@ -964,6 +996,7 @@ async function closeRouterPosition(sym, exitPrice, exitReason) {
       agentConfidence: pos.agentConfidence,
     } : {}),
   });
+  recordDayPnl(pnlPct);
   s.position = null;
 }
 

@@ -11,6 +11,8 @@
  *   7. Target — R:R multiple of risk
  */
 
+import { ema } from "../indicators.js";
+
 export const meta = {
   id:          "smc",
   name:        "Smart Money Concepts",
@@ -26,14 +28,6 @@ export const meta = {
   },
 };
 
-
-function ema(values, period) {
-  if (values.length < period) return null;
-  const k = 2 / (period + 1);
-  let e = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < values.length; i++) e = values[i] * k + e * (1 - k);
-  return e;
-}
 
 function swingHigh(bars, i, lookback) {
   const h = bars[i]?.high;

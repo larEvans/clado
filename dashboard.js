@@ -1,5 +1,6 @@
 import express from "express";
 import fetch from "node-fetch";
+import { timingSafeEqual } from "crypto";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -26,6 +27,7 @@ import { AlpacaStream } from "./stream.js";
 import { loadAllLearning, getAllRegimeStats, saveRegimeParams, getRegimeStats, getOptionsHistoryStats, suggestEarlyExitPct } from "./learner.js";
 import { classifyRegime } from "./regime.js";
 import { runHermesAnalysis, loadAllInsights, suggestParamChanges, explainTrades, deriveWinOnlyFilters } from "./hermes.js";
+import { dataPath } from "./state.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app  = express();
@@ -58,6 +60,68 @@ async function alpaca(path) {
 }
 
 app.use(express.json());
+
+// Unauthenticated liveness probe for Railway's healthcheck (must stay above
+// the auth middleware — the healthcheck has no token).
+app.get("/healthz", (req, res) => res.json({ ok: true }));
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+//
+// Set DASHBOARD_TOKEN in the environment to protect every route — pages,
+// static files and /api/*. Open the dashboard once as /?token=YOUR_TOKEN and
+// the server sets an HttpOnly cookie so the page's own fetch() calls keep
+// working without any frontend changes. API clients can send the token in an
+// "x-dashboard-token" header instead. Without DASHBOARD_TOKEN set, the
+// dashboard stays open (and warns loudly) so existing setups don't break.
+
+const DASHBOARD_TOKEN = (process.env.DASHBOARD_TOKEN || "").trim();
+const TOKEN_COOKIE    = "dashboard_token";
+
+if (!DASHBOARD_TOKEN) {
+  console.warn(
+    "[Dashboard] WARNING: DASHBOARD_TOKEN is not set — the dashboard (account data, " +
+    "config toggles, trade endpoints) is reachable by anyone with the URL. " +
+    "Set DASHBOARD_TOKEN in your environment to require a token."
+  );
+}
+
+function tokenMatches(candidate) {
+  if (!candidate) return false;
+  const a = Buffer.from(String(candidate));
+  const b = Buffer.from(DASHBOARD_TOKEN);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function cookieToken(req) {
+  const header = req.headers.cookie;
+  if (!header) return null;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() === TOKEN_COOKIE) {
+      try { return decodeURIComponent(part.slice(eq + 1).trim()); } catch { return null; }
+    }
+  }
+  return null;
+}
+
+app.use((req, res, next) => {
+  if (!DASHBOARD_TOKEN) return next();
+  const queryToken = typeof req.query.token === "string" ? req.query.token : null;
+  const supplied   = req.get("x-dashboard-token") || queryToken || cookieToken(req);
+  if (!tokenMatches(supplied)) {
+    return res.status(401).type("text/plain")
+      .send("Unauthorized. Open the dashboard as /?token=YOUR_DASHBOARD_TOKEN, or send an x-dashboard-token header.");
+  }
+  if (queryToken) {
+    // Persist the token as a cookie so subsequent page requests and the
+    // dashboard's own API calls authenticate without the query param.
+    res.setHeader("Set-Cookie",
+      `${TOKEN_COOKIE}=${encodeURIComponent(queryToken)}; HttpOnly; Path=/; SameSite=Strict; Max-Age=2592000`);
+  }
+  next();
+});
+
 app.use(express.static(__dirname));
 app.get("/", (req, res) => res.sendFile(join(__dirname, "dashboard.html")));
 
@@ -68,7 +132,7 @@ app.get("/", (req, res) => res.sendFile(join(__dirname, "dashboard.html")));
 // this file every 30s so the toggle flips live; symbol changes require a
 // service restart (we surface a "restart required" flag in the response).
 
-const CONFIG_FILE = join(__dirname, "bot-config.json");
+const CONFIG_FILE = dataPath("bot-config.json");
 
 function parseEnvBool(value, defaultValue = false) {
   if (value == null || value === "") return defaultValue;
@@ -305,7 +369,7 @@ app.get("/api/history",   async (req, res) => { try { res.json(await alpaca("/v2
 // ─── Bot log ──────────────────────────────────────────────────────────────────
 
 app.get("/api/bot-log", (req, res) => {
-  const logPath = join(__dirname, "safety-check-log.json");
+  const logPath = dataPath("safety-check-log.json");
   if (!existsSync(logPath)) return res.json([]);
   try {
     const raw = readFileSync(logPath, "utf8").trim();
@@ -382,7 +446,7 @@ function backtestTradesToHistory(trades, strategy, symbol, { source = "backtest"
 
 function appendToTradeHistory(records) {
   if (!records || records.length === 0) return 0;
-  const histFile = join(__dirname, "trade-history.json");
+  const histFile = dataPath("trade-history.json");
   let history = [];
   try { if (existsSync(histFile)) history = JSON.parse(readFileSync(histFile, "utf8")); } catch {}
   history.push(...records);
@@ -517,7 +581,7 @@ app.post("/api/hermes/analyze", async (req, res) => {
 app.get("/api/hermes/explain-trades", (req, res) => {
   const strategy = req.query?.strategy || "hybrid";
   const limit    = Math.min(parseInt(req.query?.limit) || 50, 500);
-  const histFile = join(__dirname, "trade-history.json");
+  const histFile = dataPath("trade-history.json");
   if (!existsSync(histFile)) return res.json({ trades: [], filters: { filters: [] }, message: "No trade history yet" });
   try {
     const all = JSON.parse(readFileSync(histFile, "utf8"));
@@ -542,14 +606,14 @@ app.get("/api/hermes/explain-trades", (req, res) => {
 // Apply the win-only filters as live bot config so future entries skip the loser profile.
 app.post("/api/hermes/apply-filters", (req, res) => {
   const strategy = req.body?.strategy || "hybrid";
-  const histFile = join(__dirname, "trade-history.json");
+  const histFile = dataPath("trade-history.json");
   if (!existsSync(histFile)) return res.status(400).json({ error: "No trade history" });
   try {
     const all = JSON.parse(readFileSync(histFile, "utf8"));
     const trades = all.filter(t => t.strategy === strategy);
     const { filters, blockedLosers, totalLosers, estWinRateAfter } = deriveWinOnlyFilters(trades);
 
-    const learnFile = join(__dirname, "learned-params.json");
+    const learnFile = dataPath("learned-params.json");
     let learned = {};
     try { if (existsSync(learnFile)) learned = JSON.parse(readFileSync(learnFile, "utf8")); } catch {}
     learned[strategy] = {
@@ -627,8 +691,8 @@ if (!process.env.NO_DASHBOARD_STREAM && process.env.ALPACA_API_KEY && process.en
 // ─── Bot status ────────────────────────────────────────────────────────────────
 
 app.get("/api/bot-status", (req, res) => {
-  const stateFile   = join(__dirname, "bot-state.json");
-  const historyFile = join(__dirname, "trade-history.json");
+  const stateFile   = dataPath("bot-state.json");
+  const historyFile = dataPath("trade-history.json");
 
   let state   = null;
   let history = [];
@@ -1118,7 +1182,7 @@ app.post("/api/router/optimize-by-regime", async (req, res) => {
         try {
           const seedParams = STRATEGY_META[strategy]?.params || {};
           // Fabricate a minimum-viable trades summary by re-loading history.
-          const histPath = join(__dirname, "trade-history.json");
+          const histPath = dataPath("trade-history.json");
           let history = [];
           try { history = JSON.parse(readFileSync(histPath, "utf8")); } catch {}
           const subset = history.filter(t => t.strategy === strategy && t.regime === regime);
@@ -1302,7 +1366,7 @@ app.post("/api/backtest/optimize", async (req, res) => {
     // them up on the next signal. Set autoDeploy:false to opt out.
     let autoDeployed = null;
     if (req.body.autoDeploy !== false) {
-      const learnFile = join(__dirname, "learned-params.json");
+      const learnFile = dataPath("learned-params.json");
       let learned = {};
       try { if (existsSync(learnFile)) learned = JSON.parse(readFileSync(learnFile, "utf8")); } catch {}
       learned[strategy] = {
@@ -1341,7 +1405,7 @@ app.post("/api/backtest/optimize", async (req, res) => {
       optimizedAt:   new Date().toISOString(),
     };
 
-    const histFile = join(__dirname, "backtest-history.json");
+    const histFile = dataPath("backtest-history.json");
     let history = {};
     try { if (existsSync(histFile)) history = JSON.parse(readFileSync(histFile, "utf8")); } catch {}
     history[`${strategy}-${symbol}`] = output;
@@ -1355,7 +1419,7 @@ app.post("/api/backtest/optimize", async (req, res) => {
 });
 
 app.get("/api/backtest/history", (req, res) => {
-  const histFile = join(__dirname, "backtest-history.json");
+  const histFile = dataPath("backtest-history.json");
   if (!existsSync(histFile)) return res.json({});
   try { res.json(JSON.parse(readFileSync(histFile, "utf8"))); } catch { res.json({}); }
 });
@@ -1366,7 +1430,7 @@ app.post("/api/deploy", async (req, res) => {
   const { strategy, params } = req.body;
   if (!strategy || !params) return res.status(400).json({ error: "strategy and params required" });
 
-  const learnFile = join(__dirname, "learned-params.json");
+  const learnFile = dataPath("learned-params.json");
   let learned = {};
   try { if (existsSync(learnFile)) learned = JSON.parse(readFileSync(learnFile, "utf8")); } catch {}
 

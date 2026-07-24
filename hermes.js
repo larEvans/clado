@@ -20,9 +20,10 @@
  */
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
+import { dataPath } from "./state.js";
 
-const HISTORY_FILE  = "trade-history.json";
-const INSIGHTS_FILE = "hermes-insights.json";
+const HISTORY_FILE  = dataPath("trade-history.json");
+const INSIGHTS_FILE = dataPath("hermes-insights.json");
 
 // ── Prompt builder ────────────────────────────────────────────────────────────
 
