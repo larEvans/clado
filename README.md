@@ -33,6 +33,10 @@ router.js      score fired signals by per-regime win rate × confidence,
                apply diversification discount + optional consensus vote
         │
         ▼
+ml/predictor.js  optional XGBoost price-target model (the "4th brain"):
+               veto/size the trade + feed a price target & horizon to options
+        │
+        ▼
 agents.js      optional Bull/Bear/Risk-Manager LLM debate veto
 agents-options.js  optional Options Strategist picks the contract
         │
@@ -59,6 +63,7 @@ learner.js     record the closed trade, update per-regime stats,
 | `cpcv.js` | Combinatorially Purged Cross-Validation (overfitting check) |
 | `agents.js` | Bull / Bear / Risk-Manager debate (Claude API, optional) |
 | `agents-options.js` | Options Strategist — contract selection + exit triggers |
+| `ml/*` | Price-target model (XGBoost): feature extraction, in-process inference, watchlist screener, offline trainer — see [ml/README.md](ml/README.md) |
 | `options.js` | Alpaca options chain / order helpers |
 | `hermes.js` | Post-trade analyst (Ollama → Claude API → rule-based fallback) |
 | `dashboard.js` + `dashboard.html` | Express dashboard: live status, backtests, config toggles |
@@ -133,6 +138,8 @@ annotated list). The important ones:
 | `OPTIONS_DTE` / `OPTIONS_MAX_PREMIUM` / `OPTIONS_CONTRACTS` | `7` / `500` / `1` | Options trade shape |
 | `ANTHROPIC_API_KEY` | *(empty)* | Enables the agent debate + Hermes LLM analysis |
 | `OLLAMA_HOST` | *(empty)* | Use a local model for Hermes instead |
+| `PREDICTOR_ENABLED` | `false` | Let the XGBoost price-target model veto/size router entries and steer options |
+| `PREDICTOR_MIN_CONFIDENCE` / `PREDICTOR_VETO` / `PREDICTOR_SIZE_SCALING` | `0.5` / `true` / `true` | How the model gates and sizes trades (see [ml/README.md](ml/README.md)) |
 
 The dashboard writes runtime toggles (router on/off, active strategies,
 crypto symbols, consensus, options mode) to `bot-config.json`, which the bot
@@ -147,6 +154,7 @@ restart (WebSocket resubscription).
 - Regime statistics and learned parameters, with one-click deploy to the bot
 - Hermes trade analysis and parameter suggestions
 - Strategy router controls: toggle, consensus mode, symbol management
+- 🔮 Screener tab: the price-target model ranks the whole watchlist (price targets, horizon, confidence, signal agreement) — advisory, never trades
 - Pine Script overlays served per strategy (e.g. `/api/pinescript/smc`)
 
 **Auth:** set `DASHBOARD_TOKEN` and open the dashboard as

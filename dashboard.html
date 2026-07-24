@@ -162,6 +162,7 @@
   <div class="tab" data-tab="strategies">Strategies & Backtest</div>
   <div class="tab" data-tab="signals">Daily Signals</div>
   <div class="tab" data-tab="router">Strategy Router</div>
+  <div class="tab" data-tab="screener">🔮 Screener</div>
   <div class="tab" data-tab="options-backtest">Options Backtest</div>
   <div class="tab" data-tab="chart">Chart</div>
   <div class="tab" data-tab="options">Options Chain</div>
@@ -604,6 +605,36 @@
   </div>
 </div>
 
+<!-- ══ SCREENER PANEL ════════════════════════════════════════════════════════ -->
+<div id="tab-screener" class="panel">
+
+  <details style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:6px 14px">
+    <summary style="cursor:pointer;font-size:13px;font-weight:600;padding:6px 0">📘 What is the Screener? (click to expand)</summary>
+    <div style="font-size:13px;line-height:1.6;color:#cbd5e1;padding:10px 4px 14px">
+      <p style="margin:0 0 10px"><strong>The 4th brain.</strong> A supervised <strong>XGBoost</strong> model (not an LLM) predicts each symbol's forward return from its recent price action and turns it into a concrete <strong>price target</strong>, <strong>horizon</strong>, and <strong>confidence</strong>. This screener runs it across your <em>entire watchlist</em> and ranks the names it likes — purely advisory, it never places an order.</p>
+      <ul style="margin:6px 0;padding-left:24px">
+        <li><strong>Bias</strong> — model direction (LONG/SHORT) for the forecast horizon.</li>
+        <li><strong>Target</strong> — predicted price = current × (1 + expected return).</li>
+        <li><strong>Conf</strong> — model conviction (0–100%). The router only acts on picks above <code>PREDICTOR_MIN_CONFIDENCE</code>.</li>
+        <li><strong>Signal</strong> — which strategy signals are firing right now; ✓ means a signal agrees with the model.</li>
+        <li><strong>Source</strong> — <code>xgboost</code> once you've trained a model, otherwise <code>heuristic</code> baseline. See <code>ml/README.md</code> to train.</li>
+      </ul>
+    </div>
+  </details>
+
+  <div class="section" style="margin-top:12px">
+    <div class="section-header" style="display:flex;align-items:center;justify-content:space-between">
+      <span>Watchlist Screener</span>
+      <span>
+        <span id="screener-model-badge" style="font-size:11px;color:var(--muted);margin-right:10px"></span>
+        <button class="btn btn-outline" onclick="loadScreener()">Refresh</button>
+      </span>
+    </div>
+    <div id="screener-status" style="font-size:12px;color:var(--muted);padding:6px 14px"></div>
+    <div id="screener-body" class="tbl-wrap" style="padding:6px"></div>
+  </div>
+</div>
+
 <!-- ══ OPTIONS BACKTEST PANEL ════════════════════════════════════════════════ -->
 <div id="tab-options-backtest" class="panel">
 
@@ -913,6 +944,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (tab.dataset.tab === 'options')    initOptionsTab();
     if (tab.dataset.tab === 'signals')    initDailySignals();
     if (tab.dataset.tab === 'router')     loadRouterState();
+    if (tab.dataset.tab === 'screener')   loadScreener();
     if (tab.dataset.tab === 'options-backtest') loadOptionsLearning();
     if (tab.dataset.tab === 'chart')      initChartTab();
   });
@@ -2318,6 +2350,62 @@ async function loadRouterState() {
   } catch (e) {
     document.getElementById('router-loading').style.display = 'none';
     document.getElementById('router-msg').textContent = 'Request failed: ' + e.message;
+  }
+}
+
+// ─── Screener (price-target model) ───────────────────────────────────────────
+async function loadScreener() {
+  const status = document.getElementById('screener-status');
+  const body   = document.getElementById('screener-body');
+  const badge  = document.getElementById('screener-model-badge');
+  status.textContent = 'Running model across watchlist…';
+  body.innerHTML = '';
+  try {
+    const d = await fetch('/api/screener').then(r => r.json());
+    if (d.error) { status.innerHTML = '<span style="color:var(--red)">' + d.error + '</span>'; return; }
+
+    if (d.model) {
+      const m = d.model.metrics || {};
+      badge.innerHTML = `model: <span style="color:#a78bfa">xgboost</span> · dir-acc ${m.dir_acc!=null?(m.dir_acc*100).toFixed(0)+'%':'—'} · trained ${d.model.trained_at ? new Date(d.model.trained_at).toLocaleDateString() : '?'}`;
+    } else {
+      badge.innerHTML = `model: <span style="color:#f59e0b">heuristic baseline</span> · train one via ml/README.md`;
+    }
+    status.textContent = `${d.count} symbols · ${d.interval} bars · ranked by expected return × confidence`;
+
+    const rows = (d.picks || []).map((p, i) => {
+      if (p.error) {
+        return `<tr><td>${p.symbol}</td><td colspan="7" style="color:var(--red);font-size:12px">${p.error}</td></tr>`;
+      }
+      const long = p.side === 'buy';
+      const dirColor = long ? 'var(--green)' : 'var(--red)';
+      const dirLabel = long ? 'LONG' : 'SHORT';
+      const conf = Math.round((p.confidence || 0) * 100);
+      const confColor = conf >= 60 ? '#86efac' : conf >= 35 ? '#fbbf24' : '#fca5a5';
+      const sig = (p.firingStrategies && p.firingStrategies.length)
+        ? `${p.firingStrategies.join(', ')} ${p.signalAgrees ? '<span style="color:var(--green)">✓</span>' : '<span style="color:var(--muted)">✗</span>'}`
+        : '<span style="color:var(--muted)">—</span>';
+      const ret = (p.expectedReturnPct >= 0 ? '+' : '') + p.expectedReturnPct.toFixed(2) + '%';
+      return `<tr>
+        <td style="color:var(--muted)">${i + 1}</td>
+        <td style="font-weight:600">${p.symbol}</td>
+        <td style="color:${dirColor};font-weight:600">${dirLabel}</td>
+        <td style="color:${dirColor}">${ret}</td>
+        <td>$${p.price.toFixed(2)} → <strong>$${p.priceTarget.toFixed(2)}</strong></td>
+        <td>${p.horizonDays}d</td>
+        <td><span style="color:${confColor}">${conf}%</span></td>
+        <td style="font-size:12px">${sig}</td>
+      </tr>`;
+    }).join('');
+
+    body.innerHTML = `<table class="tbl" style="width:100%">
+      <thead><tr>
+        <th>#</th><th>Symbol</th><th>Bias</th><th>Exp. Return</th>
+        <th>Price → Target</th><th>Horizon</th><th>Conf</th><th>Signal</th>
+      </tr></thead>
+      <tbody>${rows || '<tr><td colspan="8" style="color:var(--muted);padding:12px">No symbols in watchlist.</td></tr>'}</tbody>
+    </table>`;
+  } catch (e) {
+    status.innerHTML = '<span style="color:var(--red)">Request failed: ' + e.message + '</span>';
   }
 }
 
