@@ -27,6 +27,7 @@ import { planOptionsTrade, shouldExitOption } from "./agents-options.js";
 import { placeOptionsOrder, fetchSnapshots }  from "./options.js";
 import { runAgentDebate, debateEnabled } from "./agents.js";
 import { checkSignal as smcSignal } from "./strategies/smc.js";
+import { predict as predictPrice, hasModel } from "./ml/predictor.js";
 import { dataPath } from "./state.js";
 
 // Runtime config — bot-config.json overrides these env-var defaults and is
@@ -55,6 +56,13 @@ function loadRuntimeConfig() {
     // always trade the underlying — Alpaca doesn't offer crypto options.
     optionsMode:            parseEnvBool(process.env.OPTIONS_MODE, false),
     optionsDte:             parseInt(process.env.OPTIONS_DTE || "7"),
+    // Price-target model (the 4th brain). When enabled, the XGBoost/heuristic
+    // predictor gates and sizes router entries, and feeds its price target +
+    // horizon into the Options Strategist for smarter strike/expiry selection.
+    predictorEnabled:       parseEnvBool(process.env.PREDICTOR_ENABLED, false),
+    predictorMinConfidence: parseFloat(process.env.PREDICTOR_MIN_CONFIDENCE || "0.5"),
+    predictorVeto:          parseEnvBool(process.env.PREDICTOR_VETO, true),
+    predictorSizeScaling:   parseEnvBool(process.env.PREDICTOR_SIZE_SCALING, true),
   };
   if (!existsSync(CONFIG_FILE)) return defaults;
   try {
@@ -84,6 +92,10 @@ const ACTIVE_STRATS    = () => runtimeCfg.activeStrategies;
 const MAX_CONCURRENT   = () => runtimeCfg.maxConcurrentPositions;
 const OPTIONS_MODE     = () => runtimeCfg.optionsMode;
 const OPTIONS_DTE      = () => runtimeCfg.optionsDte || 7;
+const PREDICTOR_ENABLED       = () => runtimeCfg.predictorEnabled;
+const PREDICTOR_MIN_CONF      = () => runtimeCfg.predictorMinConfidence;
+const PREDICTOR_VETO          = () => runtimeCfg.predictorVeto;
+const PREDICTOR_SIZE_SCALING  = () => runtimeCfg.predictorSizeScaling;
 const STRICT_ROUTER    = process.env.STRICT_ROUTER === "true";
 const CRYPTO_SYMBOLS   = runtimeCfg.cryptoSymbols;
 
@@ -839,6 +851,33 @@ async function onRouterBar(bar) {
 
   console.log(`[Router] ${sym} ${r.tag} → ${decision.reason}`);
 
+  // ── PREDICTOR gate: the price-target model (4th brain) can veto or size the
+  // trade, and its target/horizon feed the Options Strategist downstream. ──
+  let prediction = null;
+  if (PREDICTOR_ENABLED()) {
+    try {
+      prediction = predictPrice(s.bars);
+      const agrees = prediction.side === decision.chosen.signal.side;
+      s.lastChoice = { ...s.lastChoice, prediction: {
+        side:              prediction.side,
+        expectedReturnPct: +prediction.expectedReturnPct.toFixed(2),
+        priceTarget:       +prediction.priceTarget.toFixed(2),
+        confidence:        +prediction.confidence.toFixed(2),
+        horizonDays:       prediction.horizonDays,
+        source:            prediction.source,
+        agrees,
+      }};
+      if (PREDICTOR_VETO() && !agrees && prediction.confidence >= PREDICTOR_MIN_CONF()) {
+        console.log(`[Predictor] ${sym} VETO — model says ${prediction.side} (${(prediction.confidence * 100).toFixed(0)}% conf) vs ${decision.chosen.signal.side} signal`);
+        saveRouterState();
+        return;
+      }
+      console.log(`[Predictor] ${sym} ${prediction.source} → ${prediction.side} ${prediction.expectedReturnPct >= 0 ? "+" : ""}${prediction.expectedReturnPct.toFixed(2)}% · target $${prediction.priceTarget.toFixed(2)} · ${(prediction.confidence * 100).toFixed(0)}% conf${agrees ? " ✓" : " (disagrees, not vetoed)"}`);
+    } catch (e) {
+      console.warn(`[Predictor] ${sym} prediction failed (proceeding): ${e.message}`);
+    }
+  }
+
   // AGENT_DEBATE: Bull / Bear / Risk Manager weigh in before entry fires.
   let sizeMultiplier = 1.0;
   if (debateEnabled()) {
@@ -870,11 +909,19 @@ async function onRouterBar(bar) {
     }
   }
 
-  await enterRouterTrade(sym, decision.chosen.strategy, decision.chosen.signal, bar, r.tag, sizeMultiplier);
+  // Confidence-based sizing: scale up when the model strongly agrees, halve
+  // when it disagreed but wasn't confident enough to veto.
+  if (PREDICTOR_ENABLED() && PREDICTOR_SIZE_SCALING() && prediction) {
+    const agrees = prediction.side === decision.chosen.signal.side;
+    const predScale = agrees ? (0.75 + prediction.confidence * 0.5) : 0.5; // 0.75..1.25 / 0.5
+    sizeMultiplier *= predScale;
+  }
+
+  await enterRouterTrade(sym, decision.chosen.strategy, decision.chosen.signal, bar, r.tag, sizeMultiplier, prediction);
   saveRouterState();
 }
 
-async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultiplier = 1.0) {
+async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultiplier = 1.0, prediction = null) {
   const s = getSymState(sym);
   const perPositionUSD = (TRADE_USD / Math.min(MAX_CONCURRENT(), routerStates.size || 1)) * sizeMultiplier;
   const crypto = isCryptoSymbol(sym);
@@ -884,10 +931,18 @@ async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultipli
   let optionsPlan = null;
   if (OPTIONS_MODE() && !crypto) {
     try {
+      // When the predictor agrees with the trade, hand its price target and
+      // horizon to the options planner so it picks a target-aligned strike and
+      // an expiry that matches the forecast window — instead of blind ATM/fixed-DTE.
+      const usePrediction = PREDICTOR_ENABLED() && prediction && prediction.side === signal.side;
+      const optionSignal = usePrediction
+        ? { ...signal, symbol: sym, strategy, regime, target: prediction.priceTarget }
+        : { ...signal, symbol: sym, strategy, regime };
+      const optionDte = usePrediction ? prediction.horizonDays : OPTIONS_DTE();
       optionsPlan = await planOptionsTrade(
-        { ...signal, symbol: sym, strategy, regime },
+        optionSignal,
         bar.close,
-        { dte: OPTIONS_DTE(), underlying: sym },
+        { dte: optionDte, underlying: sym },
       );
       if (optionsPlan?.contract) {
         console.log(`[OptionsAgent] ${sym} → ${optionsPlan.contract.symbol} (${optionsPlan.contract.type} ${optionsPlan.contract.strike}@${optionsPlan.contract.expiry}, premium $${(optionsPlan.contract.mid||0).toFixed(2)}, delta ${optionsPlan.contract.delta?.toFixed(2)}) · ${optionsPlan.reasoning}`);
@@ -1005,6 +1060,9 @@ async function closeRouterPosition(sym, exitPrice, exitReason) {
 let resolvedSymbols = [SYMBOL];
 if (ROUTER_ENABLED()) {
   console.log(`[Router] ENABLED — strategies: ${ACTIVE_STRATS().join(", ")} — fetching watchlist…`);
+  if (PREDICTOR_ENABLED()) {
+    console.log(`[Predictor] ENABLED — engine: ${hasModel() ? "XGBoost model" : "heuristic baseline (no model.json yet — see ml/README.md)"} · min-conf ${PREDICTOR_MIN_CONF()} · veto ${PREDICTOR_VETO()} · size-scaling ${PREDICTOR_SIZE_SCALING()}`);
+  }
   try {
     const wlRes = await fetch(`${ALPACA_BASE}/v2/watchlists`, { headers: ALPACA_HEADERS });
     const wl    = wlRes.ok ? await wlRes.json() : [];

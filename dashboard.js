@@ -26,6 +26,9 @@ import { fetchChain, fetchExpiryDates, fetchContracts, getLiveOptionsParams } fr
 import { AlpacaStream } from "./stream.js";
 import { loadAllLearning, getAllRegimeStats, saveRegimeParams, getRegimeStats, getOptionsHistoryStats, suggestEarlyExitPct } from "./learner.js";
 import { classifyRegime } from "./regime.js";
+import { screenWatchlist } from "./ml/screener.js";
+import { modelInfo } from "./ml/predictor.js";
+import { checkSignal as smcCheckSignal } from "./strategies/smc.js";
 import { runHermesAnalysis, loadAllInsights, suggestParamChanges, explainTrades, deriveWinOnlyFilters } from "./hermes.js";
 import { dataPath } from "./state.js";
 
@@ -1093,6 +1096,54 @@ app.get("/api/router/state", async (req, res) => {
         };
       })(),
       generatedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Advisory screener — run the price-target model across the whole watchlist ─
+// Purely advisory (never trades): ranks every watchlist symbol by predicted
+// return × confidence and shows which strategy signals are firing alongside.
+app.get("/api/screener", async (req, res) => {
+  try {
+    // Resolve watchlist (same source the router uses)
+    let symbols;
+    try {
+      const lists = await alpaca("/v2/watchlists");
+      if (lists?.length) {
+        const detail = await alpaca(`/v2/watchlists/${lists[0].id}`);
+        symbols = (detail.assets || []).map(a => a.symbol).filter(Boolean);
+      }
+    } catch {}
+    if (!symbols?.length) symbols = [process.env.SYMBOL || "SPY"];
+
+    const interval = req.query.interval || process.env.PREDICTOR_INTERVAL || "5m";
+    const rows = await Promise.all(symbols.map(async sym => {
+      try {
+        const candles = await fetchCandles(sym, interval);
+        const bars = candles.slice(-300); // recent window for features/signal
+        let signals = [];
+        try {
+          const smc = smcCheckSignal(bars);
+          if (smc) signals.push({ strategy: "smc", signal: smc });
+        } catch {}
+        return { symbol: sym, bars, signals, regime: classifyRegime(bars).tag };
+      } catch (e) {
+        return { symbol: sym, bars: [], signals: [], error: e.message };
+      }
+    }));
+
+    const minConfidence = req.query.minConfidence != null ? Number(req.query.minConfidence) : 0;
+    const result = screenWatchlist(rows, { minConfidence, withFeatures: req.query.features === "1" });
+    // Attach regime tags back onto the ranked picks for display.
+    const regimeBySym = Object.fromEntries(rows.map(r => [r.symbol, r.regime]));
+    for (const p of result.picks) p.regime = regimeBySym[p.symbol] || null;
+
+    res.json({
+      ...result,
+      interval,
+      model: modelInfo(), // null when running on the heuristic baseline
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
