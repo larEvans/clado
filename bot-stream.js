@@ -28,6 +28,7 @@ import { placeOptionsOrder, fetchSnapshots }  from "./options.js";
 import { runAgentDebate, debateEnabled } from "./agents.js";
 import { checkSignal as smcSignal } from "./strategies/smc.js";
 import { predict as predictPrice, hasModel } from "./ml/predictor.js";
+import { evaluatePrediction, effectiveThresholds, meta as predictorMeta } from "./strategies/predictor-strat.js";
 import { dataPath } from "./state.js";
 
 // Runtime config — bot-config.json overrides these env-var defaults and is
@@ -47,7 +48,7 @@ function loadRuntimeConfig() {
     routerEnabled:          parseEnvBool(process.env.ROUTER_ENABLED, true),
     consensusMin:           parseInt(process.env.CONSENSUS_MIN || "1"),
     maxConcurrentPositions: parseInt(process.env.MAX_CONCURRENT_POSITIONS || "5"),
-    activeStrategies:       (process.env.ACTIVE_STRATEGIES || "hybrid,hybrid10,smc,hybrid-reversal,reversal,vwap")
+    activeStrategies:       (process.env.ACTIVE_STRATEGIES || "hybrid,hybrid10,smc,hybrid-reversal,reversal,vwap,predictor")
                               .split(",").map(s => s.trim().toLowerCase()).filter(Boolean),
     cryptoSymbols:          (process.env.CRYPTO_SYMBOLS || "")
                               .split(",").map(s => s.trim().toUpperCase()).filter(Boolean),
@@ -63,6 +64,19 @@ function loadRuntimeConfig() {
     predictorMinConfidence: parseFloat(process.env.PREDICTOR_MIN_CONFIDENCE || "0.5"),
     predictorVeto:          parseEnvBool(process.env.PREDICTOR_VETO, true),
     predictorSizeScaling:   parseEnvBool(process.env.PREDICTOR_SIZE_SCALING, true),
+    // Predictor as a PRIMARY signal source (strategies/predictor-strat.js):
+    // the model itself generates trades, targeting >= minTradesPerDay/day.
+    predictorSignalEnabled: parseEnvBool(process.env.PREDICTOR_SIGNAL_ENABLED, false),
+    predictorMinEdge:       parseFloat(process.env.PREDICTOR_MIN_EDGE || "0.35"),
+    predictorSignalMinConf: parseFloat(process.env.PREDICTOR_SIGNAL_MIN_CONFIDENCE || "0.55"),
+    stopAtrMult:            parseFloat(process.env.STOP_ATR_MULT || "1.5"),
+    minTradesPerDay:        parseInt(process.env.MIN_TRADES_PER_DAY || "2"),
+    floorTimeET:            process.env.FLOOR_TIME_ET || "14:30",
+    predictorMinEdgeFloor:  parseFloat(process.env.PREDICTOR_MIN_EDGE_FLOOR || "0.15"),
+    predictorMinConfFloor:  parseFloat(process.env.PREDICTOR_MIN_CONFIDENCE_FLOOR || "0.35"),
+    // Options-first execution shaping
+    strikeMode:             (process.env.STRIKE_MODE || "between").toLowerCase(),
+    optionsDteBuffer:       parseInt(process.env.OPTIONS_DTE_BUFFER || "2"),
   };
   if (!existsSync(CONFIG_FILE)) return defaults;
   try {
@@ -96,6 +110,31 @@ const PREDICTOR_ENABLED       = () => runtimeCfg.predictorEnabled;
 const PREDICTOR_MIN_CONF      = () => runtimeCfg.predictorMinConfidence;
 const PREDICTOR_VETO          = () => runtimeCfg.predictorVeto;
 const PREDICTOR_SIZE_SCALING  = () => runtimeCfg.predictorSizeScaling;
+const PREDICTOR_SIGNAL_ENABLED = () => runtimeCfg.predictorSignalEnabled;
+const MIN_TRADES_PER_DAY      = () => runtimeCfg.minTradesPerDay;
+const STRIKE_MODE             = () => runtimeCfg.strikeMode;
+const OPTIONS_DTE_BUFFER      = () => runtimeCfg.optionsDteBuffer;
+
+// "14:30" → minutes since midnight ET
+function floorTimeMins() {
+  const [h, m] = (runtimeCfg.floorTimeET || "14:30").split(":").map(Number);
+  return (h || 14) * 60 + (m || 30);
+}
+
+// Current predictor-strategy thresholds, accounting for the two-tier daily
+// floor: after floorTimeET, if we're short of minTradesPerDay, relax to the
+// *_FLOOR values (weaker but still positive edge — never a forced bad trade).
+function predictorParams(etMins) {
+  const t = effectiveThresholds({
+    etMins,
+    tradesToday:     routerDay.tradesToday || 0,
+    minTradesPerDay: MIN_TRADES_PER_DAY(),
+    floorTimeMins:   floorTimeMins(),
+    base:  { minEdge: runtimeCfg.predictorMinEdge,      minConfidence: runtimeCfg.predictorSignalMinConf },
+    floor: { minEdge: runtimeCfg.predictorMinEdgeFloor, minConfidence: runtimeCfg.predictorMinConfFloor },
+  });
+  return { ...predictorMeta.params, minEdge: t.minEdge, minConfidence: t.minConfidence, stopAtrMult: runtimeCfg.stopAtrMult, _tier: t.tier };
+}
 const STRICT_ROUTER    = process.env.STRICT_ROUTER === "true";
 const CRYPTO_SYMBOLS   = runtimeCfg.cryptoSymbols;
 
@@ -682,23 +721,66 @@ function saveRouterState() {
     writeFileSync(ROUTER_STATE_FILE, JSON.stringify({
       symbols: out,
       strategiesFiredToday: [...(routerDay.strategiesFiredToday || [])],
+      tradesToday: routerDay.tradesToday || 0,
       date: routerDay.date,
       updatedAt: new Date().toISOString(),
     }, null, 2));
   } catch (e) { console.warn("[Router] state save failed:", e.message); }
 }
 
-const routerDay = { date: "", strategiesFiredToday: new Set() };
+const routerDay = { date: "", strategiesFiredToday: new Set(), tradesToday: 0 };
 function resetRouterDayIfNew(today) {
   if (routerDay.date !== today) {
     routerDay.date = today;
     routerDay.strategiesFiredToday = new Set();
+    routerDay.tradesToday = 0;
     for (const [, s] of routerStates.entries()) {
       s.tradedToday = false;
       s.strategiesTradedToday = new Set();
       s.date = today;
     }
   }
+}
+
+// ── Prediction snapshots → predictions.json (dashboard: targets/potential) ────
+// The bot and dashboard are separate processes, so persist what the model saw
+// on each evaluation. Throttled writes; one entry per symbol (latest wins).
+const PREDICTIONS_FILE = dataPath("predictions.json");
+const predictionSnapshots = new Map();
+let _lastPredictionsWrite = 0;
+
+function recordPredictionSnapshot(sym, ev, params) {
+  if (!ev) return;
+  predictionSnapshots.set(sym, {
+    symbol:      sym,
+    updatedAt:   new Date().toISOString(),
+    wouldFire:   ev.wouldFire,
+    skipReason:  ev.skipReason,
+    edge:        +(ev.edge || 0).toFixed(3),
+    tier:        params?._tier || 1,
+    thresholds:  { minEdge: params?.minEdge, minConfidence: params?.minConfidence },
+    prediction:  ev.prediction ? {
+      side:              ev.prediction.side,
+      price:             +(+ev.prediction.price).toFixed(4),
+      priceTarget:       +(+ev.prediction.priceTarget).toFixed(4),
+      expectedReturnPct: +(+ev.prediction.expectedReturnPct).toFixed(3),
+      horizonDays:       ev.prediction.horizonDays,
+      confidence:        +(+ev.prediction.confidence).toFixed(3),
+      source:            ev.prediction.source,
+    } : null,
+  });
+  const now = Date.now();
+  if (now - _lastPredictionsWrite < 30_000) return;  // throttle disk writes
+  _lastPredictionsWrite = now;
+  try {
+    writeFileSync(PREDICTIONS_FILE, JSON.stringify({
+      generatedAt:  new Date().toISOString(),
+      date:         routerDay.date,
+      tradesToday:  routerDay.tradesToday || 0,
+      minTradesPerDay: MIN_TRADES_PER_DAY(),
+      perSymbol:    [...predictionSnapshots.values()],
+    }, null, 2));
+  } catch (e) { console.warn("[Predictor] predictions.json write failed:", e.message); }
 }
 
 // Lookup helper for router scoring. Strategy×regime stats from history;
@@ -717,6 +799,13 @@ function candidateSignals(strategy, sym, barBuffer) {
     if (strategy === "hybrid"   || strategy === "hybrid10")  return evalHybrid(barBuffer);
     if (strategy === "orb")                                  return evalORB(barBuffer);
     if (strategy === "smc")                                  return smcSignal(barBuffer, loadLearnedParams("smc") || undefined);
+    if (strategy === "predictor") {
+      if (!PREDICTOR_SIGNAL_ENABLED()) return null;
+      const params = predictorParams(etMinutesOf(new Date()));
+      const ev = evaluatePrediction(barBuffer, params);
+      recordPredictionSnapshot(sym, ev, params);   // feeds the dashboard views
+      return ev.signal;
+    }
     // For strategies that aren't natively in this bot file yet, return null —
     // they're still tracked in stats from backtests but live signals only fire
     // for the two evaluators above.
@@ -852,9 +941,13 @@ async function onRouterBar(bar) {
   console.log(`[Router] ${sym} ${r.tag} → ${decision.reason}`);
 
   // ── PREDICTOR gate: the price-target model (4th brain) can veto or size the
-  // trade, and its target/horizon feed the Options Strategist downstream. ──
-  let prediction = null;
-  if (PREDICTOR_ENABLED()) {
+  // trade, and its target/horizon feed the Options Strategist downstream.
+  // Skipped when the predictor IS the signal source — it already generated
+  // the trade; it must not veto itself. ──
+  let prediction = decision.chosen.strategy === "predictor"
+    ? { ...decision.chosen.signal.prediction, side: decision.chosen.signal.side, price: decision.chosen.signal.entry }
+    : null;
+  if (PREDICTOR_ENABLED() && decision.chosen.strategy !== "predictor") {
     try {
       prediction = predictPrice(s.bars);
       const agrees = prediction.side === decision.chosen.signal.side;
@@ -931,14 +1024,27 @@ async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultipli
   let optionsPlan = null;
   if (OPTIONS_MODE() && !crypto) {
     try {
-      // When the predictor agrees with the trade, hand its price target and
-      // horizon to the options planner so it picks a target-aligned strike and
-      // an expiry that matches the forecast window — instead of blind ATM/fixed-DTE.
-      const usePrediction = PREDICTOR_ENABLED() && prediction && prediction.side === signal.side;
-      const optionSignal = usePrediction
-        ? { ...signal, symbol: sym, strategy, regime, target: prediction.priceTarget }
-        : { ...signal, symbol: sym, strategy, regime };
-      const optionDte = usePrediction ? prediction.horizonDays : OPTIONS_DTE();
+      // When the predictor agrees with the trade (or generated it), hand its
+      // price target and horizon to the options planner so it picks a
+      // target-aligned strike and a matching expiry — not blind ATM/fixed-DTE.
+      const usePrediction = (PREDICTOR_ENABLED() || PREDICTOR_SIGNAL_ENABLED())
+        && prediction && prediction.side === signal.side;
+      // STRIKE_MODE shapes where the strike lands by adjusting the target the
+      // planner aims at: atm = spot (highest delta), target = the model's full
+      // forecast, between = midpoint (default — balances delta vs. cost).
+      let strikeTarget = signal.target;
+      if (usePrediction) {
+        const t = prediction.priceTarget;
+        strikeTarget = STRIKE_MODE() === "atm"    ? bar.close
+                     : STRIKE_MODE() === "target" ? t
+                     : (bar.close + t) / 2;                       // "between"
+      }
+      const optionSignal = { ...signal, symbol: sym, strategy, regime, target: strikeTarget };
+      // Expiry: forecast horizon + buffer so theta doesn't strangle the trade
+      // if the move takes the full horizon.
+      const optionDte = usePrediction
+        ? Math.max(1, (prediction.horizonDays || OPTIONS_DTE()) + OPTIONS_DTE_BUFFER())
+        : OPTIONS_DTE();
       optionsPlan = await planOptionsTrade(
         optionSignal,
         bar.close,
@@ -1011,6 +1117,19 @@ async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultipli
   s.strategiesTradedToday = s.strategiesTradedToday || new Set();
   s.strategiesTradedToday.add(strategy);
   routerDay.strategiesFiredToday.add(strategy);
+  routerDay.tradesToday = (routerDay.tradesToday || 0) + 1;
+  // Keep the prediction that drove (or accompanied) the trade on the position
+  // so the close path can record target-vs-actual for the dashboard.
+  if (s.position && prediction) {
+    s.position.prediction = {
+      side:              prediction.side,
+      priceTarget:       prediction.priceTarget,
+      expectedReturnPct: prediction.expectedReturnPct,
+      horizonDays:       prediction.horizonDays,
+      confidence:        prediction.confidence,
+      source:            prediction.source,
+    };
+  }
 }
 
 async function closeRouterPosition(sym, exitPrice, exitReason) {
@@ -1031,6 +1150,8 @@ async function closeRouterPosition(sym, exitPrice, exitReason) {
     exitReason,
     regime: pos.regime,
     hourET,
+    // Prediction that drove/accompanied the trade (target-vs-actual analysis)
+    ...(pos.prediction ? { prediction: pos.prediction } : {}),
     // Options metadata so the agent can learn from outcomes
     ...(pos.isOption ? {
       isOption:       true,
@@ -1061,7 +1182,10 @@ let resolvedSymbols = [SYMBOL];
 if (ROUTER_ENABLED()) {
   console.log(`[Router] ENABLED — strategies: ${ACTIVE_STRATS().join(", ")} — fetching watchlist…`);
   if (PREDICTOR_ENABLED()) {
-    console.log(`[Predictor] ENABLED — engine: ${hasModel() ? "XGBoost model" : "heuristic baseline (no model.json yet — see ml/README.md)"} · min-conf ${PREDICTOR_MIN_CONF()} · veto ${PREDICTOR_VETO()} · size-scaling ${PREDICTOR_SIZE_SCALING()}`);
+    console.log(`[Predictor] gate ENABLED — engine: ${hasModel() ? "XGBoost model" : "heuristic baseline (no model.json yet — see ml/README.md)"} · min-conf ${PREDICTOR_MIN_CONF()} · veto ${PREDICTOR_VETO()} · size-scaling ${PREDICTOR_SIZE_SCALING()}`);
+  }
+  if (PREDICTOR_SIGNAL_ENABLED()) {
+    console.log(`[Predictor] SIGNAL MODE — the model generates trades: minEdge ${runtimeCfg.predictorMinEdge} · minConf ${runtimeCfg.predictorSignalMinConf} · floor ${MIN_TRADES_PER_DAY()}/day after ${runtimeCfg.floorTimeET} ET (edge ≥ ${runtimeCfg.predictorMinEdgeFloor}) · strike ${STRIKE_MODE()} · DTE +${OPTIONS_DTE_BUFFER()}`);
   }
   try {
     const wlRes = await fetch(`${ALPACA_BASE}/v2/watchlists`, { headers: ALPACA_HEADERS });

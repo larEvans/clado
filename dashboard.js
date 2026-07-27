@@ -1150,6 +1150,61 @@ app.get("/api/screener", async (req, res) => {
   }
 });
 
+// ─── Live predictions view — what the BOT actually saw and did ────────────────
+// Three sections: price targets per symbol (from predictions.json, written by
+// bot-stream on every evaluation), potential trades (cleared threshold but not
+// taken / would fire), and trades taken by the predictor with target-vs-actual.
+app.get("/api/predictions", (req, res) => {
+  try {
+    // 1+2. Live per-symbol snapshots from the bot process
+    let live = null;
+    const predFile = dataPath("predictions.json");
+    if (existsSync(predFile)) {
+      try { live = JSON.parse(readFileSync(predFile, "utf8")); } catch {}
+    }
+
+    // 3. Predictor-driven closed trades (trade-history.json) + open positions
+    //    (bot-router-state.json), newest first.
+    let taken = [];
+    const histFile = dataPath("trade-history.json");
+    if (existsSync(histFile)) {
+      try {
+        const history = JSON.parse(readFileSync(histFile, "utf8"));
+        taken = history
+          .filter(t => t.strategy === "predictor" || t.prediction)
+          .slice(-100)
+          .reverse()
+          .map(t => ({
+            ...t,
+            targetHit: t.prediction && t.exitPrice != null
+              ? (t.side === "buy" ? t.exitPrice >= t.prediction.priceTarget : t.exitPrice <= t.prediction.priceTarget)
+              : null,
+          }));
+      } catch {}
+    }
+    let openPositions = [];
+    const routerFile = dataPath("bot-router-state.json");
+    if (existsSync(routerFile)) {
+      try {
+        const rs = JSON.parse(readFileSync(routerFile, "utf8"));
+        openPositions = Object.entries(rs.symbols || {})
+          .filter(([, s]) => s.position)
+          .map(([sym, s]) => ({ symbol: sym, ...s.position }));
+      } catch {}
+    }
+
+    res.json({
+      generatedAt: new Date().toISOString(),
+      live,          // { date, tradesToday, minTradesPerDay, perSymbol: [...] } or null if bot hasn't written yet
+      openPositions,
+      taken,
+      model: modelInfo(),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Run every active strategy across the watchlist for the historical window
 // available from Alpaca (~60 days of 5m bars). Saves trades into history so
 // the per-regime stats table populates. Required before going live.

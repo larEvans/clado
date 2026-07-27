@@ -633,6 +633,25 @@
     <div id="screener-status" style="font-size:12px;color:var(--muted);padding:6px 14px"></div>
     <div id="screener-body" class="tbl-wrap" style="padding:6px"></div>
   </div>
+
+  <!-- Live bot view: what the model saw on the last bar, in the bot process -->
+  <div class="section" style="margin-top:12px">
+    <div class="section-header" style="display:flex;align-items:center;justify-content:space-between">
+      <span>🎯 Live Price Targets (bot's view)</span>
+      <span id="pred-day-status" style="font-size:11px;color:var(--muted)"></span>
+    </div>
+    <div id="pred-targets" class="tbl-wrap" style="padding:6px"></div>
+  </div>
+
+  <div class="section" style="margin-top:12px">
+    <div class="section-header">⚡ Potential Trades (cleared or near threshold)</div>
+    <div id="pred-potential" class="tbl-wrap" style="padding:6px"></div>
+  </div>
+
+  <div class="section" style="margin-top:12px">
+    <div class="section-header">✅ Trades Taken by the Model</div>
+    <div id="pred-taken" class="tbl-wrap" style="padding:6px"></div>
+  </div>
 </div>
 
 <!-- ══ OPTIONS BACKTEST PANEL ════════════════════════════════════════════════ -->
@@ -2406,6 +2425,106 @@ async function loadScreener() {
     </table>`;
   } catch (e) {
     status.innerHTML = '<span style="color:var(--red)">Request failed: ' + e.message + '</span>';
+  }
+  loadPredictions();
+}
+
+// ─── Live predictions: bot's price targets, potential + taken trades ─────────
+async function loadPredictions() {
+  const tgt = document.getElementById('pred-targets');
+  const pot = document.getElementById('pred-potential');
+  const tak = document.getElementById('pred-taken');
+  const day = document.getElementById('pred-day-status');
+  try {
+    const d = await fetch('/api/predictions').then(r => r.json());
+    if (d.error) { tgt.innerHTML = `<div style="color:var(--red);padding:10px">${d.error}</div>`; return; }
+
+    const empty = (msg) => `<div style="color:var(--muted);font-size:13px;padding:10px">${msg}</div>`;
+    const fmtSide = s => s === 'buy'
+      ? '<span style="color:var(--green);font-weight:600">LONG</span>'
+      : '<span style="color:var(--red);font-weight:600">SHORT</span>';
+
+    // ── Day progress ──
+    if (d.live) {
+      const behind = (d.live.tradesToday || 0) < (d.live.minTradesPerDay || 0);
+      day.innerHTML = `trades today: <strong style="color:${behind ? '#fbbf24' : 'var(--green)'}">${d.live.tradesToday || 0}/${d.live.minTradesPerDay || 0}</strong> · updated ${new Date(d.live.generatedAt).toLocaleTimeString()}`;
+    } else {
+      day.textContent = 'bot has not written predictions yet (needs PREDICTOR_SIGNAL_ENABLED=true + a running bot)';
+    }
+
+    // ── 1. Price targets (bot's live view) ──
+    const per = d.live?.perSymbol || [];
+    tgt.innerHTML = per.length === 0 ? empty('No live predictions yet. Start the bot with PREDICTOR_SIGNAL_ENABLED=true — this fills on the first bar.') :
+      `<table class="tbl" style="width:100%"><thead><tr>
+        <th>Symbol</th><th>Bias</th><th>Price → Target</th><th>Exp. Return</th><th>Horizon</th><th>Conf</th><th>Edge</th><th>Updated</th>
+      </tr></thead><tbody>` + per.map(p => {
+        const pr = p.prediction;
+        if (!pr) return `<tr><td>${p.symbol}</td><td colspan="7" style="color:var(--muted)">${p.skipReason || 'no prediction'}</td></tr>`;
+        return `<tr>
+          <td style="font-weight:600">${p.symbol}</td>
+          <td>${fmtSide(pr.side)}</td>
+          <td>$${pr.price.toFixed(2)} → <strong>$${pr.priceTarget.toFixed(2)}</strong></td>
+          <td style="color:${pr.expectedReturnPct >= 0 ? 'var(--green)' : 'var(--red)'}">${pr.expectedReturnPct >= 0 ? '+' : ''}${pr.expectedReturnPct.toFixed(2)}%</td>
+          <td>${pr.horizonDays}d</td>
+          <td>${Math.round(pr.confidence * 100)}%</td>
+          <td>${p.edge.toFixed(2)}${p.tier === 2 ? ' <span style="font-size:9px;color:#fbbf24">TIER2</span>' : ''}</td>
+          <td style="font-size:11px;color:var(--muted)">${new Date(p.updatedAt).toLocaleTimeString()}</td>
+        </tr>`;
+      }).join('') + '</tbody></table>';
+
+    // ── 2. Potential trades ──
+    const potentials = per.filter(p => p.prediction && (p.wouldFire || p.skipReason));
+    pot.innerHTML = potentials.length === 0 ? empty('Nothing evaluated yet.') :
+      `<table class="tbl" style="width:100%"><thead><tr>
+        <th>Symbol</th><th>Bias</th><th>Target</th><th>Edge vs. needed</th><th>Status</th>
+      </tr></thead><tbody>` + potentials.map(p => {
+        const pr = p.prediction;
+        const need = p.thresholds?.minEdge ?? '—';
+        const status = p.wouldFire
+          ? '<span style="color:var(--green);font-weight:600">WOULD FIRE ✓</span> <span style="font-size:11px;color:var(--muted)">(taken unless capacity/position blocks)</span>'
+          : `<span style="color:var(--muted)">skipped — ${p.skipReason}</span>`;
+        return `<tr>
+          <td style="font-weight:600">${p.symbol}</td>
+          <td>${fmtSide(pr.side)}</td>
+          <td>$${pr.priceTarget.toFixed(2)}</td>
+          <td>${p.edge.toFixed(2)} / ${need}</td>
+          <td style="font-size:12px">${status}</td>
+        </tr>`;
+      }).join('') + '</tbody></table>';
+
+    // ── 3. Trades taken (open + closed) ──
+    const open = (d.openPositions || []).map(p => `<tr style="background:rgba(59,130,246,.06)">
+      <td style="font-weight:600">${p.symbol}</td>
+      <td>${fmtSide(p.side)}</td>
+      <td><span style="color:#60a5fa">OPEN</span>${p.isOption ? ` · <span style="font-size:11px">${p.contract?.type || ''} $${p.contract?.strike ?? ''} ${p.contract?.expiry || ''}</span>` : ''}</td>
+      <td>$${(p.entry ?? 0).toFixed(2)}</td>
+      <td>${p.prediction ? '$' + p.prediction.priceTarget.toFixed(2) : (p.target ? '$' + p.target.toFixed(2) : '—')}</td>
+      <td>—</td>
+      <td>${p.prediction ? Math.round(p.prediction.confidence * 100) + '%' : '—'}</td>
+      <td style="font-size:11px;color:var(--muted)">${p.entryTime ? new Date(p.entryTime).toLocaleString() : ''}</td>
+    </tr>`);
+    const closed = (d.taken || []).map(t => {
+      const pnl = t.pnlPct != null ? `<span style="color:${t.pnlPct >= 0 ? 'var(--green)' : 'var(--red)'}">${t.pnlPct >= 0 ? '+' : ''}${t.pnlPct.toFixed(2)}%</span>` : '—';
+      const opt = t.isOption ? ` · <span style="font-size:11px">${t.optionType || ''} $${t.optionStrike ?? ''} ${t.optionDte != null ? t.optionDte + 'DTE' : ''}</span>` : '';
+      const hit = t.targetHit === true ? ' <span style="color:var(--green);font-size:10px">TARGET HIT</span>'
+                : t.targetHit === false ? ` <span style="color:var(--muted);font-size:10px">${(t.exitReason || '').toUpperCase()}</span>` : '';
+      return `<tr>
+        <td style="font-weight:600">${t.symbol}</td>
+        <td>${fmtSide(t.side)}</td>
+        <td><span style="font-size:11px">${t.exitReason || 'closed'}</span>${opt}</td>
+        <td>$${(t.entryPrice ?? 0).toFixed(2)} → $${(t.exitPrice ?? 0).toFixed(2)}</td>
+        <td>${t.prediction ? '$' + t.prediction.priceTarget.toFixed(2) + hit : '—'}</td>
+        <td>${pnl}</td>
+        <td>${t.prediction ? Math.round(t.prediction.confidence * 100) + '%' : '—'}</td>
+        <td style="font-size:11px;color:var(--muted)">${t.exitTime ? new Date(t.exitTime).toLocaleString() : ''}</td>
+      </tr>`;
+    });
+    tak.innerHTML = (open.length + closed.length) === 0 ? empty('No model-driven trades yet. They appear here as soon as the predictor opens one (or with a prediction attached).') :
+      `<table class="tbl" style="width:100%"><thead><tr>
+        <th>Symbol</th><th>Bias</th><th>Status / Contract</th><th>Entry → Exit</th><th>Model Target</th><th>P&L</th><th>Conf</th><th>Time</th>
+      </tr></thead><tbody>` + open.join('') + closed.join('') + '</tbody></table>';
+  } catch (e) {
+    tgt.innerHTML = `<div style="color:var(--red);padding:10px">Request failed: ${e.message}</div>`;
   }
 }
 

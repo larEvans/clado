@@ -140,6 +140,9 @@ annotated list). The important ones:
 | `OLLAMA_HOST` | *(empty)* | Use a local model for Hermes instead |
 | `PREDICTOR_ENABLED` | `false` | Let the XGBoost price-target model veto/size router entries and steer options |
 | `PREDICTOR_MIN_CONFIDENCE` / `PREDICTOR_VETO` / `PREDICTOR_SIZE_SCALING` | `0.5` / `true` / `true` | How the model gates and sizes trades (see [ml/README.md](ml/README.md)) |
+| `PREDICTOR_SIGNAL_ENABLED` | `false` | **Signal mode**: the model itself generates trades (strategy id `predictor`) — target from the forecast, stop from ATR, strike/expiry from target/horizon in options mode. See [docs/xgboost-trading-plan.md](docs/xgboost-trading-plan.md) |
+| `MIN_TRADES_PER_DAY` / `FLOOR_TIME_ET` | `2` / `14:30` | Soft daily floor: after this ET time, if behind, thresholds relax to the `*_FLOOR` values (still positive-edge only) |
+| `STRIKE_MODE` / `OPTIONS_DTE_BUFFER` | `between` / `2` | Options shaping: strike aimed at spot↔target midpoint; expiry = forecast horizon + buffer |
 
 The dashboard writes runtime toggles (router on/off, active strategies,
 crypto symbols, consensus, options mode) to `bot-config.json`, which the bot
