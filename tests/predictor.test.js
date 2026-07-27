@@ -4,6 +4,7 @@ import { extractFeatures, FEATURE_NAMES, FEATURE_COUNT } from "../ml/features.js
 import { predict } from "../ml/predictor.js";
 import { screenWatchlist } from "../ml/screener.js";
 import { compileModel, predictRaw } from "../ml/xgb-runtime.js";
+import { checkSignal as predictorSignal, evaluatePrediction, effectiveThresholds, meta as predictorMeta } from "../strategies/predictor-strat.js";
 
 // Build synthetic bars from a list of closes; range is ±0.1% around close.
 function mkBars(closes, vol = 1000) {
@@ -103,6 +104,72 @@ test("xgb-runtime walks a two-tree booster correctly", () => {
   assert.ok(Math.abs(predictRaw(compiled, [5, 9]) - (-0.75)) < 1e-9);
   // f0=20 (>=10 → 2), f1=1 (<5 → 0.25): 0.5 + 2 + 0.25 = 2.75
   assert.ok(Math.abs(predictRaw(compiled, [20, 1]) - 2.75) < 1e-9);
+});
+
+// ── predictor strategy (signal generator) ──────────────────────────────────────
+
+test("predictor strategy fires a well-formed signal on a strong trend", () => {
+  // Loose thresholds so the heuristic's uptrend read clears them
+  const sig = predictorSignal(RISING, { ...predictorMeta.params, minEdge: 0.01, minConfidence: 0.1 });
+  assert.ok(sig, "expected a signal on a strong uptrend");
+  assert.equal(sig.side, "buy");
+  assert.ok(sig.target > sig.entry, "long target must be above entry");
+  assert.ok(sig.stop < sig.entry, "long stop must be below entry");
+  assert.equal(sig.entrySignal, "predictor");
+  assert.ok(sig.prediction && sig.prediction.confidence > 0);
+});
+
+test("predictor strategy shorts a downtrend with stop above entry", () => {
+  const sig = predictorSignal(FALLING, { ...predictorMeta.params, minEdge: 0.01, minConfidence: 0.1 });
+  assert.ok(sig);
+  assert.equal(sig.side, "sell");
+  assert.ok(sig.target < sig.entry);
+  assert.ok(sig.stop > sig.entry);
+});
+
+test("predictor strategy returns null below thresholds, with the reason", () => {
+  const ev = evaluatePrediction(FLAT, { ...predictorMeta.params, minEdge: 99, minConfidence: 0.99 });
+  assert.equal(ev.signal, null);
+  assert.equal(ev.wouldFire, false);
+  assert.ok(ev.skipReason, "skip reason should be populated");
+});
+
+test("predictor strategy returns null on insufficient bars", () => {
+  const ev = evaluatePrediction(mkBars([100, 101, 102]));
+  assert.equal(ev.signal, null);
+  assert.match(ev.skipReason, /insufficient/);
+});
+
+// ── daily-floor threshold tiers ────────────────────────────────────────────────
+
+const FLOOR_CFG = {
+  minTradesPerDay: 2,
+  floorTimeMins: 14 * 60 + 30,
+  base:  { minEdge: 0.35, minConfidence: 0.55 },
+  floor: { minEdge: 0.15, minConfidence: 0.35 },
+};
+
+test("floor: tier 1 (strict) before the floor time even when behind", () => {
+  const t = effectiveThresholds({ ...FLOOR_CFG, etMins: 10 * 60, tradesToday: 0 });
+  assert.equal(t.tier, 1);
+  assert.equal(t.minEdge, 0.35);
+});
+
+test("floor: tier 2 (relaxed) after floor time when behind the daily minimum", () => {
+  const t = effectiveThresholds({ ...FLOOR_CFG, etMins: 15 * 60, tradesToday: 1 });
+  assert.equal(t.tier, 2);
+  assert.equal(t.minEdge, 0.15);
+  assert.equal(t.minConfidence, 0.35);
+});
+
+test("floor: stays tier 1 after floor time once the minimum is met", () => {
+  const t = effectiveThresholds({ ...FLOOR_CFG, etMins: 15 * 60, tradesToday: 2 });
+  assert.equal(t.tier, 1);
+});
+
+test("floor: disabled when minTradesPerDay is 0", () => {
+  const t = effectiveThresholds({ ...FLOOR_CFG, minTradesPerDay: 0, etMins: 15 * 60, tradesToday: 0 });
+  assert.equal(t.tier, 1);
 });
 
 test("xgb-runtime sends NaN features down the missing branch", () => {
