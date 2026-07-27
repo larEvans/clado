@@ -5,11 +5,13 @@ reliably produces **≥ 2 trades/day** across the watchlist, wire in a research-
 path toward profitability, and surface price targets / potential trades / taken trades
 on the dashboard.
 
-**Watchlist:** SPY, TSLA, QQQ, MSFT, META, + one more (see note below).
+**Watchlist (final):** SPY, TSLA, QQQ, MSFT, META — 5 symbols. *(SPCX dropped: SpaceX
+is private / not tradeable. All 5 remaining have deep, liquid weekly options.)*
 
-> ⚠️ **"SPCX" is not a tradeable ticker.** SpaceX is a private company — there is no
-> stock/option for it on Alpaca. Options that were likely meant: **SPCE** (Virgin
-> Galactic), **SPXL** (3× S&P ETF), or just drop it. Confirm before build.
+**Execution (final): OPTIONS-FIRST.** Every predictor signal routes through the Options
+Strategist (`agents-options.js` → `planOptionsTrade`) and buys a call (long) or put
+(short). Shares are the fallback only if no clean contract qualifies. This is the whole
+point of a price-target model: the forecast **target → strike** and **horizon → expiry**.
 
 ---
 
@@ -68,6 +70,31 @@ Design points:
    `"predictor"` (the model already generated it — don't let it veto itself).
 4. Keep the existing gates (capacity, daily-loss, one-position-per-symbol) — those are
    sound risk controls.
+
+### Options execution path (PRIORITY)
+`OPTIONS_MODE=true` becomes the default operating mode for this strategy. For every
+predictor signal, `enterRouterTrade` already passes the prediction into
+`planOptionsTrade` — build on that:
+
+1. **Strike from target:** pick the strike nearest the model's `priceTarget` (slightly
+   ITM of the target for higher delta / lower theta bleed; make this a config
+   `STRIKE_MODE=atm|target|between`, default `between` = midway between spot and target).
+2. **Expiry from horizon:** DTE = `prediction.horizonDays` **+ buffer** (default +2
+   days) so theta doesn't strangle the trade if the move takes the full horizon.
+   Weeklies exist for all 5 symbols, so granularity is fine.
+3. **Contract quality gates (reject if):** spread > 10% of mid, open interest < 500,
+   premium > `OPTIONS_MAX_PREMIUM`, delta outside 0.35–0.70. The existing
+   `agents-options.js` checks most of this — verify and tighten.
+4. **Options-aware exits:** keep the existing profit-target %, max-loss %, time-exit,
+   and IV-crush triggers from `shouldExitOption`; scale profit-target/max-loss with DTE
+   (already implemented — verify against predictor horizons).
+5. **Fallback:** if no contract passes the gates, EITHER skip (default) or fall back to
+   shares (`OPTIONS_FALLBACK=skip|shares`, default `skip` — a bad contract is worse
+   than no trade; the existing code falls back to stock on *planning errors* only,
+   keep that distinction).
+6. **Sizing:** contracts = floor(risk budget / (premium × 100)), min 1, capped by
+   `OPTIONS_MAX_PREMIUM` and the 1%-risk rule. Confidence scales the risk budget
+   (0.75×–1.25×) exactly like the stock path.
 
 ---
 
@@ -150,7 +177,9 @@ Three dashboard views (extend the existing 🔮 Screener tab or add a "Predictio
    weren't taken (capacity, already in position, below floor). Shows *why* skipped.
 3. **Trades Taken** — executed trades joined to the **prediction that drove them**
    (target vs. actual, confidence, hit/stop/near-target outcome). Pull from the existing
-   trade log + `predictions.json`.
+   trade log + `predictions.json`. **Options columns:** contract symbol, type
+   (call/put), strike, expiry/DTE, premium paid, current premium, option P&L % —
+   alongside the underlying's price-vs-target progress.
 
 New endpoint `GET /api/predictions` in `dashboard.js` serving the three sections from
 `predictions.json` + trade history. Add auto-refresh (the tab already has a Refresh
@@ -164,11 +193,19 @@ button pattern).
 PREDICTOR_SIGNAL_ENABLED=true     # predictor generates signals (not just gates)
 PREDICTOR_MIN_EDGE=0.35           # min |expReturn%| × confidence to fire
 PREDICTOR_MIN_CONFIDENCE=0.55     # min model confidence to fire
-STOP_ATR_MULT=1.5                 # stop distance = ATR × this
+STOP_ATR_MULT=1.5                 # underlying stop distance = ATR × this
 MIN_TRADES_PER_DAY=2              # daily floor
 FORCE_MIN_TRADES=false            # false = soft target, true = guarantee (lower EV)
 FLOOR_TIME_ET=14:30               # when Tier-2 relaxation kicks in
 PREDICTOR_MIN_EDGE_FLOOR=0.15     # relaxed threshold for the floor
+
+# Options-first execution
+OPTIONS_MODE=true                 # route predictor signals through options
+STRIKE_MODE=between               # atm | target | between (spot↔target midpoint)
+OPTIONS_DTE_BUFFER=2              # expiry = horizonDays + this
+OPTIONS_FALLBACK=skip             # skip | shares when no contract qualifies
+OPTIONS_MAX_SPREAD_PCT=10         # reject if bid/ask spread > 10% of mid
+OPTIONS_MIN_OI=500                # reject if open interest below this
 ```
 
 ---
@@ -179,8 +216,12 @@ PREDICTOR_MIN_EDGE_FLOOR=0.15     # relaxed threshold for the floor
   signal above it, correct side/stop/target (extend `tests/predictor.test.js`).
 - Unit: daily-floor logic (Tier 2 fires only when short and only on positive edge).
 - Backtest: predictor strategy over ≥ 1yr, report trades/day, win rate, expectancy, Sharpe.
+- **Options backtest:** re-run through the existing year-options backtest path
+  (`/api/backtest/year-options`) so premium decay/IV effects are in the P&L, not just
+  underlying moves — options P&L ≠ stock P&L.
 - CPCV: confirm the edge survives purged cross-validation.
-- Paper: run `PAPER_TRADING=true` and verify ≥ 2 trades/day appear in "Trades Taken".
+- Paper: run `PAPER_TRADING=true` + `OPTIONS_MODE=true`; verify ≥ 2 trades/day appear
+  in "Trades Taken" **with contract details populated**.
 
 ---
 
@@ -202,13 +243,15 @@ PREDICTOR_MIN_EDGE_FLOOR=0.15     # relaxed threshold for the floor
 
 ---
 
-## 9. Decisions to confirm before build (defaults in **bold**)
+## 9. Decisions
 
-1. **6th ticker:** replace SPCX with **SPCE** / SPXL / drop? *(SpaceX isn't tradeable.)*
-2. **Instrument:** trade **shares** or route through options (`OPTIONS_MODE`)? Options
-   need the strike/expiry logic already stubbed in `agents-options.js`.
+**RESOLVED by owner:**
+1. ~~6th ticker~~ → **dropped; final watchlist is 5 symbols** (SPY, TSLA, QQQ, MSFT, META).
+2. ~~Instrument~~ → **OPTIONS-FIRST** (calls/puts via the Options Strategist; §2 options path).
+
+**Remaining (defaults in bold — build with defaults unless owner overrides):**
 3. **Daily floor:** **soft target** (aim for 2, keep EV) or hard `FORCE_MIN_TRADES`?
 4. **Risk/trade:** default **1% of `PORTFOLIO_VALUE_USD`** per position — confirm size.
-5. **Model:** keep the single global model, or move to **per-symbol** models?
+5. **Model:** keep the **single global model**, or move to per-symbol models?
 ```
 ```
