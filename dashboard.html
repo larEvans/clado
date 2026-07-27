@@ -270,7 +270,7 @@
   <div class="section">
     <div class="section-header" style="justify-content:space-between">
       Live Bot Status
-      <span style="font-size:11px;font-weight:400;color:var(--muted)">run <code>node bot-stream.js</code> to start</span>
+      <span id="bot-alive-pill" style="font-size:11px;font-weight:600;color:var(--muted)">checking…</span>
     </div>
     <div class="bot-grid">
       <div class="metric"><div class="m-label">Today's Trade</div><div class="m-value" id="bot-traded" style="font-size:16px">—</div></div>
@@ -1702,6 +1702,20 @@ async function loadBotStatus() {
     const d = await fetch("/api/bot-status").then(r => r.json());
 
     const state = d.state;
+
+    // Liveness pill — from the bot's 60s heartbeat file, independent of bars
+    const pill = document.getElementById("bot-alive-pill");
+    if (pill) {
+      const hb = d.heartbeat;
+      if (hb?.alive) {
+        const modes = [hb.routerEnabled ? 'router' : 'single', hb.predictorSignal ? 'predictor' : null, hb.optionsMode ? 'options' : null, hb.paper ? 'PAPER' : 'LIVE $'].filter(Boolean).join(' · ');
+        pill.innerHTML = `<span style="color:var(--green)">● RUNNING</span> <span style="font-weight:400;color:var(--muted)">${modes} · ${hb.symbols?.length || 0} symbols</span>`;
+      } else if (hb) {
+        pill.innerHTML = `<span style="color:var(--red)">● NOT RUNNING</span> <span style="font-weight:400;color:var(--muted)">last heartbeat ${Math.round(hb.ageSec / 60)}m ago — check the bot service on Railway</span>`;
+      } else {
+        pill.innerHTML = `<span style="color:var(--red)">● NEVER STARTED</span> <span style="font-weight:400;color:var(--muted)">bot-stream has never run against this data dir — check Railway start command runs <code>node start.js</code></span>`;
+      }
+    }
 
     // Top metrics
     const traded = state?.tradedToday;

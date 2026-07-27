@@ -705,6 +705,18 @@ app.get("/api/bot-status", (req, res) => {
   try { if (existsSync(historyFile)) history = JSON.parse(readFileSync(historyFile, "utf8")); } catch {}
   try { learning = loadAllLearning(); } catch {}
 
+  // Bot process liveness — bot-stream writes bot-heartbeat.json every 60s
+  // regardless of market hours. alive = heartbeat fresher than 3 minutes.
+  let heartbeat = null;
+  try {
+    const hbFile = dataPath("bot-heartbeat.json");
+    if (existsSync(hbFile)) {
+      const hb = JSON.parse(readFileSync(hbFile, "utf8"));
+      const ageSec = (Date.now() - new Date(hb.at).getTime()) / 1000;
+      heartbeat = { ...hb, ageSec: Math.round(ageSec), alive: ageSec < 180 };
+    }
+  } catch {}
+
   const last20   = history.slice(-20);
   const wins     = last20.filter(t => t.win).length;
   const winRate  = last20.length > 0 ? wins / last20.length : null;
@@ -712,6 +724,7 @@ app.get("/api/bot-status", (req, res) => {
 
   res.json({
     state,
+    heartbeat,
     winRate,
     avgPnl:       avgPnl !== null ? +avgPnl.toFixed(3) : null,
     totalTrades:  history.length,

@@ -1202,6 +1202,26 @@ if (ROUTER_ENABLED()) {
   console.log(`[Bot] single-strategy mode (${STRATEGY} on ${SYMBOL}) — toggle Router ON in dashboard or set ROUTER_ENABLED=true to multi-strategy route`);
 }
 
+// ── Heartbeat — proves the bot PROCESS is alive even when no bars arrive ──────
+// (bars stop overnight/weekends, so state-file mtimes go stale while the
+// process is perfectly healthy; the dashboard's status pill reads this file.)
+const HEARTBEAT_FILE = dataPath("bot-heartbeat.json");
+function writeHeartbeat() {
+  try {
+    writeFileSync(HEARTBEAT_FILE, JSON.stringify({
+      at:              new Date().toISOString(),
+      pid:             process.pid,
+      routerEnabled:   ROUTER_ENABLED(),
+      predictorSignal: PREDICTOR_SIGNAL_ENABLED(),
+      optionsMode:     OPTIONS_MODE(),
+      paper:           IS_PAPER,
+      symbols:         resolvedSymbols,
+    }));
+  } catch {}
+}
+writeHeartbeat();
+setInterval(writeHeartbeat, 60_000);
+
 // Split symbols by feed: stocks go to the IEX stream, crypto to the v1beta3 stream.
 const stockSymbols  = resolvedSymbols.filter(s => !isCryptoSymbol(s));
 const cryptoSymbols = [...new Set([...resolvedSymbols.filter(isCryptoSymbol), ...CRYPTO_SYMBOLS])];
