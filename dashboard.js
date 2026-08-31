@@ -30,7 +30,7 @@ import { screenWatchlist } from "./ml/screener.js";
 import { modelInfo } from "./ml/predictor.js";
 import { checkSignal as smcCheckSignal } from "./strategies/smc.js";
 import { runHermesAnalysis, loadAllInsights, suggestParamChanges, explainTrades, deriveWinOnlyFilters } from "./hermes.js";
-import { dataPath } from "./state.js";
+import { dataPath, DATA_DIR } from "./state.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app  = express();
@@ -318,7 +318,6 @@ app.get("/api/diag", async (req, res) => {
       ALPACA_SECRET_KEY: keySec   ? `set (len=${keySec.length})`                                  : "MISSING",
       ALPACA_BASE_URL:   baseRaw  || "(unset — using default)",
       STRATEGY:          process.env.STRATEGY        || "(unset — defaults to orb)",
-      SYMBOL:            process.env.SYMBOL          || "(unset)",
       PAPER_TRADING:     process.env.PAPER_TRADING   || "(unset)",
     },
     normalizedBase: ALPACA_BASE,
@@ -340,6 +339,45 @@ app.get("/api/diag", async (req, res) => {
   }
   if (!keyId || !keySec) {
     diag.hints.push("ALPACA_API_KEY or ALPACA_SECRET_KEY is missing on Railway — set both under Variables and redeploy.");
+  }
+
+  // ── Does this dashboard process share a filesystem with bot-stream.js? ──
+  // If Railway runs them as TWO SEPARATE SERVICES instead of one service
+  // running `node start.js` (which spawns both as children), each gets its
+  // own private ephemeral disk. Config toggles/predictions written here would
+  // then never reach the bot process, and vice versa — the #1 cause of "I
+  // turned the bot on but the dashboard still shows it off."
+  const hbFile     = dataPath("bot-heartbeat.json");
+  const cfgFile    = dataPath("bot-config.json");
+  let heartbeat = null, heartbeatAgeSec = null;
+  try {
+    if (existsSync(hbFile)) {
+      heartbeat = JSON.parse(readFileSync(hbFile, "utf8"));
+      heartbeatAgeSec = Math.round((Date.now() - new Date(heartbeat.at).getTime()) / 1000);
+    }
+  } catch {}
+  diag.sharedFilesystem = {
+    DATA_DIR: DATA_DIR,
+    heartbeatFile: hbFile,
+    heartbeatFound: !!heartbeat,
+    heartbeatAgeSec,
+    heartbeatAlive: heartbeatAgeSec != null && heartbeatAgeSec < 180,
+    configFile: cfgFile,
+    configFound: existsSync(cfgFile),
+  };
+  if (!heartbeat) {
+    diag.hints.push(
+      "No bot-heartbeat.json found in this process's DATA_DIR. Either bot-stream.js has never run, " +
+      "or — very common — Railway is running dashboard.js and bot-stream.js as TWO SEPARATE SERVICES " +
+      "(e.g. from an old Procfile with 'web:' and 'bot:' process types). Each service gets its own " +
+      "private disk, so they can never see each other's state files or config toggles. Fix: make sure " +
+      "Railway has exactly ONE service for this repo, with start command `node start.js` (see railway.json) " +
+      "— that single process spawns BOTH bot-stream.js and dashboard.js as children sharing one filesystem. " +
+      "If you see two services (e.g. 'web' and 'bot') in the Railway project, delete one and keep only the " +
+      "one running start.js, or set DATA_DIR on both to the SAME mounted volume."
+    );
+  } else if (heartbeatAgeSec >= 180) {
+    diag.hints.push(`Last bot heartbeat was ${Math.round(heartbeatAgeSec / 60)} minutes ago — the bot process appears to have stopped. Check the Railway logs for that service.`);
   }
 
   // Probe — try /v2/account and /v2/clock (clock works without auth scope issues)
