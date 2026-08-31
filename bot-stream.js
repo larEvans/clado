@@ -170,7 +170,10 @@ function dailyLossHalted() {
   return dayPnl.halted && dayPnl.date === todayET(new Date());
 }
 
-const SYMBOL      = (process.env.SYMBOL   || "SPY").toUpperCase();
+// Traded symbols come from the Alpaca watchlist — the single source of truth.
+// SYMBOL is resolved at startup (single-strategy mode uses the first watchlist
+// entry); there is no env fallback, so the watchlist alone decides what trades.
+let SYMBOL        = null;
 const STRATEGY    = (process.env.STRATEGY || "hybrid").toLowerCase();
 const TRADE_USD   = parseFloat(process.env.MAX_TRADE_SIZE_USD || "200");
 function normalizeAlpacaBase(raw) {
@@ -542,6 +545,7 @@ async function closePosition(pos, exitPrice, exitReason) {
     symbol:     pos.symbol,
     strategy:   pos.strategy,
     side:       pos.side,
+    source:     IS_PAPER ? "paper" : "live",
     entryPrice: pos.entryPrice,
     exitPrice,
     entryTime:  pos.entryTime,
@@ -647,7 +651,7 @@ async function onBar(bar) {
 
 console.log("=".repeat(60));
 console.log("  Alpaca Streaming Bot");
-console.log(`  Symbol   : ${SYMBOL}`);
+console.log(`  Symbols  : (resolved from Alpaca watchlist at startup)`);
 console.log(`  Strategy : ${STRATEGY}`);
 console.log(`  Trade $  : $${TRADE_USD}`);
 console.log(`  Mode     : ${IS_PAPER ? "PAPER (no orders sent)" : "ORDERS ENABLED"}`);
@@ -673,7 +677,7 @@ if (!IS_PAPER && describeAlpacaAccount(ALPACA_BASE) === "PAPER ACCOUNT") {
 const startParams = loadLearnedParams(STRATEGY) || getDefaultParams(STRATEGY);
 console.log(`[Bot] Active ${STRATEGY} params:`, startParams);
 
-saveState({ symbol: SYMBOL, strategy: STRATEGY, botStarted: new Date().toISOString(), routerEnabled: ROUTER_ENABLED() });
+saveState({ symbol: null, strategy: STRATEGY, botStarted: new Date().toISOString(), routerEnabled: ROUTER_ENABLED() });
 
 // ── Router mode: multi-symbol per-bar regime-based dispatch ─────────────────
 //
@@ -1145,6 +1149,7 @@ async function closeRouterPosition(sym, exitPrice, exitReason) {
   const hourET = etMinutesOf(new Date(pos.entryTime || Date.now())) / 60 | 0;
   const { pnlPct } = recordTradeClosed({
     symbol: sym, strategy: pos.strategy, side: pos.side,
+    source: IS_PAPER ? "paper" : "live",
     entryPrice: pos.entry, exitPrice,
     entryTime: pos.entryTime, exitTime: new Date().toISOString(),
     exitReason,
@@ -1178,28 +1183,47 @@ async function closeRouterPosition(sym, exitPrice, exitReason) {
 
 // ── Wire up the stream ────────────────────────────────────────────────────────
 
-let resolvedSymbols = [SYMBOL];
+// The Alpaca watchlist is the ONLY source of traded stock symbols — no env
+// fallback. Manage it from the dashboard (Account tab) or the Alpaca app.
+async function fetchWatchlistSymbols() {
+  const wlRes = await fetch(`${ALPACA_BASE}/v2/watchlists`, { headers: ALPACA_HEADERS });
+  const wl    = wlRes.ok ? await wlRes.json() : [];
+  if (!wl?.length) return [];
+  const detailRes = await fetch(`${ALPACA_BASE}/v2/watchlists/${wl[0].id}`, { headers: ALPACA_HEADERS });
+  const detail    = detailRes.ok ? await detailRes.json() : { assets: [] };
+  return (detail.assets || []).map(a => a.symbol).filter(Boolean);
+}
+
+let resolvedSymbols = [];
+try {
+  resolvedSymbols = await fetchWatchlistSymbols();
+} catch (e) { console.warn("[Bot] watchlist fetch failed:", e.message); }
+
 if (ROUTER_ENABLED()) {
-  console.log(`[Router] ENABLED — strategies: ${ACTIVE_STRATS().join(", ")} — fetching watchlist…`);
+  console.log(`[Router] ENABLED — strategies: ${ACTIVE_STRATS().join(", ")}`);
   if (PREDICTOR_ENABLED()) {
     console.log(`[Predictor] gate ENABLED — engine: ${hasModel() ? "XGBoost model" : "heuristic baseline (no model.json yet — see ml/README.md)"} · min-conf ${PREDICTOR_MIN_CONF()} · veto ${PREDICTOR_VETO()} · size-scaling ${PREDICTOR_SIZE_SCALING()}`);
   }
   if (PREDICTOR_SIGNAL_ENABLED()) {
     console.log(`[Predictor] SIGNAL MODE — the model generates trades: minEdge ${runtimeCfg.predictorMinEdge} · minConf ${runtimeCfg.predictorSignalMinConf} · floor ${MIN_TRADES_PER_DAY()}/day after ${runtimeCfg.floorTimeET} ET (edge ≥ ${runtimeCfg.predictorMinEdgeFloor}) · strike ${STRIKE_MODE()} · DTE +${OPTIONS_DTE_BUFFER()}`);
   }
-  try {
-    const wlRes = await fetch(`${ALPACA_BASE}/v2/watchlists`, { headers: ALPACA_HEADERS });
-    const wl    = wlRes.ok ? await wlRes.json() : [];
-    if (wl?.length) {
-      const detailRes = await fetch(`${ALPACA_BASE}/v2/watchlists/${wl[0].id}`, { headers: ALPACA_HEADERS });
-      const detail    = detailRes.ok ? await detailRes.json() : { assets: [] };
-      const syms      = (detail.assets || []).map(a => a.symbol).filter(Boolean);
-      if (syms.length) resolvedSymbols = syms;
-    }
-  } catch (e) { console.warn("[Router] watchlist fetch failed:", e.message); }
-  console.log(`[Router] subscribing to ${resolvedSymbols.length} symbols: ${resolvedSymbols.join(", ")}`);
+  console.log(`[Router] subscribing to ${resolvedSymbols.length} watchlist symbols: ${resolvedSymbols.join(", ") || "(none)"}`);
 } else {
-  console.log(`[Bot] single-strategy mode (${STRATEGY} on ${SYMBOL}) — toggle Router ON in dashboard or set ROUTER_ENABLED=true to multi-strategy route`);
+  // Single-strategy mode trades the FIRST watchlist symbol.
+  SYMBOL = resolvedSymbols[0] || null;
+  resolvedSymbols = SYMBOL ? [SYMBOL] : [];
+  console.log(SYMBOL
+    ? `[Bot] single-strategy mode (${STRATEGY} on ${SYMBOL} — first watchlist symbol) — toggle Router ON for multi-strategy routing`
+    : `[Bot] single-strategy mode, but the Alpaca watchlist is empty — nothing to trade`);
+  if (SYMBOL) saveState({ symbol: SYMBOL });
+}
+
+if (resolvedSymbols.length === 0 && CRYPTO_SYMBOLS.length === 0) {
+  console.error("═".repeat(60));
+  console.error("[Bot] NO SYMBOLS TO TRADE — your Alpaca watchlist is empty.");
+  console.error("[Bot] Add symbols (e.g. SPY, TSLA, QQQ, MSFT, META) in the");
+  console.error("[Bot] dashboard's Account tab or the Alpaca app, then restart.");
+  console.error("═".repeat(60));
 }
 
 // ── Heartbeat — proves the bot PROCESS is alive even when no bars arrive ──────

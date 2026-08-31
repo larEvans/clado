@@ -723,7 +723,7 @@ app.get("/api/watchlist", async (req, res) => {
 
 if (!process.env.NO_DASHBOARD_STREAM && process.env.ALPACA_API_KEY && process.env.ALPACA_SECRET_KEY) {
   (async () => {
-    let symbols = [process.env.SYMBOL || "SPY"];
+    let symbols = [];
     try {
       const lists = await alpaca("/v2/watchlists");
       if (lists?.length) {
@@ -731,7 +731,8 @@ if (!process.env.NO_DASHBOARD_STREAM && process.env.ALPACA_API_KEY && process.en
         const wl      = (detail.assets || []).map(a => a.symbol).filter(Boolean);
         if (wl.length) { symbols = wl; console.log(`[Stream] Watchlist symbols: ${wl.join(", ")}`); }
       }
-    } catch (e) { console.warn("[Stream] Watchlist fetch failed, using", symbols.join(","), "—", e.message); }
+    } catch (e) { console.warn("[Stream] Watchlist fetch failed —", e.message); }
+    if (symbols.length === 0) { console.warn("[Stream] Alpaca watchlist is empty — no live price stream"); return; }
 
     const liveStream = new AlpacaStream(symbols);
     liveStream.on("bar",          bar   => broadcastSSE({ type: "bar",   ...bar }));
@@ -769,7 +770,13 @@ app.get("/api/bot-status", (req, res) => {
     }
   } catch {}
 
-  const last20   = history.slice(-20);
+  // "Live Bot Status" must reflect only trades the bot actually EXECUTED
+  // (paper or live). Backtest bootstrap writes simulated trades into the same
+  // trade-history.json (source:"backtest") to seed the router's regime stats —
+  // those must never appear here as if real money/paper orders happened.
+  const executed = history.filter(t => t.source !== "backtest");
+
+  const last20   = executed.slice(-20);
   const wins     = last20.filter(t => t.win).length;
   const winRate  = last20.length > 0 ? wins / last20.length : null;
   const avgPnl   = last20.length > 0 ? last20.reduce((s, t) => s + t.pnlPct, 0) / last20.length : null;
@@ -779,8 +786,9 @@ app.get("/api/bot-status", (req, res) => {
     heartbeat,
     winRate,
     avgPnl:       avgPnl !== null ? +avgPnl.toFixed(3) : null,
-    totalTrades:  history.length,
-    recentTrades: history.slice(-10).reverse(),
+    totalTrades:  executed.length,
+    backtestTrades: history.length - executed.length, // seeded stats, not executions
+    recentTrades: executed.slice(-10).reverse(),
     learning,
   });
 });
@@ -859,7 +867,7 @@ app.get("/api/daily-signals", async (req, res) => {
           symbols = (detail.assets || []).map(a => a.symbol).filter(Boolean);
         }
       } catch {}
-      if (!symbols?.length) symbols = [process.env.SYMBOL || "SPY"];
+      if (!symbols?.length) symbols = [];  // watchlist is the only source — no env fallback
     }
 
     const tf = TIMEFRAMES[strategy] || "5m";
@@ -926,7 +934,7 @@ app.post("/api/backtest/year-options", async (req, res) => {
           symbols = (detail.assets || []).map(a => a.symbol).filter(Boolean);
         }
       } catch {}
-      if (!symbols?.length) symbols = [process.env.SYMBOL || "SPY"];
+      if (!symbols?.length) symbols = [];  // watchlist is the only source — no env fallback
     }
 
     console.log(`[YearOptions] ${strategies.length} strategies × ${symbols.length} symbols × 1y of 5m bars in options mode`);
@@ -1125,7 +1133,7 @@ app.get("/api/router/state", async (req, res) => {
         symbols = (detail.assets || []).map(a => a.symbol).filter(Boolean);
       }
     } catch {}
-    if (!symbols?.length) symbols = [process.env.SYMBOL || "SPY"];
+    if (!symbols?.length) symbols = [];  // watchlist is the only source — no env fallback
 
     // For each symbol, fetch recent 5m bars (~5 days) and classify regime
     const tf = "5m";
@@ -1181,7 +1189,7 @@ app.get("/api/screener", async (req, res) => {
         symbols = (detail.assets || []).map(a => a.symbol).filter(Boolean);
       }
     } catch {}
-    if (!symbols?.length) symbols = [process.env.SYMBOL || "SPY"];
+    if (!symbols?.length) symbols = [];  // watchlist is the only source — no env fallback
 
     const interval = req.query.interval || process.env.PREDICTOR_INTERVAL || "5m";
     const rows = await Promise.all(symbols.map(async sym => {
@@ -1236,6 +1244,7 @@ app.get("/api/predictions", (req, res) => {
       try {
         const history = JSON.parse(readFileSync(histFile, "utf8"));
         taken = history
+          .filter(t => t.source !== "backtest")
           .filter(t => t.strategy === "predictor" || t.prediction)
           .slice(-100)
           .reverse()
@@ -1285,7 +1294,7 @@ app.post("/api/router/backtest-all", async (req, res) => {
           symbols = (detail.assets || []).map(a => a.symbol).filter(Boolean);
         }
       } catch {}
-      if (!symbols?.length) symbols = [process.env.SYMBOL || "SPY"];
+      if (!symbols?.length) symbols = [];  // watchlist is the only source — no env fallback
     }
 
     console.log(`[Router] bootstrap: ${strategies.length} strategies × ${symbols.length} symbols`);

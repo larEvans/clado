@@ -127,7 +127,7 @@ annotated list). The important ones:
 | `DASHBOARD_TOKEN` | *(empty)* | **Set this on any internet-reachable deployment.** Protects the whole dashboard; open `/?token=...` once or send an `x-dashboard-token` header |
 | `ROUTER_ENABLED` | `true` | Multi-strategy router vs. single-strategy mode |
 | `ACTIVE_STRATEGIES` | `hybrid,hybrid10,smc,...` | Comma list of strategy IDs the router evaluates |
-| `STRATEGY` / `SYMBOL` / `TIMEFRAME` | `hybrid` / `SPY` / `1H` | Single-strategy mode settings |
+| `STRATEGY` / `TIMEFRAME` | `hybrid` / `1H` | Single-strategy mode settings (trades the first Alpaca-watchlist symbol; there is no `SYMBOL` env var) |
 | `CRYPTO_SYMBOLS` | *(empty)* | e.g. `BTC/USD,ETH/USD` — adds a 24/7 crypto stream |
 | `CONSENSUS_MIN` | `1` | Require ≥ N strategies agreeing on a side before trading |
 | `MAX_CONCURRENT_POSITIONS` | `5` | Open-position cap |

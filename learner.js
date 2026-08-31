@@ -247,6 +247,11 @@ export function recordTradeClosed({
   entryPrice, exitPrice,
   entryTime, exitTime, exitReason,
   regime = null, hourET = null,
+  // Provenance: "paper" | "live" from the bot. Backtest-seeded records are
+  // written elsewhere with source:"backtest" — dashboards filter on this so
+  // simulated trades never masquerade as executed ones.
+  source = "bot",
+  prediction = null,
   // Options-specific (passed when pos.isOption is true)
   isOption = false, contractSymbol = null,
   optionType = null, optionStrike = null,
@@ -289,6 +294,8 @@ export function recordTradeClosed({
     win,
     entryTime, exitTime, exitReason,
     regime, hourET,
+    source,
+    ...(prediction ? { prediction } : {}),
     ...(isOption ? {
       isOption: true, contractSymbol,
       optionType, optionStrike,
