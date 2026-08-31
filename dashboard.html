@@ -2258,7 +2258,9 @@ async function addStock() {
     const r = await fetch("/api/watchlist/add", { method: "POST", headers: { "Content-Type":"application/json" }, body: JSON.stringify({ symbol: sym }) }).then(r => r.json());
     if (r.error) return flashStatus("Add failed: " + r.error);
     document.getElementById("add-stock").value = "";
-    flashStatus(`${sym} added to watchlist · restart bot-stream service to apply`);
+    flashStatus(r.created
+      ? `${sym} added · created a new watchlist for the bot · restart bot-stream service to apply`
+      : `${sym} added to watchlist · restart bot-stream service to apply`);
     loadActiveSymbols();
   } catch (e) { flashStatus("Error: " + e.message); }
 }

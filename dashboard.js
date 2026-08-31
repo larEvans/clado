@@ -199,14 +199,28 @@ app.patch("/api/config", (req, res) => {
   res.json({ ok: true, config: next, restartRequired, changed: Object.keys(patch) });
 });
 
-// Add a stock to the user's Alpaca watchlist (first watchlist for now)
+// Add a stock to the user's Alpaca watchlist (first watchlist for now).
+// If the account has no watchlist yet via the /v2/watchlists REST resource
+// (e.g. a list built in Alpaca's newer web UI doesn't always show up here),
+// create one automatically instead of erroring out — the dashboard becomes
+// the reliable source of truth rather than depending on Alpaca's UI quirks.
 app.post("/api/watchlist/add", async (req, res) => {
   const symbol = String(req.body?.symbol || "").trim().toUpperCase();
   if (!symbol) return res.status(400).json({ error: "symbol required" });
   if (symbol.includes("/")) return res.status(400).json({ error: "Crypto symbols (with /) belong in the Crypto Symbols section, not the stock watchlist" });
   try {
     const lists = await alpaca("/v2/watchlists");
-    if (!lists?.length) return res.status(404).json({ error: "No Alpaca watchlist exists — create one in the Alpaca dashboard first" });
+    if (!lists?.length) {
+      // No watchlist visible via the Trading API — create one now.
+      const r = await fetch(`${ALPACA_BASE}/v2/watchlists`, {
+        method: "POST",
+        headers: ALPACA_HEADERS,
+        body:    JSON.stringify({ name: "Bot Watchlist", symbols: [symbol] }),
+      });
+      const data = await r.json();
+      if (!r.ok) return res.status(r.status).json({ error: data?.message || JSON.stringify(data) });
+      return res.json({ ok: true, symbol, watchlistId: data.id, created: true, restartRequired: true });
+    }
     const wlId = lists[0].id;
     const r = await fetch(`${ALPACA_BASE}/v2/watchlists/${wlId}`, {
       method: "POST",
