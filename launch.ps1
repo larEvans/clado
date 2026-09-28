@@ -1,7 +1,7 @@
-# launch.ps1 - Start TradingView (CDP-enabled), Dashboard, and optionally Claude Code
+# launch.ps1 - Start TradingView (CDP-enabled), the trading bot + dashboard, and optionally Claude Code
 #
 # Usage:
-#   .\launch.ps1               -- launches TradingView + dashboard
+#   .\launch.ps1               -- launches TradingView + bot + dashboard
 #   .\launch.ps1 -WithClaude   -- also opens Claude Code
 
 param([switch]$WithClaude)
@@ -106,23 +106,39 @@ if ($tvExe) {
   Start-Sleep -Milliseconds 2000
 }
 
-# ---- 3. Start dashboard server ------------------------------------------------
+# ---- 3. Start bot + dashboard -------------------------------------------------
+# start.js runs BOTH bot-stream.js (the trading engine) and dashboard.js as
+# children sharing one filesystem, and restarts either if it crashes.
+# (Starting dashboard.js alone gives you a dashboard that never trades.)
 Write-Host ""
-Write-Host "  [3/4] Starting dashboard server (port $DASHBOARD_PORT)..." -ForegroundColor Cyan
+Write-Host "  [3/4] Starting trading bot + dashboard (port $DASHBOARD_PORT)..." -ForegroundColor Cyan
 
-Get-Process -Name "node" -ErrorAction SilentlyContinue | ForEach-Object {
-  try { $_.Kill() } catch { $_ = $null }
+if (-not (Test-Path (Join-Path $ROOT "node_modules"))) {
+  Write-Host "  node_modules missing - running npm install..." -ForegroundColor Yellow
+  Push-Location $ROOT; npm install; Pop-Location
 }
+
+# Stop only a previous run of THIS bot (node processes launched from this
+# folder) - never unrelated Node apps on the machine.
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.CommandLine -and $_.CommandLine.Contains($ROOT) } |
+  ForEach-Object {
+    Write-Host "  Stopping previous bot process (PID $($_.ProcessId))..." -ForegroundColor Yellow
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+  }
 Start-Sleep -Milliseconds 500
 
-$dashProc = Start-Process -FilePath "node" `
-  -ArgumentList (Join-Path $ROOT "dashboard.js") `
+Write-Host "  If this bot is ALSO deployed on Railway, stop the Railway service first -" -ForegroundColor Yellow
+Write-Host "  two copies on one Alpaca account will both place every trade." -ForegroundColor Yellow
+
+$botProc = Start-Process -FilePath "node" `
+  -ArgumentList "`"$(Join-Path $ROOT 'start.js')`"" `
   -WorkingDirectory $ROOT `
   -PassThru `
   -WindowStyle Normal
 
-Write-Host "  Dashboard server started (PID $($dashProc.Id))." -ForegroundColor Green
-Start-Sleep -Milliseconds 1500
+Write-Host "  Bot + dashboard started (PID $($botProc.Id)) - watch that window for [Router] / [Bot] logs." -ForegroundColor Green
+Start-Sleep -Milliseconds 2500
 
 # ---- 4. Claude Code (optional) ------------------------------------------------
 Write-Host ""

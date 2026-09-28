@@ -652,6 +652,15 @@
     <div class="section-header">✅ Trades Taken by the Model</div>
     <div id="pred-taken" class="tbl-wrap" style="padding:6px"></div>
   </div>
+
+  <div class="section" style="margin-top:12px">
+    <div class="section-header" style="display:flex;align-items:center;justify-content:space-between">
+      <span>📡 TradingView Alerts</span>
+      <span id="tv-status" style="font-size:11px;color:var(--muted)"></span>
+    </div>
+    <div id="tv-setup" style="font-size:12px;line-height:1.6;color:#cbd5e1;padding:8px 14px"></div>
+    <div id="tv-alerts" class="tbl-wrap" style="padding:6px"></div>
+  </div>
 </div>
 
 <!-- ══ OPTIONS BACKTEST PANEL ════════════════════════════════════════════════ -->
@@ -2443,6 +2452,46 @@ async function loadScreener() {
     status.innerHTML = '<span style="color:var(--red)">Request failed: ' + e.message + '</span>';
   }
   loadPredictions();
+  loadTvSignals();
+}
+
+// ─── TradingView alerts: setup instructions + recent webhook deliveries ──────
+async function loadTvSignals() {
+  const status = document.getElementById('tv-status');
+  const setup  = document.getElementById('tv-setup');
+  const body   = document.getElementById('tv-alerts');
+  if (!status) return;
+  try {
+    const d = await fetch('/api/tv-signals').then(r => r.json());
+    const url = location.origin + d.webhookPath;
+    const template = '{"secret":"YOUR_TV_WEBHOOK_SECRET","symbol":"{{ticker}}","action":"{{strategy.order.action}}","position":"{{strategy.market_position}}","price":{{close}}}';
+    status.innerHTML = d.enabled
+      ? '<span style="color:var(--green)">● webhook ON</span> · alerts expire after ' + d.maxAgeSec + 's'
+      : '<span style="color:var(--yellow)">● webhook OFF</span> — set TV_WEBHOOK_SECRET on Railway';
+    setup.innerHTML =
+      'In the TradingView app, create an alert → <strong>Notifications</strong> → tick <strong>Webhook URL</strong>:<br>' +
+      '<code style="user-select:all">' + url + '</code><br>' +
+      'Paste this into the alert <strong>Message</strong> (strategy alerts; for indicator alerts use <code>"action":"buy"</code>, <code>"sell"</code> or <code>"exit"</code> instead):<br>' +
+      '<code style="user-select:all;word-break:break-all">' + template.replace(/</g, '&lt;') + '</code>';
+    const alerts = d.alerts || [];
+    body.innerHTML = alerts.length === 0
+      ? '<div style="color:var(--muted);font-size:13px;padding:10px">No alerts received yet.</div>'
+      : '<table class="tbl" style="width:100%"><thead><tr><th>Received</th><th>Symbol</th><th>Action</th><th>Price</th><th>Stop / Target</th><th>Label</th><th>Status</th></tr></thead><tbody>' +
+        alerts.map(a => {
+          const c = a.side === 'buy' ? 'var(--green)' : a.side === 'sell' ? 'var(--red)' : 'var(--yellow)';
+          return '<tr>' +
+            '<td style="font-size:11px;color:var(--muted)">' + new Date(a.receivedAt).toLocaleTimeString() + '</td>' +
+            '<td style="font-weight:600">' + a.symbol + '</td>' +
+            '<td style="color:' + c + ';font-weight:600">' + a.side.toUpperCase() + '</td>' +
+            '<td>' + (a.price != null ? '$' + Number(a.price).toFixed(2) : '—') + '</td>' +
+            '<td>' + (a.stop != null ? '$' + a.stop : 'ATR') + ' / ' + (a.target != null ? '$' + a.target : 'auto') + '</td>' +
+            '<td style="font-size:11px">' + (a.strategy ? String(a.strategy).replace(/[&<>"']/g, ch => '&#' + ch.charCodeAt(0) + ';') : '—') + '</td>' +
+            '<td style="font-size:11px">' + (a.fresh ? '<span style="color:var(--green)">live — bot can act on it</span>' : '<span style="color:var(--muted)">expired</span>') + '</td>' +
+          '</tr>';
+        }).join('') + '</tbody></table>';
+  } catch (e) {
+    status.textContent = 'failed to load: ' + e.message;
+  }
 }
 
 // ─── Live predictions: bot's price targets, potential + taken trades ─────────

@@ -31,6 +31,7 @@ import { modelInfo } from "./ml/predictor.js";
 import { checkSignal as smcCheckSignal } from "./strategies/smc.js";
 import { runHermesAnalysis, loadAllInsights, suggestParamChanges, explainTrades, deriveWinOnlyFilters } from "./hermes.js";
 import { dataPath, DATA_DIR } from "./state.js";
+import { TV_ENABLED, TV_MAX_AGE_SEC, secretMatches, parseTvAlert, appendTvAlert, readTvAlerts, alertAgeSec } from "./tradingview.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app  = express();
@@ -67,6 +68,31 @@ app.use(express.json());
 // Unauthenticated liveness probe for Railway's healthcheck (must stay above
 // the auth middleware — the healthcheck has no token).
 app.get("/healthz", (req, res) => res.json({ ok: true }));
+
+// ─── TradingView webhook ──────────────────────────────────────────────────────
+// Also above the auth middleware: TradingView can't send custom headers, so it
+// authenticates with TV_WEBHOOK_SECRET inside the alert message body instead.
+// TradingView posts application/json when the message is valid JSON and
+// text/plain otherwise, so accept both.
+app.post("/webhook/tradingview", express.text({ type: "text/*" }), (req, res) => {
+  if (!TV_ENABLED()) return res.status(503).json({ error: "TradingView webhook disabled — set TV_WEBHOOK_SECRET" });
+  let body = req.body;
+  if (typeof body === "string") {
+    try { body = JSON.parse(body); } catch { return res.status(400).json({ error: "alert message is not valid JSON" }); }
+  }
+  if (!secretMatches(body?.secret)) {
+    console.warn(`[TradingView] rejected webhook from ${req.ip}: bad or missing secret`);
+    return res.status(401).json({ error: "bad secret" });
+  }
+  try {
+    const alert = appendTvAlert(parseTvAlert(body));
+    console.log(`[TradingView] alert: ${alert.side.toUpperCase()} ${alert.symbol}${alert.price != null ? ` @ ${alert.price}` : ""}${alert.strategy ? ` (${alert.strategy})` : ""}`);
+    res.json({ ok: true, id: alert.id, symbol: alert.symbol, side: alert.side });
+  } catch (e) {
+    console.warn(`[TradingView] invalid alert: ${e.message}`);
+    res.status(400).json({ error: e.message });
+  }
+});
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 //
@@ -1227,6 +1253,21 @@ app.get("/api/screener", async (req, res) => {
 // Three sections: price targets per symbol (from predictions.json, written by
 // bot-stream on every evaluation), potential trades (cleared threshold but not
 // taken / would fire), and trades taken by the predictor with target-vs-actual.
+// Recent TradingView alerts received by the webhook, newest first.
+app.get("/api/tv-signals", (req, res) => {
+  const maxAge = TV_MAX_AGE_SEC();
+  const now = Date.now();
+  res.json({
+    enabled:     TV_ENABLED(),
+    webhookPath: "/webhook/tradingview",
+    maxAgeSec:   maxAge,
+    alerts: readTvAlerts().slice(-50).reverse().map(a => {
+      const ageSec = Math.round(alertAgeSec(a, now));
+      return { ...a, ageSec, fresh: ageSec <= maxAge };
+    }),
+  });
+});
+
 app.get("/api/predictions", (req, res) => {
   try {
     // 1+2. Live per-symbol snapshots from the bot process

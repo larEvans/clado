@@ -30,6 +30,7 @@ import { checkSignal as smcSignal } from "./strategies/smc.js";
 import { predict as predictPrice, hasModel } from "./ml/predictor.js";
 import { evaluatePrediction, effectiveThresholds, meta as predictorMeta } from "./strategies/predictor-strat.js";
 import { dataPath } from "./state.js";
+import { TV_ENABLED, TV_MAX_AGE_SEC, readTvAlerts, findFreshAlert, buildTvTradeSignal } from "./tradingview.js";
 
 // Runtime config — bot-config.json overrides these env-var defaults and is
 // reloaded periodically so the dashboard can toggle the router live.
@@ -102,7 +103,12 @@ setInterval(() => {
 // Convenience getters used through the bar handler so each tick reads the
 // latest config without us threading it everywhere.
 const ROUTER_ENABLED   = () => runtimeCfg.routerEnabled;
-const ACTIVE_STRATS    = () => runtimeCfg.activeStrategies;
+// "tradingview" joins automatically whenever TV_WEBHOOK_SECRET is set, so a
+// dashboard-saved activeStrategies list can't silently drop alert trading.
+const ACTIVE_STRATS    = () => {
+  const list = runtimeCfg.activeStrategies || [];
+  return TV_ENABLED() && !list.includes("tradingview") ? [...list, "tradingview"] : list;
+};
 const MAX_CONCURRENT   = () => runtimeCfg.maxConcurrentPositions;
 const OPTIONS_MODE     = () => runtimeCfg.optionsMode;
 const OPTIONS_DTE      = () => runtimeCfg.optionsDte || 7;
@@ -798,8 +804,33 @@ function routerStatsLookup(strategy, regime) {
 
 // Each strategy's signal evaluator wrapped to accept a per-symbol bar buffer.
 // evalORB and evalHybrid already accept barBuffer — wrap others.
+// ── TradingView alerts (written by the dashboard's /webhook/tradingview) ──────
+// An alert is used at most once (consumed on entry/exit); unused alerts expire
+// after TV_SIGNAL_MAX_AGE_SEC. Consumption is in-memory — after a restart,
+// the age limit alone keeps old alerts from re-firing.
+const tvConsumed = new Set();
+const TV_STOP_ATR_MULT = parseFloat(process.env.TV_STOP_ATR_MULT || "1.5");
+const TV_RR            = parseFloat(process.env.TV_RR || "2");
+
+function freshTvAlert(sym, sides, afterIso = null) {
+  if (!TV_ENABLED()) return null;
+  return findFreshAlert(readTvAlerts(), sym, sides, { consumed: tvConsumed, maxAgeSec: TV_MAX_AGE_SEC(), afterIso });
+}
+
+// TradingView alerts may fire many times a day — the TV strategy decides its
+// own entries — so "tradingview" is exempt from the once-per-symbol-per-day
+// rule. One open position per symbol, capacity and the daily loss limit
+// still apply.
+function strategyUsedUp(s, strategy) {
+  return strategy !== "tradingview" && !!s.strategiesTradedToday?.has(strategy);
+}
+
 function candidateSignals(strategy, sym, barBuffer) {
   try {
+    if (strategy === "tradingview") {
+      const alert = freshTvAlert(sym, ["buy", "sell"]);
+      return alert ? buildTvTradeSignal(alert, barBuffer, { stopAtrMult: TV_STOP_ATR_MULT, rr: TV_RR }) : null;
+    }
     if (strategy === "hybrid"   || strategy === "hybrid10")  return evalHybrid(barBuffer);
     if (strategy === "orb")                                  return evalORB(barBuffer);
     if (strategy === "smc")                                  return smcSignal(barBuffer, loadLearnedParams("smc") || undefined);
@@ -862,6 +893,20 @@ async function onRouterBar(bar) {
       if (nt != null) { exitReason = "near-target"; exitPrice = nt; }
     }
 
+    // TradingView exit: for positions the TV strategy opened, an "exit" alert —
+    // or an opposite-side alert (a reversal) — closes it at the bar close. Only
+    // alerts received after entry count. Reversal alerts aren't consumed here,
+    // so the next bar can open the new side through the normal entry path.
+    if (!exitReason && pos.strategy === "tradingview") {
+      const opposite = pos.side === "buy" ? "sell" : "buy";
+      const x = freshTvAlert(sym, ["exit", opposite], pos.entryTime);
+      if (x) {
+        exitReason = x.side === "exit" ? "tv-exit" : "tv-reversal";
+        exitPrice  = bar.close;
+        if (x.side === "exit") tvConsumed.add(x.id);
+      }
+    }
+
     // Options-specific exit triggers: profit-target %, max-loss %, time, IV crush.
     // Checked roughly once per minute (every ~5 bars at 1-min cadence) to avoid
     // hammering the snapshot endpoint.
@@ -904,7 +949,7 @@ async function onRouterBar(bar) {
   // ── Entry: classify regime, gather candidates, route ──────────────────
   // Allow each active strategy to fire once per symbol per day.
   // We still keep only one open position per symbol at a time.
-  if (ACTIVE_STRATS().every(strategy => s.strategiesTradedToday?.has(strategy))) return;
+  if (ACTIVE_STRATS().every(strategy => strategyUsedUp(s, strategy))) return;
   if (!crypto && etMins < ORB_READY) return;  // ORB-gated entries are stocks-only
   if (s.bars.length < 20) return;
 
@@ -924,7 +969,7 @@ async function onRouterBar(bar) {
     ? ACTIVE_STRATS().filter(x => ["reversal", "vwap-reclaim", "hybrid-reversal"].includes(x))
     : ACTIVE_STRATS();
   const candidates = eligibleStrats
-    .filter(strategy => !s.strategiesTradedToday?.has(strategy))
+    .filter(strategy => !strategyUsedUp(s, strategy))
     .map(strategy => ({
       strategy,
       signal: candidateSignals(strategy, sym, s.bars),
@@ -1122,6 +1167,7 @@ async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultipli
   s.strategiesTradedToday.add(strategy);
   routerDay.strategiesFiredToday.add(strategy);
   routerDay.tradesToday = (routerDay.tradesToday || 0) + 1;
+  if (signal.tvAlertId) tvConsumed.add(signal.tvAlertId); // each TradingView alert trades once
   // Keep the prediction that drove (or accompanied) the trade on the position
   // so the close path can record target-vs-actual for the dashboard.
   if (s.position && prediction) {
@@ -1207,6 +1253,9 @@ if (ROUTER_ENABLED()) {
   if (PREDICTOR_SIGNAL_ENABLED()) {
     console.log(`[Predictor] SIGNAL MODE — the model generates trades: minEdge ${runtimeCfg.predictorMinEdge} · minConf ${runtimeCfg.predictorSignalMinConf} · floor ${MIN_TRADES_PER_DAY()}/day after ${runtimeCfg.floorTimeET} ET (edge ≥ ${runtimeCfg.predictorMinEdgeFloor}) · strike ${STRIKE_MODE()} · DTE +${OPTIONS_DTE_BUFFER()}`);
   }
+  console.log(TV_ENABLED()
+    ? `[TradingView] alerts ENABLED — POST /webhook/tradingview · alerts expire after ${TV_MAX_AGE_SEC()}s · default stop ${TV_STOP_ATR_MULT}×ATR, target ${TV_RR}R`
+    : `[TradingView] alerts off — set TV_WEBHOOK_SECRET to trade TradingView alerts`);
   console.log(`[Router] subscribing to ${resolvedSymbols.length} watchlist symbols: ${resolvedSymbols.join(", ") || "(none)"}`);
 } else {
   // Single-strategy mode trades the FIRST watchlist symbol.
