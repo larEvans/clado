@@ -14,6 +14,8 @@
  */
 
 import { ema, atr } from "../indicators.js";
+import { liquidityLevels, fairValueGaps, sweeps } from "../ict.js";
+import { etInfo, MARKET_OPEN } from "../et.js";
 
 // Order matters and must stay stable: train.py writes columns in this order,
 // and xgb-runtime.js indexes features by position (f0, f1, …).
@@ -32,6 +34,18 @@ export const FEATURE_NAMES = [
   "dist_hi_20",   // (high20 - price) / price (%) — headroom to recent high
   "dist_lo_20",   // (price - low20) / price (%) — cushion above recent low
   "momentum_10",  // (price - close[-10]) / atr — normalized momentum
+  // ICT concepts (ict.js). Appended so the heuristic's positional reads and
+  // older models (which look features up by name) are unaffected.
+  "dist_pdh_atr",      // (previous day high - price) / ATR
+  "dist_pdl_atr",      // (price - previous day low) / ATR
+  "premium_discount",  // price's position in the previous day's range (>0.5 premium)
+  "dist_liq_up_atr",   // nearest buy-side liquidity above / ATR (20 if none)
+  "dist_liq_dn_atr",   // nearest sell-side liquidity below / ATR (20 if none)
+  "fvg_bull",          // unfilled bullish fair value gaps, last 20 bars
+  "fvg_bear",          // unfilled bearish fair value gaps, last 20 bars
+  "sweep_high",        // buy-side liquidity swept in the last 6 bars (1/0)
+  "sweep_low",         // sell-side liquidity swept in the last 6 bars (1/0)
+  "mins_since_open",   // minutes since 9:30 ET at the bar's close (killzones)
 ];
 
 export const FEATURE_COUNT = FEATURE_NAMES.length;
@@ -115,6 +129,26 @@ export function extractFeatures(bars) {
   const distLo = price ? ((price - lo) / price) * 100 : 0;
   const mom10 = a && n > 10 ? (price - bars[n - 11].close) / a : 0;
 
+  // ICT features — need timestamps (bars without .time get neutral values).
+  let ict = [0, 0, 0.5, 20, 20, 0, 0, 0, 0, 0];
+  if (bars[n - 1].time != null && a) {
+    const liq = liquidityLevels(bars);
+    const up = liq.levels.filter(l => l.side === "buy" && l.price > price).map(l => l.price - price);
+    const dn = liq.levels.filter(l => l.side === "sell" && l.price < price).map(l => price - l.price);
+    const fvg = fairValueGaps(bars, 20);
+    const sw = sweeps(bars, 6, 20);
+    const barMs = n > 1 ? bars[n - 1].time - bars[n - 2].time : 300_000;
+    ict = [
+      liq.pdh != null ? (liq.pdh - price) / a : 0,
+      liq.pdl != null ? (price - liq.pdl) / a : 0,
+      liq.pdh != null && liq.pdh > liq.pdl ? (price - liq.pdl) / (liq.pdh - liq.pdl) : 0.5,
+      up.length ? Math.min(20, Math.min(...up) / a) : 20,
+      dn.length ? Math.min(20, Math.min(...dn) / a) : 20,
+      fvg.bull, fvg.bear, sw.high, sw.low,
+      etInfo(bars[n - 1].time + Math.max(60_000, Math.min(barMs, 3_600_000))).mins - MARKET_OPEN,
+    ];
+  }
+
   return [
     finite(pctReturn(bars, 1)),
     finite(pctReturn(bars, 5)),
@@ -130,6 +164,7 @@ export function extractFeatures(bars) {
     finite(distHi),
     finite(distLo),
     finite(mom10),
+    ...ict.map(x => finite(x)),
   ];
 }
 

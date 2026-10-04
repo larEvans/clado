@@ -39,12 +39,55 @@ node ml/export-dataset.js --symbols SPY,QQQ,AAPL,MSFT,NVDA,TSLA,AMD,META \
 pip install xgboost numpy pandas scikit-learn
 python ml/train.py --data ml/dataset.csv --horizon 12 --interval 5m
 
-# → writes ml/model.json (feature list + trees + label stats + holdout metrics)
+# → writes ml/model.json (feature list + trees + label stats + test metrics + split)
+#   The running bot hot-loads ml/model.json, so write elsewhere with --out to
+#   evaluate a model without changing live decisions.
+
+# 3. Backtest it as a strategy, on the period it never trained on
+PREDICTOR_MODEL_PATH=ml/model.json node backtest.js --strategy=predictor --symbol=TSLA --year
 ```
 
-`horizon` is how many bars ahead the label looks (12 × 5m ≈ one trading day).
+`horizon` is how many bars ahead the label looks (12 × 5m = one hour).
 Keep `--interval`/`--horizon` consistent between the two commands so the horizon
 metadata matches the training label.
+
+### 0DTE training
+
+```bash
+node ml/export-dataset.js --preset=0dte --out ml/dataset-0dte.csv
+python ml/train.py --data ml/dataset-0dte.csv --out /tmp/model-0dte.json
+```
+
+`--preset=0dte` = triple-barrier labels walked on **1-minute** bars (so the
+barrier really touched first decides the label), only rows the live bot could
+trade (9:45-15:45 ET), and labels that end by the 15:45 EOD close.
+
+## Honest validation
+
+`export-dataset.js` writes `ts`, `symbol` and `label_end_ts` columns (not
+features). `train.py` uses them to train on the oldest 80% of the data and
+test on the newest 20% (`--test-frac`), dropping training rows whose label
+window runs into the test period. A random split scores much better on paper
+only because neighbouring bars share most of their future-return window. The
+trainer prints test accuracy next to an "always guess the common direction"
+baseline, plus accuracy on the model's most confident 20% of calls. A model
+is only worth using if it beats the baseline there.
+
+`model.json` records `split.test_start_ms`. `node backtest.js --strategy=predictor`
+only takes entries from that date on, using the live router's rules (entries
+from 9:45 ET, one predictor trade per symbol per day, stop/target/near-target
+exits, flat by 3:45 ET). Flags:
+
+| Flag | Effect |
+|------|--------|
+| `--year` | a year of history instead of 60 days |
+| `--timeframe=1m` | replay on 1-minute bars, which is what the live stream feeds the bot |
+| `--params='{"minEdge":0.2,"minConfidence":0.5}'` | try other firing thresholds |
+| `--mode=options` | price the trades as options (Black-Scholes) |
+| `--include-in-sample` | also trade the training period (optimistic) |
+
+`train.py --refit-all` retrains on everything after scoring. That model has no
+unseen period left, so its backtests are in-sample and the backtester says so.
 
 ## Where the model is loaded from
 

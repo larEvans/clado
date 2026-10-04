@@ -1,0 +1,216 @@
+//@version=5
+// Smart-money concepts + Wyckoff — same definitions as concepts.js / ict.js:
+//   structure (BOS / CHoCH), order blocks = supply/demand zones (until
+//   mitigated / invalidated), fair value gaps (until filled), liquidity
+//   (untaken swing highs/lows until swept, previous day high/low), Wyckoff
+//   ranges with springs / upthrusts, and 1h / 15m / chart trend.
+indicator("SMC + Wyckoff Concepts (MTF)", overlay=true, max_boxes_count=300, max_lines_count=300, max_labels_count=300)
+
+swingLen   = input.int(2, "Swing length (bars each side)", minval=1)
+htf1       = input.timeframe("60", "Bias timeframe")
+htf2       = input.timeframe("15", "Middle timeframe")
+showOB     = input.bool(true, "Supply / demand (order blocks)")
+showFVG    = input.bool(true, "Inefficiencies (FVG)")
+showLiq    = input.bool(true, "Liquidity")
+showStruct = input.bool(true, "Structure (BOS / CHoCH)")
+showWy     = input.bool(true, "Wyckoff ranges / springs")
+wyBars     = input.int(20, "Wyckoff range min bars", minval=5)
+wyAtrs     = input.float(4.0, "Wyckoff range max width (ATR)", step=0.5)
+maxZones   = input.int(15, "Max zones of each kind", minval=1, maxval=60)
+
+cDemand = color.new(color.teal, 80)
+cSupply = color.new(color.red, 80)
+cFvgUp  = color.new(color.blue, 85)
+cFvgDn  = color.new(color.orange, 85)
+
+// ── Trend of a timeframe from structure (for the MTF table) ──────────────────
+f_trend(len) =>
+    ph = ta.pivothigh(high, len, len)
+    pl = ta.pivotlow(low, len, len)
+    var float lh = na
+    var float ll = na
+    var int tr = 0
+    if not na(ph)
+        lh := ph
+    if not na(pl)
+        ll := pl
+    if not na(lh) and close > lh
+        tr := 1
+        lh := na
+    if not na(ll) and close < ll
+        tr := -1
+        ll := na
+    tr
+
+t1 = request.security(syminfo.tickerid, htf1, f_trend(swingLen), lookahead=barmerge.lookahead_off)
+t2 = request.security(syminfo.tickerid, htf2, f_trend(swingLen), lookahead=barmerge.lookahead_off)
+
+// ── Structure on the chart timeframe ─────────────────────────────────────────
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low, swingLen, swingLen)
+var float lastHigh = na
+var int   lastHighBar = na
+var float lastLow = na
+var int   lastLowBar = na
+var int   trend = 0
+if not na(ph)
+    lastHigh := ph
+    lastHighBar := bar_index - swingLen
+if not na(pl)
+    lastLow := pl
+    lastLowBar := bar_index - swingLen
+
+bullBreak = not na(lastHigh) and close > lastHigh
+bearBreak = not na(lastLow) and close < lastLow
+
+var array<box>  zBox = array.new<box>()
+var array<int>  zDir = array.new<int>()
+var array<bool> zMit = array.new<bool>()
+
+f_orderBlock(int dir) =>
+    // extreme of the leg into the break, then the last opposite candle at/before it
+    int ext = 0
+    float extV = dir == 1 ? low : high
+    for i = 0 to 20
+        if dir == 1 ? low[i] < extV : high[i] > extV
+            extV := dir == 1 ? low[i] : high[i]
+            ext := i
+    int ob = ext
+    for i = ext to ext + 5
+        if dir == 1 ? close[i] < open[i] : close[i] > open[i]
+            ob := i
+            break
+    [ob, high[ob], low[ob]]
+
+if bullBreak
+    if showStruct
+        line.new(lastHighBar, lastHigh, bar_index, lastHigh, color=color.teal, style=line.style_dashed)
+        label.new(bar_index, lastHigh, trend == -1 ? "CHoCH" : "BOS", style=label.style_label_down, color=color.new(color.teal, 100), textcolor=color.teal, size=size.tiny)
+    if showOB
+        [ob, top, bot] = f_orderBlock(1)
+        array.push(zBox, box.new(bar_index - ob, top, bar_index + 1, bot, border_color=color.teal, bgcolor=cDemand, text="Demand", text_color=color.teal, text_size=size.tiny, text_halign=text.align_left))
+        array.push(zDir, 1)
+        array.push(zMit, false)
+    trend := 1
+    lastHigh := na
+if bearBreak
+    if showStruct
+        line.new(lastLowBar, lastLow, bar_index, lastLow, color=color.red, style=line.style_dashed)
+        label.new(bar_index, lastLow, trend == 1 ? "CHoCH" : "BOS", style=label.style_label_up, color=color.new(color.red, 100), textcolor=color.red, size=size.tiny)
+    if showOB
+        [ob, top, bot] = f_orderBlock(-1)
+        array.push(zBox, box.new(bar_index - ob, top, bar_index + 1, bot, border_color=color.red, bgcolor=cSupply, text="Supply", text_color=color.red, text_size=size.tiny, text_halign=text.align_left))
+        array.push(zDir, -1)
+        array.push(zMit, false)
+    trend := -1
+    lastLow := na
+
+// keep zones alive: extend right; mark the first return (mitigation); stop at invalidation
+if array.size(zBox) > 0
+    for i = array.size(zBox) - 1 to 0
+        b = array.get(zBox, i)
+        d = array.get(zDir, i)
+        top = box.get_top(b)
+        bot = box.get_bottom(b)
+        invalid = d == 1 ? close < bot : close > top
+        if invalid
+            box.set_right(b, bar_index)
+            box.set_bgcolor(b, color.new(color.gray, 92))
+            box.set_text(b, "")
+            array.remove(zBox, i)
+            array.remove(zDir, i)
+            array.remove(zMit, i)
+        else
+            box.set_right(b, bar_index + 1)
+            if not array.get(zMit, i) and (d == 1 ? low <= top : high >= bot) and box.get_left(b) < bar_index - 1
+                array.set(zMit, i, true)
+                box.set_text(b, d == 1 ? "Demand (mitigated)" : "Supply (mitigated)")
+                box.set_bgcolor(b, d == 1 ? color.new(color.teal, 90) : color.new(color.red, 90))
+while array.size(zBox) > maxZones
+    array.shift(zBox)
+    array.shift(zDir)
+    array.shift(zMit)
+
+// ── Fair value gaps (inefficiencies) ─────────────────────────────────────────
+var array<box> gBox = array.new<box>()
+var array<int> gDir = array.new<int>()
+if showFVG and bar_index > 2
+    if low > high[2]
+        array.push(gBox, box.new(bar_index - 2, low, bar_index + 1, high[2], border_color=color.new(color.blue, 60), bgcolor=cFvgUp, text="FVG", text_color=color.blue, text_size=size.tiny))
+        array.push(gDir, 1)
+    if high < low[2]
+        array.push(gBox, box.new(bar_index - 2, low[2], bar_index + 1, high, border_color=color.new(color.orange, 60), bgcolor=cFvgDn, text="FVG", text_color=color.orange, text_size=size.tiny))
+        array.push(gDir, -1)
+if array.size(gBox) > 0
+    for i = array.size(gBox) - 1 to 0
+        b = array.get(gBox, i)
+        d = array.get(gDir, i)
+        filled = d == 1 ? low <= box.get_bottom(b) : high >= box.get_top(b)
+        if filled and box.get_left(b) < bar_index - 2
+            box.set_right(b, bar_index)
+            box.set_bgcolor(b, color.new(color.gray, 95))
+            box.set_text(b, "")
+            array.remove(gBox, i)
+            array.remove(gDir, i)
+        else
+            box.set_right(b, bar_index + 1)
+while array.size(gBox) > maxZones
+    array.shift(gBox)
+    array.shift(gDir)
+
+// ── Liquidity: untaken swing highs / lows until swept; previous day H/L ─────
+var array<line> lLine = array.new<line>()
+var array<int>  lDir  = array.new<int>()
+if showLiq
+    if not na(ph)
+        array.push(lLine, line.new(bar_index - swingLen, ph, bar_index, ph, color=color.new(color.fuchsia, 30), style=line.style_dotted))
+        array.push(lDir, 1)
+    if not na(pl)
+        array.push(lLine, line.new(bar_index - swingLen, pl, bar_index, pl, color=color.new(color.fuchsia, 30), style=line.style_dotted))
+        array.push(lDir, -1)
+if array.size(lLine) > 0
+    for i = array.size(lLine) - 1 to 0
+        l = array.get(lLine, i)
+        d = array.get(lDir, i)
+        lvl = line.get_y1(l)
+        swept = d == 1 ? high > lvl : low < lvl
+        line.set_x2(l, bar_index)
+        if swept
+            line.set_color(l, color.new(color.gray, 60))
+            label.new(bar_index, lvl, "$$$ swept", style=d == 1 ? label.style_label_down : label.style_label_up, color=color.new(color.fuchsia, 100), textcolor=color.fuchsia, size=size.tiny)
+            array.remove(lLine, i)
+            array.remove(lDir, i)
+while array.size(lLine) > maxZones * 2
+    line.delete(array.shift(lLine))
+    array.shift(lDir)
+
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+plot(showLiq ? pdh : na, "Previous day high (buy-side liquidity)", color=color.new(color.fuchsia, 0), style=plot.style_stepline, linewidth=1)
+plot(showLiq ? pdl : na, "Previous day low (sell-side liquidity)", color=color.new(color.fuchsia, 0), style=plot.style_stepline, linewidth=1)
+
+// ── Wyckoff: trading ranges and springs / upthrusts ──────────────────────────
+atrv  = ta.atr(14)
+rngHi = ta.highest(high, wyBars)[1]
+rngLo = ta.lowest(low, wyBars)[1]
+inRange = rngHi - rngLo <= wyAtrs * atrv[1]
+spring   = showWy and inRange and low < rngLo and close > rngLo
+upthrust = showWy and inRange and high > rngHi and close < rngHi
+if spring or upthrust
+    box.new(bar_index - wyBars, rngHi, bar_index, rngLo, border_color=color.new(color.purple, 40), bgcolor=color.new(color.purple, 92), text=spring ? "Wyckoff range → Spring" : "Wyckoff range → Upthrust", text_color=color.purple, text_size=size.tiny, text_valign=text.align_top)
+plotshape(spring, "Spring", shape.triangleup, location.belowbar, color.purple, size=size.small)
+plotshape(upthrust, "Upthrust", shape.triangledown, location.abovebar, color.purple, size=size.small)
+
+// ── Multi-timeframe trend table ──────────────────────────────────────────────
+var table tb = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black, 20), border_width=1)
+f_txt(t) => t == 1 ? "▲ up" : t == -1 ? "▼ down" : "–"
+f_col(t) => t == 1 ? color.teal : t == -1 ? color.red : color.gray
+if barstate.islast
+    table.cell(tb, 0, 0, "Structure", text_color=color.white, text_size=size.small)
+    table.cell(tb, 1, 0, "Trend", text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 1, htf1 + "m", text_color=color.white, text_size=size.small)
+    table.cell(tb, 1, 1, f_txt(t1), text_color=f_col(t1), text_size=size.small)
+    table.cell(tb, 0, 2, htf2 + "m", text_color=color.white, text_size=size.small)
+    table.cell(tb, 1, 2, f_txt(t2), text_color=f_col(t2), text_size=size.small)
+    table.cell(tb, 0, 3, "chart", text_color=color.white, text_size=size.small)
+    table.cell(tb, 1, 3, f_txt(trend), text_color=f_col(trend), text_size=size.small)

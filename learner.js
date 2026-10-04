@@ -252,6 +252,8 @@ export function recordTradeClosed({
   // simulated trades never masquerade as executed ones.
   source = "bot",
   prediction = null,
+  // Real order fills vs signal prices (bot with orders enabled): slippage data
+  fills = null,
   // Options-specific (passed when pos.isOption is true)
   isOption = false, contractSymbol = null,
   optionType = null, optionStrike = null,
@@ -296,6 +298,7 @@ export function recordTradeClosed({
     regime, hourET,
     source,
     ...(prediction ? { prediction } : {}),
+    ...(fills ? { fills } : {}),
     ...(isOption ? {
       isOption: true, contractSymbol,
       optionType, optionStrike,

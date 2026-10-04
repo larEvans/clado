@@ -57,6 +57,13 @@ learner.js     record the closed trade, update per-regime stats,
 | `stream.js` | Alpaca WebSocket wrapper (stocks + crypto feeds) |
 | `regime.js` | Market regime classifier (trend / volatility / gap / ORB quality) |
 | `router.js` | Strategy selection: per-regime win-rate scoring, consensus mode, diversification |
+| `signals.js` | Shared by the live bot and `replay.js`: 5/15/60-minute bars from the 1-minute stream, each strategy's entry check on its native bars, exits (incl. trailing stops), the router's entry decision |
+| `replay.js` | Full-system replay backtest of the live router |
+| `strategy-screener.js` | Which symbols suit hybrid10 / vwap-reclaim: backtests each on ~2 years of 5m bars per symbol, split into an older and newer year, after a 0.02% round-trip cost; also 0DTE expiries/week and option spreads. `node strategy-screener.js [--most-actives=30]` or the dashboard's Screener tab. Its built-in check (does a good older year predict the newer year?) was negative on the first run for 51 liquid symbols, so treat "fits" as candidates, not proof |
+| `strategies/dip-buy.js` | **Active.** Index dip-buy: SPY/QQQ/IWM/DIA above the 200-day average with RSI(2) < 10 at 3:55 PM → buy shares; exit at 3:55 on RSI(2) > 70, a close above the prior day's high, or after 7 sessions; held overnight (exempt from the 3:45 close; positions are restored after a restart). 2025–Sep 2026: 72 trades, 76% win, +0.75%/trade after costs — see docs/edge-study.md |
+| `ict.js`, `strategies/ict-2024.js` | ICT concepts (liquidity pools, fair value gaps, sweeps) used for optional liquidity targets, model features, and the ICT 2024 Mentorship Lecture 1 "8:30 model" strategy (available, not active). Jul 2020–Sep 2026, 7 symbols (SPY QQQ TSLA MSFT META IWM DIA), 5m bars: 574 trades, 41% win, +0.180R/trade before costs (95% CI +0.07 to +0.30, t≈3), positive on every symbol and 6 of 7 years (2026 YTD −0.17R). Thin: median stop 0.42% of price, so a 0.02% round-trip cost halves it and 0.05% erases it |
+| `strategies/late-momentum.js`, `strategies/noise-momentum.js` | Research-based intraday momentum strategies (last-half-hour momentum; noise-band momentum). Available but not active: neither added edge in a 1-year replay on SPY/TSLA/QQQ/MSFT/META |
+| `runtime-config.js` | Router settings: env defaults overridden by `bot-config.json` |
 | `strategies/*.js` | Pluggable strategies — each exports `meta` + a signal function |
 | `learner.js` | Trade history, per-regime stats, adaptive parameter learning |
 | `backtest.js` | Backtesting engine + indicator math |
@@ -126,8 +133,15 @@ annotated list). The important ones:
 | `PAPER_TRADING` | `true` | `true` logs decisions only; `false` submits real orders to `ALPACA_BASE_URL` |
 | `DASHBOARD_TOKEN` | *(empty)* | **Set this on any internet-reachable deployment.** Protects the whole dashboard; open `/?token=...` once or send an `x-dashboard-token` header |
 | `ROUTER_ENABLED` | `true` | Multi-strategy router vs. single-strategy mode |
+| `ROUTER_SCORE` | `winrate` | How the router ranks candidates: `winrate`, or `expectancy` (average P&L per trade; also refuses trades whose regime history loses money). In a 1-year replay `expectancy` did worse: per-regime samples are small |
+| `PAPER_TRADING` / `LIVE_TRADING_CONFIRM` | `true` / — | `PAPER_TRADING=true`: no orders; trades are simulated at bar prices (source `paper`). `false` with `ALPACA_BASE_URL=https://paper-api.alpaca.markets`: real orders in Alpaca's paper account, recorded at their actual fills with slippage vs the signal (source `paper-account`). Against the live API the bot refuses to start unless `LIVE_TRADING_CONFIRM=yes`. Stock shorts are whole shares (Alpaca can't short fractional) and need a margin account with shorting enabled |
+| `STOCK_ONLY_STRATEGIES` (or `stockOnlyStrategies` in bot-config.json) | — | Strategies that trade shares even when `OPTIONS_MODE` is on, e.g. `ict-2024`, whose edge is too thin for option spreads |
+| `strategySymbols` (bot-config.json) | `{}` | Per-strategy symbol whitelist, e.g. `{"ict-2024": ["SPY","QQQ","DIA"]}`; a strategy with no entry trades every symbol |
+| `TARGET_MODE` / `LIQUIDITY_MIN_RR` | `strategy` / `2` | `liquidity` = ICT targets: each trade aims at the nearest liquidity pool (previous-day/overnight high-low, session high-low, untaken swing points — `ict.js`) at least `LIQUIDITY_MIN_RR` × risk away, and the options premium take-profit/time exits are dropped. Off: in a 1-year stock-mode replay it cut the active strategies from +0.060R to −0.121R per trade (pools were reached on ~8% of trades) |
+| `minRelVol` (hybrid / hybrid10 param) | `0` (off) | Relative-volume filter: take the opening-range breakout only if opening volume ≥ this × its 14-session average (Zarattini, Barbon & Aziz 2024). Off because at 1.0 it cut hybrid10 from +0.088R to +0.047R per trade in a 1-year replay on these symbols |
 | `ACTIVE_STRATEGIES` | `hybrid,hybrid10,smc,...` | Comma list of strategy IDs the router evaluates |
-| `STRATEGY` / `TIMEFRAME` | `hybrid` / `1H` | Single-strategy mode settings (trades the first Alpaca-watchlist symbol; there is no `SYMBOL` env var) |
+| `STRATEGY` / `TIMEFRAME` | `hybrid` / `1H` | Single-strategy mode settings (trades the first entry in `SYMBOLS`) |
+| `SYMBOLS` | — | Comma-separated stock symbols to stream and trade (e.g. `SPY,TSLA,QQQ,MSFT,META`). Seeds `symbols.json` in `DATA_DIR`; the dashboard's Add/Remove stock controls edit that file. No Alpaca watchlist is used |
 | `CRYPTO_SYMBOLS` | *(empty)* | e.g. `BTC/USD,ETH/USD` — adds a 24/7 crypto stream |
 | `CONSENSUS_MIN` | `1` | Require ≥ N strategies agreeing on a side before trading |
 | `MAX_CONCURRENT_POSITIONS` | `5` | Open-position cap |
@@ -158,7 +172,7 @@ restart (WebSocket resubscription).
 - Regime statistics and learned parameters, with one-click deploy to the bot
 - Hermes trade analysis and parameter suggestions
 - Strategy router controls: toggle, consensus mode, symbol management
-- 🔮 Screener tab: the price-target model ranks the whole watchlist (price targets, horizon, confidence, signal agreement) — advisory, never trades
+- 🔮 Screener tab: the price-target model ranks every configured symbol (price targets, horizon, confidence, signal agreement) — advisory, never trades
 - Pine Script overlays served per strategy (e.g. `/api/pinescript/smc`)
 
 **Auth:** set `DASHBOARD_TOKEN` and open the dashboard as
@@ -170,13 +184,41 @@ platform healthchecks.
 ## Backtesting
 
 ```bash
-npm run backtest                      # defaults
-STRATEGY=orb SYMBOL=SPY node backtest.js
+node backtest.js --strategy=orb --symbol=SPY          # one strategy, one symbol
+node backtest.js --strategy=predictor --symbol=TSLA --year   # the ML model (see ml/README.md)
 ```
 
 The dashboard's Backtest tab runs the same engine, and the CPCV tab runs
 Combinatorially Purged Cross-Validation to estimate how much of a strategy's
 edge is overfitting.
+
+### Full-system replay
+
+`replay.js` runs the **live router** over history, not one strategy at a time:
+all symbols at once, every active strategy on its native bars, the router's
+choice, the predictor veto and sizing, trailing/target/near-target/time/EOD
+exits, max concurrent positions and the daily loss limit. It calls the same
+code as the live bot (`signals.js`), with settings from `.env` and
+`bot-config.json`.
+
+```bash
+node replay.js                        # past year, 1-minute bars, live settings
+node replay.js --compare-gate         # predictor gate ON vs OFF on the same data
+node replay.js --mode=stock           # underlying P&L, no option-pricing assumptions
+node replay.js --base=5m              # faster, coarser: 5-minute bars
+node replay.js --json=replay.json     # also save every trade
+```
+
+Entries fill at the next 1-minute bar's open and exits are checked every
+minute, as live. A year of 1-minute bars is cached in `DATA_DIR/cache` for
+the day. 0DTE uses each symbol's expiry calendar (SPY/QQQ daily, single
+stocks Mon/Wed/Fri; on other days the next listed expiry, as the live
+planner does). Or use **Full-System Replay** on the dashboard's Router tab. Router win-rate
+stats are walk-forward (the router only knows backtest trades that had
+already closed), and a trained model is only scored after its training data.
+Not simulated: the LLM agent debate, the LLM options planner (options are
+priced with Black-Scholes at a flat IV, no bid/ask spread), slippage and
+commissions.
 
 ## Deploying (Railway)
 

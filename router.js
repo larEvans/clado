@@ -18,25 +18,30 @@ const MIN_SAMPLE_FOR_STRICT = 5;
 const SAMPLE_FOR_FULL_TRUST = 30;
 const DIVERSIFICATION_DISCOUNT = 0.8;
 
-function scoreCandidate(strategy, regime, statsLookup) {
+// scoreBy "winrate" (default): win rate × sample confidence.
+// scoreBy "expectancy": average P&L % × sample confidence, so a 68%-win
+// strategy with tiny wins doesn't outrank one that actually makes money.
+// Unknown strategies score 0 (neutral) and negative-expectancy ones below it.
+function scoreCandidate(strategy, regime, statsLookup, scoreBy = "winrate") {
   const regStats = statsLookup(strategy, regime);
   // Without per-regime history, fall back to global win rate (looked up with regime=null)
   const stats = regStats || statsLookup(strategy, null);
   if (!stats) {
-    // No data at all — neutral prior of 0.5 winRate × tiny confidence weight
-    return { winRate: 0.5, sampleSize: 0, score: 0.5 * Math.sqrt(1 / SAMPLE_FOR_FULL_TRUST), source: "prior" };
+    // No data at all — neutral prior: 0.5 winRate × tiny confidence weight, or 0 expectancy
+    const score = scoreBy === "expectancy" ? 0 : 0.5 * Math.sqrt(1 / SAMPLE_FOR_FULL_TRUST);
+    return { winRate: 0.5, sampleSize: 0, score, source: "prior" };
   }
   const confidence = Math.sqrt(Math.min(stats.sampleSize, SAMPLE_FOR_FULL_TRUST) / SAMPLE_FOR_FULL_TRUST);
   return {
     winRate:    stats.winRate,
     sampleSize: stats.sampleSize,
-    score:      stats.winRate * confidence,
+    score:      (scoreBy === "expectancy" ? (stats.avgPnl ?? 0) : stats.winRate) * confidence,
     source:     regStats ? "regime" : "global",
     avgPnl:     stats.avgPnl,
   };
 }
 
-export function chooseSignal({ candidates, regime, statsLookup, todayState, strict = false, consensusMin = 1 }) {
+export function chooseSignal({ candidates, regime, statsLookup, todayState, strict = false, consensusMin = 1, scoreBy = "winrate" }) {
   const live = (candidates || []).filter(c => c && c.signal);
   if (live.length === 0) return { chosen: null, ranking: [], reason: "no candidates fired" };
 
@@ -69,9 +74,10 @@ export function chooseSignal({ candidates, regime, statsLookup, todayState, stri
   }
 
   const ranking = pool.map(c => {
-    const s = scoreCandidate(c.strategy, regime, statsLookup);
-    // Diversification: discount strategies already used today
-    const diverseMultiplier = fired.has(c.strategy) ? DIVERSIFICATION_DISCOUNT : 1.0;
+    const s = scoreCandidate(c.strategy, regime, statsLookup, scoreBy);
+    // Diversification: discount strategies already used today (a negative
+    // expectancy score is made MORE negative, not less)
+    const diverseMultiplier = fired.has(c.strategy) ? (s.score < 0 ? 1 / DIVERSIFICATION_DISCOUNT : DIVERSIFICATION_DISCOUNT) : 1.0;
     return {
       strategy:        c.strategy,
       signal:          c.signal,
@@ -86,6 +92,11 @@ export function chooseSignal({ candidates, regime, statsLookup, todayState, stri
   }).sort((a, b) => b.score - a.score);
 
   const top = ranking[0];
+
+  // Expectancy mode: never take a trade whose history says it loses here.
+  if (scoreBy === "expectancy" && top.score < 0) {
+    return { chosen: null, ranking, reason: `expectancy: best candidate (${top.strategy}) has negative average P&L in "${regime}"` };
+  }
 
   // Strict mode: require at least one candidate to have meaningful regime data
   if (strict && (top.source === "prior" || top.sampleSize < MIN_SAMPLE_FOR_STRICT)) {

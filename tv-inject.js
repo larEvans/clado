@@ -24,13 +24,16 @@ const PINE_FILES = {
   momentum:         join(__dirname, "pinescript", "momentum.pine"),
   hybrid:           join(__dirname, "pinescript", "hybrid.pine"),
   "options-overlay": join(__dirname, "pinescript", "options-overlay.pine"),
+  concepts:         join(__dirname, "pinescript", "concepts.pine"),
 };
 
 // ─── CDP helpers ─────────────────────────────────────────────────────────────
 
 function cdpGet(path) {
   return new Promise((resolve, reject) => {
-    const req = http.get({ host: "localhost", port: CDP_PORT, path }, res => {
+    // 127.0.0.1, not "localhost": Node resolves localhost to ::1 first, and
+    // TradingView's debug port listens on IPv4 only.
+    const req = http.get({ host: "127.0.0.1", port: CDP_PORT, path }, res => {
       let data = "";
       res.on("data", c => data += c);
       res.on("end", () => { try { resolve(JSON.parse(data)); } catch { reject(new Error("Bad JSON from CDP")); } });

@@ -25,5 +25,8 @@ export const meta = {
     maxRangePct:   1.0,
     emaPeriod:     9,
     emaSlowPeriod: 21,
+    // Relative-volume filter (see hybrid10.js). 0 = off.
+    minRelVol:     0,
+    relVolDays:    14,
   },
 };

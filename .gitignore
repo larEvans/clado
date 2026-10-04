@@ -19,4 +19,7 @@ predictions.json
 
 # ML training artifacts (regenerable). The trained ml/model.json MAY be
 # committed to bundle a model with the deploy, or dropped in DATA_DIR instead.
-ml/dataset.csv
+ml/dataset*.csv
+cache/
+strategy-screener.json
+symbols.json

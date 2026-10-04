@@ -20,71 +20,18 @@ import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import { AlpacaStream } from "./stream.js";
 import { getDefaultParams, loadLearnedParams, recordTradeClosed, runLearner, getEarlyExitConfig } from "./learner.js";
 import { pickStop, nearTargetTrigger } from "./backtest.js";
-import { classifyRegime } from "./regime.js";
-import { chooseSignal }   from "./router.js";
 import { getRegimeStats, getAllRegimeStats } from "./learner.js";
 import { planOptionsTrade, shouldExitOption } from "./agents-options.js";
 import { placeOptionsOrder, fetchSnapshots }  from "./options.js";
 import { runAgentDebate, debateEnabled } from "./agents.js";
-import { checkSignal as smcSignal } from "./strategies/smc.js";
 import { predict as predictPrice, hasModel } from "./ml/predictor.js";
-import { evaluatePrediction, effectiveThresholds, meta as predictorMeta } from "./strategies/predictor-strat.js";
 import { dataPath } from "./state.js";
+import { loadSymbols } from "./symbols.js";
+import { SymbolSeries, decideEntry, updatePosition, etInfo, STRATEGY_TF, SUPPORTED_STRATEGIES } from "./signals.js";
+import { fetchCandles } from "./backtest.js";
 import { TV_ENABLED, TV_MAX_AGE_SEC, readTvAlerts, findFreshAlert, buildTvTradeSignal } from "./tradingview.js";
 
-// Runtime config — bot-config.json overrides these env-var defaults and is
-// reloaded periodically so the dashboard can toggle the router live.
-const CONFIG_FILE = dataPath("bot-config.json");
-
-function parseEnvBool(value, defaultValue = false) {
-  if (value == null || value === "") return defaultValue;
-  const normalized = String(value).trim().toLowerCase();
-  if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
-  if (["false", "0", "no", "n", "off"].includes(normalized)) return false;
-  return defaultValue;
-}
-
-function loadRuntimeConfig() {
-  const defaults = {
-    routerEnabled:          parseEnvBool(process.env.ROUTER_ENABLED, true),
-    consensusMin:           parseInt(process.env.CONSENSUS_MIN || "1"),
-    maxConcurrentPositions: parseInt(process.env.MAX_CONCURRENT_POSITIONS || "5"),
-    activeStrategies:       (process.env.ACTIVE_STRATEGIES || "hybrid,hybrid10,smc,hybrid-reversal,reversal,vwap,predictor")
-                              .split(",").map(s => s.trim().toLowerCase()).filter(Boolean),
-    cryptoSymbols:          (process.env.CRYPTO_SYMBOLS || "")
-                              .split(",").map(s => s.trim().toUpperCase()).filter(Boolean),
-    // When true, every stock signal routes through the Options Strategist
-    // agent which picks the contract and exit triggers. Crypto symbols
-    // always trade the underlying — Alpaca doesn't offer crypto options.
-    optionsMode:            parseEnvBool(process.env.OPTIONS_MODE, false),
-    optionsDte:             parseInt(process.env.OPTIONS_DTE || "7"),
-    // Price-target model (the 4th brain). When enabled, the XGBoost/heuristic
-    // predictor gates and sizes router entries, and feeds its price target +
-    // horizon into the Options Strategist for smarter strike/expiry selection.
-    predictorEnabled:       parseEnvBool(process.env.PREDICTOR_ENABLED, false),
-    predictorMinConfidence: parseFloat(process.env.PREDICTOR_MIN_CONFIDENCE || "0.5"),
-    predictorVeto:          parseEnvBool(process.env.PREDICTOR_VETO, true),
-    predictorSizeScaling:   parseEnvBool(process.env.PREDICTOR_SIZE_SCALING, true),
-    // Predictor as a PRIMARY signal source (strategies/predictor-strat.js):
-    // the model itself generates trades, targeting >= minTradesPerDay/day.
-    predictorSignalEnabled: parseEnvBool(process.env.PREDICTOR_SIGNAL_ENABLED, false),
-    predictorMinEdge:       parseFloat(process.env.PREDICTOR_MIN_EDGE || "0.35"),
-    predictorSignalMinConf: parseFloat(process.env.PREDICTOR_SIGNAL_MIN_CONFIDENCE || "0.55"),
-    stopAtrMult:            parseFloat(process.env.STOP_ATR_MULT || "1.5"),
-    minTradesPerDay:        parseInt(process.env.MIN_TRADES_PER_DAY || "2"),
-    floorTimeET:            process.env.FLOOR_TIME_ET || "14:30",
-    predictorMinEdgeFloor:  parseFloat(process.env.PREDICTOR_MIN_EDGE_FLOOR || "0.15"),
-    predictorMinConfFloor:  parseFloat(process.env.PREDICTOR_MIN_CONFIDENCE_FLOOR || "0.35"),
-    // Options-first execution shaping
-    strikeMode:             (process.env.STRIKE_MODE || "between").toLowerCase(),
-    optionsDteBuffer:       parseInt(process.env.OPTIONS_DTE_BUFFER || "2"),
-  };
-  if (!existsSync(CONFIG_FILE)) return defaults;
-  try {
-    const fileCfg = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
-    return { ...defaults, ...fileCfg };
-  } catch { return defaults; }
-}
+import { loadRuntimeConfig, parseEnvBool } from "./runtime-config.js";
 
 let runtimeCfg = loadRuntimeConfig();
 
@@ -121,26 +68,6 @@ const MIN_TRADES_PER_DAY      = () => runtimeCfg.minTradesPerDay;
 const STRIKE_MODE             = () => runtimeCfg.strikeMode;
 const OPTIONS_DTE_BUFFER      = () => runtimeCfg.optionsDteBuffer;
 
-// "14:30" → minutes since midnight ET
-function floorTimeMins() {
-  const [h, m] = (runtimeCfg.floorTimeET || "14:30").split(":").map(Number);
-  return (h || 14) * 60 + (m || 30);
-}
-
-// Current predictor-strategy thresholds, accounting for the two-tier daily
-// floor: after floorTimeET, if we're short of minTradesPerDay, relax to the
-// *_FLOOR values (weaker but still positive edge — never a forced bad trade).
-function predictorParams(etMins) {
-  const t = effectiveThresholds({
-    etMins,
-    tradesToday:     routerDay.tradesToday || 0,
-    minTradesPerDay: MIN_TRADES_PER_DAY(),
-    floorTimeMins:   floorTimeMins(),
-    base:  { minEdge: runtimeCfg.predictorMinEdge,      minConfidence: runtimeCfg.predictorSignalMinConf },
-    floor: { minEdge: runtimeCfg.predictorMinEdgeFloor, minConfidence: runtimeCfg.predictorMinConfFloor },
-  });
-  return { ...predictorMeta.params, minEdge: t.minEdge, minConfidence: t.minConfidence, stopAtrMult: runtimeCfg.stopAtrMult, _tier: t.tier };
-}
 const STRICT_ROUTER    = process.env.STRICT_ROUTER === "true";
 const CRYPTO_SYMBOLS   = runtimeCfg.cryptoSymbols;
 
@@ -176,9 +103,8 @@ function dailyLossHalted() {
   return dayPnl.halted && dayPnl.date === todayET(new Date());
 }
 
-// Traded symbols come from the Alpaca watchlist — the single source of truth.
-// SYMBOL is resolved at startup (single-strategy mode uses the first watchlist
-// entry); there is no env fallback, so the watchlist alone decides what trades.
+// Traded symbols come from symbols.js (symbols.json, seeded from SYMBOLS env).
+// SYMBOL is resolved at startup (single-strategy mode uses the first entry).
 let SYMBOL        = null;
 const STRATEGY    = (process.env.STRATEGY || "hybrid").toLowerCase();
 const TRADE_USD   = parseFloat(process.env.MAX_TRADE_SIZE_USD || "200");
@@ -196,6 +122,9 @@ function describeAlpacaAccount(baseUrl) {
 
 const IS_PAPER    = parseEnvBool(process.env.PAPER_TRADING, true);
 const ALPACA_BASE = normalizeAlpacaBase(process.env.ALPACA_BASE_URL);
+// Trade-history provenance: "paper" = simulated in the bot (no orders),
+// "paper-account" = real orders filled in Alpaca's paper account, "live".
+const TRADE_SOURCE = IS_PAPER ? "paper" : describeAlpacaAccount(ALPACA_BASE) === "PAPER ACCOUNT" ? "paper-account" : "live";
 const LOG_FILE    = dataPath("safety-check-log.json");
 const STATE_FILE  = dataPath("bot-state.json");
 
@@ -275,18 +204,28 @@ function appendLog(entry) {
 
 // ── Alpaca REST helpers ───────────────────────────────────────────────────────
 
-async function placeOrder(symbol, side, notionalUSD) {
+async function placeOrder(symbol, side, notionalUSD, price = null) {
   // Crypto requires time_in_force=gtc and minimum $10 notional; stocks use day TIF.
   const isCrypto = isCryptoSymbol(symbol);
   const tif      = isCrypto ? "gtc" : "day";
   const notional = isCrypto ? Math.max(notionalUSD, 10) : notionalUSD;
+
+  // Alpaca can't short fractional shares, so a stock SHORT is whole shares —
+  // at least 1, which can exceed the per-position budget on high-priced ETFs.
+  let size = { notional: notional.toFixed(2) };
+  if (side === "sell" && !isCrypto) {
+    if (!(price > 0)) throw new Error("short entry needs a price to size whole shares");
+    const qty = Math.max(1, Math.floor(notionalUSD / price));
+    if (qty * price > notionalUSD * 1.5) console.warn(`[Bot] ${symbol} short: 1 share ≈ $${price.toFixed(2)} exceeds the $${notionalUSD.toFixed(2)} budget`);
+    size = { qty: String(qty) };
+  }
 
   const res = await fetch(`${ALPACA_BASE}/v2/orders`, {
     method: "POST",
     headers: ALPACA_HEADERS,
     body: JSON.stringify({
       symbol,
-      notional:     notional.toFixed(2),
+      ...size,
       side,
       type:         "market",
       time_in_force: tif,
@@ -298,7 +237,7 @@ async function placeOrder(symbol, side, notionalUSD) {
 }
 
 async function closeAlpacaPosition(symbol) {
-  const res = await fetch(`${ALPACA_BASE}/v2/positions/${symbol}`, {
+  const res = await fetch(`${ALPACA_BASE}/v2/positions/${encodeURIComponent(symbol)}`, {
     method: "DELETE",
     headers: ALPACA_HEADERS,
   });
@@ -306,6 +245,25 @@ async function closeAlpacaPosition(symbol) {
     const data = await res.json();
     throw new Error(`Close position failed: ${data.message || JSON.stringify(data)}`);
   }
+  return res.ok ? res.json().catch(() => null) : null;   // the closing order
+}
+
+/** Average fill price of an order, polling briefly (market orders fill in
+ *  well under a second during RTH). null if not filled within `waitMs`. */
+async function orderFillPrice(orderId, waitMs = 10_000) {
+  if (!orderId) return null;
+  const until = Date.now() + waitMs;
+  while (Date.now() < until) {
+    try {
+      const res = await fetch(`${ALPACA_BASE}/v2/orders/${orderId}`, { headers: ALPACA_HEADERS });
+      const o = res.ok ? await res.json() : null;
+      const px = parseFloat(o?.filled_avg_price);
+      if (o?.status === "filled" && px > 0) return px;
+      if (["canceled", "expired", "rejected"].includes(o?.status)) return null;
+    } catch {}
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return null;
 }
 
 // ── EMA helper (rolling array, O(1) update) ───────────────────────────────────
@@ -657,7 +615,7 @@ async function onBar(bar) {
 
 console.log("=".repeat(60));
 console.log("  Alpaca Streaming Bot");
-console.log(`  Symbols  : (resolved from Alpaca watchlist at startup)`);
+console.log(`  Symbols  : (from symbols.json / SYMBOLS env at startup)`);
 console.log(`  Strategy : ${STRATEGY}`);
 console.log(`  Trade $  : $${TRADE_USD}`);
 console.log(`  Mode     : ${IS_PAPER ? "PAPER (no orders sent)" : "ORDERS ENABLED"}`);
@@ -679,6 +637,14 @@ if (!IS_PAPER && describeAlpacaAccount(ALPACA_BASE) === "PAPER ACCOUNT") {
   console.warn("[Bot] PAPER_TRADING=false, but ALPACA_BASE_URL points at Alpaca paper. Orders will execute in the Alpaca paper account, not the live brokerage account.");
 }
 
+// Real-money guard: pointing ALPACA_BASE_URL at the live API is not enough on
+// its own to send live orders — that also takes LIVE_TRADING_CONFIRM=yes.
+if (!IS_PAPER && describeAlpacaAccount(ALPACA_BASE) === "LIVE ACCOUNT" && process.env.LIVE_TRADING_CONFIRM !== "yes") {
+  console.error("ERROR: orders are enabled against the LIVE Alpaca account but LIVE_TRADING_CONFIRM is not \"yes\". Refusing to start.");
+  console.error("Set LIVE_TRADING_CONFIRM=yes to trade real money, or use ALPACA_BASE_URL=https://paper-api.alpaca.markets.");
+  process.exit(1);
+}
+
 // Show current learned params at startup
 const startParams = loadLearnedParams(STRATEGY) || getDefaultParams(STRATEGY);
 console.log(`[Bot] Active ${STRATEGY} params:`, startParams);
@@ -687,7 +653,7 @@ saveState({ symbol: null, strategy: STRATEGY, botStarted: new Date().toISOString
 
 // ── Router mode: multi-symbol per-bar regime-based dispatch ─────────────────
 //
-// When ROUTER_ENABLED=true, the bot subscribes to every Alpaca watchlist
+// When ROUTER_ENABLED=true, the bot subscribes to every configured
 // symbol, classifies each symbol's regime on every bar, asks each active
 // strategy's signal evaluator whether it wants to enter, and routes to the
 // strategy with the best historical win rate in that regime.
@@ -701,6 +667,7 @@ function getSymState(sym) {
   if (!routerStates.has(sym)) {
     routerStates.set(sym, {
       bars: [],
+      series: new SymbolSeries(1),   // 5/15/60-minute bars built from the 1-minute stream
       ema9: new RollingEMA(9),
       ema21: new RollingEMA(21),
       position: null,
@@ -802,8 +769,6 @@ function routerStatsLookup(strategy, regime) {
   return all; // getRegimeStats returns per-regime only — null case yields null;
 }
 
-// Each strategy's signal evaluator wrapped to accept a per-symbol bar buffer.
-// evalORB and evalHybrid already accept barBuffer — wrap others.
 // ── TradingView alerts (written by the dashboard's /webhook/tradingview) ──────
 // An alert is used at most once (consumed on entry/exit); unused alerts expire
 // after TV_SIGNAL_MAX_AGE_SEC. Consumption is in-memory — after a restart,
@@ -825,31 +790,23 @@ function strategyUsedUp(s, strategy) {
   return strategy !== "tradingview" && !!s.strategiesTradedToday?.has(strategy);
 }
 
-function candidateSignals(strategy, sym, barBuffer) {
+// TradingView alerts aren't bar-driven, so they bypass signals.js: a fresh
+// alert is a candidate on whatever bar it arrives. Returns undefined for every
+// other strategy so decideEntry evaluates those on their native bars.
+function tvCandidate(strategy, sym, barBuffer) {
+  if (strategy !== "tradingview") return undefined;
   try {
-    if (strategy === "tradingview") {
-      const alert = freshTvAlert(sym, ["buy", "sell"]);
-      return alert ? buildTvTradeSignal(alert, barBuffer, { stopAtrMult: TV_STOP_ATR_MULT, rr: TV_RR }) : null;
-    }
-    if (strategy === "hybrid"   || strategy === "hybrid10")  return evalHybrid(barBuffer);
-    if (strategy === "orb")                                  return evalORB(barBuffer);
-    if (strategy === "smc")                                  return smcSignal(barBuffer, loadLearnedParams("smc") || undefined);
-    if (strategy === "predictor") {
-      if (!PREDICTOR_SIGNAL_ENABLED()) return null;
-      const params = predictorParams(etMinutesOf(new Date()));
-      const ev = evaluatePrediction(barBuffer, params);
-      recordPredictionSnapshot(sym, ev, params);   // feeds the dashboard views
-      return ev.signal;
-    }
-    // For strategies that aren't natively in this bot file yet, return null —
-    // they're still tracked in stats from backtests but live signals only fire
-    // for the two evaluators above.
-    return null;
+    const alert = freshTvAlert(sym, ["buy", "sell"]);
+    return alert ? buildTvTradeSignal(alert, barBuffer, { stopAtrMult: TV_STOP_ATR_MULT, rr: TV_RR }) : null;
   } catch (e) {
-    console.warn(`[Router] ${strategy} eval error for ${sym}:`, e.message);
+    console.warn(`[Router] tradingview eval error for ${sym}:`, e.message);
     return null;
   }
 }
+
+// Active strategies with no live evaluator are called out at startup instead
+// of silently never firing.
+const UNSUPPORTED_ACTIVE = () => ACTIVE_STRATS().filter(x => x !== "tradingview" && !SUPPORTED_STRATEGIES.includes(x));
 
 async function onRouterBar(bar) {
   const sym = bar.symbol;
@@ -858,19 +815,20 @@ async function onRouterBar(bar) {
   if (s.bars.length > 500) s.bars.shift();
   s.ema9.update(bar.close);
   s.ema21.update(bar.close);
+  const completed = s.series.push(bar);
 
-  const now    = new Date();
-  const etMins = etMinutesOf(now);
-  const today  = todayET(now);
+  // Clock = end of this 1-minute bar (when it arrives), so live and replay.js
+  // make identical time-of-day decisions.
+  const { mins: etMins, day: today } = etInfo(bar.time + 60_000);
   const crypto = isCryptoSymbol(sym);
 
   // Crypto trades 24/7 — bypass NYSE market-hours gating. For stocks, only
   // act inside RTH; for crypto, every bar at any hour is fair game.
-  if (!crypto && (etMins < MARKET_OPEN || etMins >= MARKET_CLOSE)) return;
+  if (!crypto && (etMins < MARKET_OPEN || etMins > MARKET_CLOSE)) return;   // the bar ending at 4:00 can still exit
   resetRouterDayIfNew(today);
 
   // ── EOD close (stocks only — crypto positions can roll overnight) ───
-  if (!crypto && etMins >= EOD_CLOSE && s.position) {
+  if (!crypto && s.position && !s.position.overnight && etMins >= (s.position.eodMins ?? EOD_CLOSE)) {
     console.log(`[Router] ${sym} EOD — close @ $${bar.close.toFixed(2)}`);
     await closeRouterPosition(sym, bar.close, "eod");
     return;
@@ -879,19 +837,10 @@ async function onRouterBar(bar) {
   // ── Manage open position (same exit logic as single-symbol path) ──────
   if (s.position) {
     const pos = s.position;
-    let exitPrice = null, exitReason = null;
-    // Underlying stop/target on the stock price (works for both stock and option positions)
-    if (pos.side === "buy") {
-      if (bar.low  <= pos.stop)   { exitReason = "stop";   exitPrice = pos.stop;   }
-      if (bar.high >= pos.target) { exitReason = "target"; exitPrice = pos.target; }
-    } else {
-      if (bar.high >= pos.stop)   { exitReason = "stop";   exitPrice = pos.stop;   }
-      if (bar.low  <= pos.target) { exitReason = "target"; exitPrice = pos.target; }
-    }
-    if (!exitReason) {
-      const nt = nearTargetTrigger(pos.side, pos.entry, pos.target, bar, learnedNearTargetPct(pos.strategy, pos.regime));
-      if (nt != null) { exitReason = "near-target"; exitPrice = nt; }
-    }
+    // Underlying stop / trailing stop / target / near-target / bias flip,
+    // shared with replay.js (works for both stock and option positions).
+    const ex = updatePosition(pos, bar, { series: s.series, completedTfs: completed, nearTargetPct: learnedNearTargetPct(pos.strategy, pos.regime) });
+    let exitPrice = ex?.exitPrice ?? null, exitReason = ex?.exitReason ?? null;
 
     // TradingView exit: for positions the TV strategy opened, an "exit" alert —
     // or an opposite-side alert (a reversal) — closes it at the bar close. Only
@@ -946,82 +895,54 @@ async function onRouterBar(bar) {
     return;
   }
 
-  // ── Entry: classify regime, gather candidates, route ──────────────────
-  // Allow each active strategy to fire once per symbol per day.
-  // We still keep only one open position per symbol at a time.
-  if (ACTIVE_STRATS().every(strategy => strategyUsedUp(s, strategy))) return;
-  if (!crypto && etMins < ORB_READY) return;  // ORB-gated entries are stocks-only
-  if (s.bars.length < 20) return;
-
-  // Daily loss limit — stop opening new positions for the rest of the day
-  if (dailyLossHalted()) return;
-
-  // Capacity check: don't exceed max concurrent positions
-  const openCount = [...routerStates.values()].filter(x => x.position).length;
-  if (openCount >= MAX_CONCURRENT()) return;
-
-  const r = classifyRegime(s.bars);
-  s.lastRegime = r.tag;
-
-  // Crypto narrows to strategies that don't depend on a 9:30 ET open.
-  // Mean-reversion / divergence strategies apply 24/7; ORB-based ones don't.
-  const eligibleStrats = crypto
-    ? ACTIVE_STRATS().filter(x => ["reversal", "vwap-reclaim", "hybrid-reversal"].includes(x))
-    : ACTIVE_STRATS();
-  const candidates = eligibleStrats
-    .filter(strategy => !strategyUsedUp(s, strategy))
-    .map(strategy => ({
-      strategy,
-      signal: candidateSignals(strategy, sym, s.bars),
-    }));
-
-  const decision = chooseSignal({
-    candidates,
-    regime:       r.tag,
-    statsLookup:  routerStatsLookup,
-    todayState:   routerDay,
-    strict:       STRICT_ROUTER,
-    consensusMin: CONSENSUS_MIN,
+  // ── Entry: gates, regime, candidates, route, predictor gate (signals.js) ──
+  // Each strategy is evaluated only when one of its native bars (5/15/60 min)
+  // closes, exactly as in its backtest. Shared with replay.js.
+  const dec = decideEntry({
+    state:     s,
+    completed,
+    etMins,
+    crypto,
+    symbol:    sym,
+    cfg:       { ...runtimeCfg, strict: STRICT_ROUTER, consensusMin: CONSENSUS_MIN },
+    day:       routerDay,
+    openCount: [...routerStates.values()].filter(x => x.position).length,
+    halted:    dailyLossHalted(),
+    statsLookup:    routerStatsLookup,
+    paramsFor:      strategy => loadLearnedParams(strategy) || {},
+    predict:        predictPrice,
+    extraCandidate: strategy => tvCandidate(strategy, sym, s.bars),
+    onPrediction:   (ev, params) => recordPredictionSnapshot(sym, ev, params),
   });
+  if (dec.regime) s.lastRegime = dec.regime;
+  if (!dec.decision) return;                       // a gate stopped it before routing
+  const decision = dec.decision;
   s.lastChoice = decision.chosen ? { strategy: decision.chosen.strategy, score: decision.chosen.score, winRate: decision.chosen.winRate, reason: decision.reason } : { reason: decision.reason };
-
+  if (dec.prediction && decision.chosen) {
+    const p = dec.prediction;
+    s.lastChoice.prediction = {
+      side: p.side, expectedReturnPct: +(+p.expectedReturnPct).toFixed(2), priceTarget: +(+p.priceTarget).toFixed(2),
+      confidence: +(+p.confidence).toFixed(2), horizonDays: p.horizonDays, source: p.source,
+      agrees: p.side === decision.chosen.signal.side,
+    };
+  }
   if (!decision.chosen) { saveRouterState(); return; }
-
-  console.log(`[Router] ${sym} ${r.tag} → ${decision.reason}`);
-
-  // ── PREDICTOR gate: the price-target model (4th brain) can veto or size the
-  // trade, and its target/horizon feed the Options Strategist downstream.
-  // Skipped when the predictor IS the signal source — it already generated
-  // the trade; it must not veto itself. ──
-  let prediction = decision.chosen.strategy === "predictor"
-    ? { ...decision.chosen.signal.prediction, side: decision.chosen.signal.side, price: decision.chosen.signal.entry }
-    : null;
-  if (PREDICTOR_ENABLED() && decision.chosen.strategy !== "predictor") {
-    try {
-      prediction = predictPrice(s.bars);
-      const agrees = prediction.side === decision.chosen.signal.side;
-      s.lastChoice = { ...s.lastChoice, prediction: {
-        side:              prediction.side,
-        expectedReturnPct: +prediction.expectedReturnPct.toFixed(2),
-        priceTarget:       +prediction.priceTarget.toFixed(2),
-        confidence:        +prediction.confidence.toFixed(2),
-        horizonDays:       prediction.horizonDays,
-        source:            prediction.source,
-        agrees,
-      }};
-      if (PREDICTOR_VETO() && !agrees && prediction.confidence >= PREDICTOR_MIN_CONF()) {
-        console.log(`[Predictor] ${sym} VETO — model says ${prediction.side} (${(prediction.confidence * 100).toFixed(0)}% conf) vs ${decision.chosen.signal.side} signal`);
-        saveRouterState();
-        return;
-      }
-      console.log(`[Predictor] ${sym} ${prediction.source} → ${prediction.side} ${prediction.expectedReturnPct >= 0 ? "+" : ""}${prediction.expectedReturnPct.toFixed(2)}% · target $${prediction.priceTarget.toFixed(2)} · ${(prediction.confidence * 100).toFixed(0)}% conf${agrees ? " ✓" : " (disagrees, not vetoed)"}`);
-    } catch (e) {
-      console.warn(`[Predictor] ${sym} prediction failed (proceeding): ${e.message}`);
-    }
+  console.log(`[Router] ${sym} ${dec.regime} → ${decision.reason}`);
+  if (dec.vetoed) {
+    console.log(`[Predictor] ${sym} VETO — ${dec.reason} vs ${decision.chosen.signal.side} signal`);
+    saveRouterState();
+    return;
+  }
+  const r = { tag: dec.regime };
+  const prediction = dec.prediction || null;
+  if (prediction && decision.chosen.strategy !== "predictor") {
+    const agrees = prediction.side === decision.chosen.signal.side;
+    console.log(`[Predictor] ${sym} ${prediction.source} → ${prediction.side} ${prediction.expectedReturnPct >= 0 ? "+" : ""}${prediction.expectedReturnPct.toFixed(2)}% · target $${prediction.priceTarget.toFixed(2)} · ${(prediction.confidence * 100).toFixed(0)}% conf${agrees ? " ✓" : " (disagrees, not vetoed)"}`);
   }
 
   // AGENT_DEBATE: Bull / Bear / Risk Manager weigh in before entry fires.
-  let sizeMultiplier = 1.0;
+  // decideEntry already applied the predictor's confidence sizing.
+  let sizeMultiplier = dec.sizeMultiplier ?? 1.0;
   if (debateEnabled()) {
     const tradeCandidate = {
       symbol:    sym,
@@ -1045,22 +966,29 @@ async function onRouterBar(bar) {
       console.log(`[Agents] ${sym}: ${debate.verdict} (bull ${debate.bull.confidence}, bear ${debate.bear.confidence}) → ${debate.risk.reasoning}`);
       s.lastChoice = { ...s.lastChoice, debate };
       if (debate.verdict !== "APPROVE") { saveRouterState(); return; }
-      sizeMultiplier = debate.risk.sizeMultiplier || 1.0;
+      sizeMultiplier *= debate.risk.sizeMultiplier || 1.0;
     } catch (e) {
       console.warn(`[Agents] ${sym} debate failed (proceeding with full size):`, e.message);
     }
   }
 
-  // Confidence-based sizing: scale up when the model strongly agrees, halve
-  // when it disagreed but wasn't confident enough to veto.
-  if (PREDICTOR_ENABLED() && PREDICTOR_SIZE_SCALING() && prediction) {
-    const agrees = prediction.side === decision.chosen.signal.side;
-    const predScale = agrees ? (0.75 + prediction.confidence * 0.5) : 0.5; // 0.75..1.25 / 0.5
-    sizeMultiplier *= predScale;
-  }
-
   await enterRouterTrade(sym, decision.chosen.strategy, decision.chosen.signal, bar, r.tag, sizeMultiplier, prediction);
   saveRouterState();
+}
+
+// How signals.js manages the position: native bar size (trailing stops and
+// bias-flip exits update on its closes), trailing-stop settings, initial stop.
+function exitPlan(strategy, signal) {
+  return {
+    tf:          signal.tf || STRATEGY_TF[strategy] || null,
+    initialStop: signal.stop,
+    ...(signal.trail    ? { trail: signal.trail } : {}),
+    ...(signal.biasFlip ? { biasFlip: true }      : {}),
+    ...(signal.timeExitAt ? { timeExitAt: signal.timeExitAt } : {}),
+    ...(signal.bandStop ? { bandStop: signal.bandStop } : {}),
+    ...(signal.eodMins ? { eodMins: signal.eodMins } : {}),
+    ...(signal.overnight ? { overnight: true, entryDay: signal.entryDay, dipExit: signal.dipExit } : {}),
+  };
 }
 
 async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultiplier = 1.0, prediction = null) {
@@ -1069,9 +997,10 @@ async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultipli
   const crypto = isCryptoSymbol(sym);
 
   // Options Strategist routes ALL stock-direction trades through the agent
-  // when OPTIONS_MODE is on. Crypto is excluded (Alpaca has no crypto options).
+  // when OPTIONS_MODE is on. Crypto is excluded (Alpaca has no crypto options),
+  // and so are strategies in stockOnlyStrategies, which always trade shares.
   let optionsPlan = null;
-  if (OPTIONS_MODE() && !crypto) {
+  if (OPTIONS_MODE() && !crypto && !(runtimeCfg.stockOnlyStrategies || []).includes(strategy)) {
     try {
       // When the predictor agrees with the trade (or generated it), hand its
       // price target and horizon to the options planner so it picks a
@@ -1091,14 +1020,21 @@ async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultipli
       const optionSignal = { ...signal, symbol: sym, strategy, regime, target: strikeTarget };
       // Expiry: forecast horizon + buffer so theta doesn't strangle the trade
       // if the move takes the full horizon.
-      const optionDte = usePrediction
-        ? Math.max(1, (prediction.horizonDays || OPTIONS_DTE()) + OPTIONS_DTE_BUFFER())
+      // OPTIONS_DTE 0 = 0DTE: always same-day contracts, even when the
+      // predictor supplies a multi-day horizon.
+      const optionDte = OPTIONS_DTE() === 0 ? 0
+        : usePrediction ? Math.max(1, (prediction.horizonDays || OPTIONS_DTE()) + OPTIONS_DTE_BUFFER())
         : OPTIONS_DTE();
       optionsPlan = await planOptionsTrade(
         optionSignal,
         bar.close,
         { dte: optionDte, underlying: sym },
       );
+      if (optionsPlan?.contract && runtimeCfg.targetMode === "liquidity" && optionsPlan.exitTriggers) {
+        // ICT liquidity targets: let the underlying reach its target; keep
+        // only the premium max-loss stop (plus the underlying stop / EOD).
+        optionsPlan.exitTriggers = { ...optionsPlan.exitTriggers, profitTargetPct: null, timeExitMinutes: null };
+      }
       if (optionsPlan?.contract) {
         console.log(`[OptionsAgent] ${sym} → ${optionsPlan.contract.symbol} (${optionsPlan.contract.type} ${optionsPlan.contract.strike}@${optionsPlan.contract.expiry}, premium $${(optionsPlan.contract.mid||0).toFixed(2)}, delta ${optionsPlan.contract.delta?.toFixed(2)}) · ${optionsPlan.reasoning}`);
       } else {
@@ -1112,6 +1048,7 @@ async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultipli
   }
 
   // Execute the trade
+  let optionsOrder = null, stockOrder = null;
   if (optionsPlan?.contract) {
     // Options leg
     const contractMid = optionsPlan.contract.mid || optionsPlan.contract.ask || 1;
@@ -1119,7 +1056,7 @@ async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultipli
     if (IS_PAPER) {
       console.log(`[Router] PAPER BUY ${numContracts}× ${optionsPlan.contract.symbol} (~$${(numContracts * contractMid * 100).toFixed(2)}) for stock ${signal.side.toUpperCase()} ${sym} [regime: ${regime}]`);
     } else {
-      try { await placeOptionsOrder(optionsPlan.contract.symbol, "buy", numContracts); }
+      try { optionsOrder = await placeOptionsOrder(optionsPlan.contract.symbol, "buy", numContracts); }
       catch (e) { console.error(`[Router] ${sym} options order failed:`, e.message); return; }
     }
     s.position = {
@@ -1127,6 +1064,7 @@ async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultipli
       entry:          signal.entry,
       stop:           signal.stop,
       target:         signal.target,
+      ...exitPlan(strategy, signal),
       strategy, regime,
       entryTime:      new Date().toISOString(),
       entryBar:       bar,
@@ -1147,7 +1085,7 @@ async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultipli
     if (IS_PAPER) {
       console.log(`[Router] PAPER ${signal.side.toUpperCase()} ${sym} via ${strategy} $${perPositionUSD.toFixed(2)} @ ~${bar.close.toFixed(2)} [regime: ${regime}]`);
     } else {
-      try { await placeOrder(sym, signal.side, perPositionUSD); }
+      try { stockOrder = await placeOrder(sym, signal.side, perPositionUSD, bar.close); }
       catch (e) { console.error(`[Router] ${sym} order failed:`, e.message); return; }
     }
     s.position = {
@@ -1155,11 +1093,24 @@ async function enterRouterTrade(sym, strategy, signal, bar, regime, sizeMultipli
       entry:  signal.entry,
       stop:   signal.stop,
       target: signal.target,
+      ...exitPlan(strategy, signal),
       strategy, regime,
       entryTime: new Date().toISOString(),
       entryBar:  bar,
       isOption:  false,
     };
+  }
+
+  // Orders sent: record the real fill so the trade history shows actual
+  // slippage/spread vs the signal price (what paper-account testing is for).
+  const order = optionsOrder || stockOrder;
+  if (order && s.position) {
+    s.position.entryOrderId = order.id;
+    const fill = await orderFillPrice(order.id);
+    if (fill != null) {
+      s.position.entryFill = fill;
+      console.log(`[Router] ${sym} filled @ ${fill} (${optionsOrder ? "premium" : "signal " + signal.entry.toFixed(2)})`);
+    }
   }
 
   s.tradedToday = true;
@@ -1186,17 +1137,33 @@ async function closeRouterPosition(sym, exitPrice, exitReason) {
   const s = getSymState(sym);
   const pos = s.position;
   if (!pos) return;
+  let exitFill = null;
   if (!IS_PAPER) {
     // For option positions, close the option contract directly (its OCC symbol),
     // not the underlying stock symbol.
     const closeSymbol = pos.isOption && pos.contractSymbol ? pos.contractSymbol : sym;
-    try { await closeAlpacaPosition(closeSymbol); } catch (e) { console.error(`[Router] ${closeSymbol} close failed:`, e.message); }
+    try {
+      const closeOrder = await closeAlpacaPosition(closeSymbol);
+      exitFill = await orderFillPrice(closeOrder?.id);
+    } catch (e) { console.error(`[Router] ${closeSymbol} close failed:`, e.message); }
   }
+  // Stock trades are scored on the real fills when both are known; the signal
+  // prices are kept alongside so slippage can be measured.
+  const stockFills = !pos.isOption && pos.entryFill != null && exitFill != null;
+  const dir = pos.side === "buy" ? 1 : -1;
+  const fills = pos.entryFill != null || exitFill != null ? {
+    entry: pos.entryFill ?? null, exit: exitFill,
+    signalEntry: pos.entry, signalExit: exitPrice,
+    ...(!pos.isOption && pos.entryFill != null ? { entrySlipPct: +(dir * (pos.entryFill - pos.entry) / pos.entry * 100).toFixed(4) } : {}),
+    ...(!pos.isOption && exitFill != null ? { exitSlipPct: +(dir * (exitPrice - exitFill) / exitPrice * 100).toFixed(4) } : {}),
+  } : null;
   const hourET = etMinutesOf(new Date(pos.entryTime || Date.now())) / 60 | 0;
   const { pnlPct } = recordTradeClosed({
     symbol: sym, strategy: pos.strategy, side: pos.side,
-    source: IS_PAPER ? "paper" : "live",
-    entryPrice: pos.entry, exitPrice,
+    source: TRADE_SOURCE,
+    entryPrice: stockFills ? pos.entryFill : pos.entry,
+    exitPrice:  stockFills ? exitFill : exitPrice,
+    fills,
     entryTime: pos.entryTime, exitTime: new Date().toISOString(),
     exitReason,
     regime: pos.regime,
@@ -1212,12 +1179,13 @@ async function closeRouterPosition(sym, exitPrice, exitReason) {
       optionDte:      pos.contract?.dte,
       optionDelta:    pos.contract?.delta,
       optionIv:       pos.entryIv,
-      entryPremium:   pos.entryPremium,
-      // exitPremium / optionsPnL aren't known exactly here — Alpaca's close
-      // order fill arrives async. We approximate via the underlying move and
-      // record the contract type so the agent learns from directional outcome
-      // even before fill prices land.
-      optionsPnL:     null,
+      entryPremium:   pos.entryFill ?? pos.entryPremium,
+      // With orders enabled these are real fills; in PAPER_TRADING mode the
+      // exit premium isn't known and only the underlying move is recorded.
+      ...(pos.entryFill != null && exitFill != null ? {
+        exitPremium: exitFill,
+        optionsPnL:  +((exitFill - pos.entryFill) * 100 * (pos.numContracts || 1)).toFixed(2),
+      } : { optionsPnL: null }),
       agentSource:    pos.agentSource,
       agentReasoning: pos.agentReasoning,
       agentConfidence: pos.agentConfidence,
@@ -1229,21 +1197,9 @@ async function closeRouterPosition(sym, exitPrice, exitReason) {
 
 // ── Wire up the stream ────────────────────────────────────────────────────────
 
-// The Alpaca watchlist is the ONLY source of traded stock symbols — no env
-// fallback. Manage it from the dashboard (Account tab) or the Alpaca app.
-async function fetchWatchlistSymbols() {
-  const wlRes = await fetch(`${ALPACA_BASE}/v2/watchlists`, { headers: ALPACA_HEADERS });
-  const wl    = wlRes.ok ? await wlRes.json() : [];
-  if (!wl?.length) return [];
-  const detailRes = await fetch(`${ALPACA_BASE}/v2/watchlists/${wl[0].id}`, { headers: ALPACA_HEADERS });
-  const detail    = detailRes.ok ? await detailRes.json() : { assets: [] };
-  return (detail.assets || []).map(a => a.symbol).filter(Boolean);
-}
-
-let resolvedSymbols = [];
-try {
-  resolvedSymbols = await fetchWatchlistSymbols();
-} catch (e) { console.warn("[Bot] watchlist fetch failed:", e.message); }
+// Traded stock symbols come from the bot's own list (symbols.json / SYMBOLS
+// env — see symbols.js), not an Alpaca watchlist. Alpaca only supplies prices.
+let resolvedSymbols = loadSymbols();
 
 if (ROUTER_ENABLED()) {
   console.log(`[Router] ENABLED — strategies: ${ACTIVE_STRATS().join(", ")}`);
@@ -1256,22 +1212,22 @@ if (ROUTER_ENABLED()) {
   console.log(TV_ENABLED()
     ? `[TradingView] alerts ENABLED — POST /webhook/tradingview · alerts expire after ${TV_MAX_AGE_SEC()}s · default stop ${TV_STOP_ATR_MULT}×ATR, target ${TV_RR}R`
     : `[TradingView] alerts off — set TV_WEBHOOK_SECRET to trade TradingView alerts`);
-  console.log(`[Router] subscribing to ${resolvedSymbols.length} watchlist symbols: ${resolvedSymbols.join(", ") || "(none)"}`);
+  console.log(`[Router] subscribing to ${resolvedSymbols.length} symbols: ${resolvedSymbols.join(", ") || "(none)"}`);
 } else {
-  // Single-strategy mode trades the FIRST watchlist symbol.
+  // Single-strategy mode trades the FIRST configured symbol.
   SYMBOL = resolvedSymbols[0] || null;
   resolvedSymbols = SYMBOL ? [SYMBOL] : [];
   console.log(SYMBOL
-    ? `[Bot] single-strategy mode (${STRATEGY} on ${SYMBOL} — first watchlist symbol) — toggle Router ON for multi-strategy routing`
-    : `[Bot] single-strategy mode, but the Alpaca watchlist is empty — nothing to trade`);
+    ? `[Bot] single-strategy mode (${STRATEGY} on ${SYMBOL} — first configured symbol) — toggle Router ON for multi-strategy routing`
+    : `[Bot] single-strategy mode, but no symbols are configured — nothing to trade`);
   if (SYMBOL) saveState({ symbol: SYMBOL });
 }
 
 if (resolvedSymbols.length === 0 && CRYPTO_SYMBOLS.length === 0) {
   console.error("═".repeat(60));
-  console.error("[Bot] NO SYMBOLS TO TRADE — your Alpaca watchlist is empty.");
-  console.error("[Bot] Add symbols (e.g. SPY, TSLA, QQQ, MSFT, META) in the");
-  console.error("[Bot] dashboard's Account tab or the Alpaca app, then restart.");
+  console.error("[Bot] NO SYMBOLS TO TRADE — no stock symbols configured.");
+  console.error("[Bot] Set SYMBOLS=SPY,TSLA,QQQ,MSFT,META in .env, or add stocks in");
+  console.error("[Bot] the dashboard's Account tab, then restart.");
   console.error("═".repeat(60));
 }
 
@@ -1289,6 +1245,10 @@ function writeHeartbeat() {
       optionsMode:     OPTIONS_MODE(),
       paper:           IS_PAPER,
       symbols:         resolvedSymbols,
+      // Bars on hand per symbol (5m/15m/1h) — shows the startup warm-up worked.
+      bars: Object.fromEntries([...routerStates].map(([sym, s]) => [sym, { m5: s.series.get(5).length, m15: s.series.get(15).length, h1: s.series.get(60).length, daily: s.series.daily.length }])),
+      activeStrategies: ACTIVE_STRATS(),
+      unsupportedStrategies: UNSUPPORTED_ACTIVE(),
     }));
   } catch {}
 }
@@ -1298,6 +1258,64 @@ setInterval(writeHeartbeat, 60_000);
 // Split symbols by feed: stocks go to the IEX stream, crypto to the v1beta3 stream.
 const stockSymbols  = resolvedSymbols.filter(s => !isCryptoSymbol(s));
 const cryptoSymbols = [...new Set([...resolvedSymbols.filter(isCryptoSymbol), ...CRYPTO_SYMBOLS])];
+
+// Warm up each stock symbol's bar series from recent history, so strategies
+// on 5/15/60-minute bars (EMAs, ATR, regime, the predictor) can trade from the
+// first bar after a restart instead of waiting hours to fill their buffers.
+const WARMUP_DAYS = parseInt(process.env.WARMUP_DAYS || "21");  // calendar days: noise-momentum needs 14 trading days
+for (const sym of stockSymbols) {
+  try {
+    const hist = await fetchCandles(sym, "1m", { days: WARMUP_DAYS, cap: 50_000 });
+    const s = getSymState(sym);
+    for (const b of hist) {
+      s.series.push(b);
+      s.bars.push({ ...b, symbol: sym });
+      if (s.bars.length > 500) s.bars.shift();
+    }
+    // Daily sessions for daily-bar strategies (dip-buy's 200-day average):
+    // older than the intraday warm-up. Stamp +12h so the UTC-midnight daily
+    // bar maps to its own ET date in winter too.
+    try {
+      const days = await fetchCandles(sym, "1D", { days: 420, cap: 1_000 });
+      s.series.seedDaily(days.map(d => ({ day: etInfo(d.time + 12 * 3600_000).day, open: d.open, high: d.high, low: d.low, close: d.close })));
+    } catch (e) { console.warn(`[Bot] daily history ${sym} failed (${e.message}) — daily strategies wait for 200 sessions`); }
+    console.log(`[Bot] warm-up ${sym}: ${hist.length} 1m bars → ${s.series.get(5).length}×5m ${s.series.get(15).length}×15m ${s.series.get(60).length}×1h, ${s.series.daily.length} daily`);
+  } catch (e) {
+    console.warn(`[Bot] warm-up ${sym} failed (${e.message}) — its strategies start once enough live bars arrive`);
+  }
+}
+
+// Overnight positions (dip-buy) survive restarts: restore them from the last
+// saved router state. Intraday positions are not restored — they would have
+// been closed at 3:45 anyway.
+const restored = [];
+try {
+  const saved = existsSync(ROUTER_STATE_FILE) ? JSON.parse(readFileSync(ROUTER_STATE_FILE, "utf8")) : null;
+  for (const [sym, v] of Object.entries(saved?.symbols || {})) {
+    if (v.position?.overnight && stockSymbols.includes(sym)) {
+      getSymState(sym).position = v.position;
+      restored.push(`${sym} ${v.position.strategy} from ${v.position.entryDay}`);
+    }
+  }
+  if (restored.length) console.log(`[Router] restored overnight position(s): ${restored.join(", ")}`);
+} catch (e) { console.warn("[Router] could not restore positions:", e.message); }
+
+// With orders enabled, the bot only manages positions it opened since this
+// start (plus restored overnight ones). Flag anything else already open in the
+// account on its symbols — it will NOT be managed or closed automatically.
+if (!IS_PAPER) {
+  try {
+    const res = await fetch(`${ALPACA_BASE}/v2/positions`, { headers: ALPACA_HEADERS });
+    const open = res.ok ? await res.json() : [];
+    const ours = open.filter(p => stockSymbols.some(sym => p.symbol === sym || p.symbol.startsWith(sym)) && !routerStates.get(p.symbol)?.position);
+    if (ours.length) console.warn(`[Bot] ${ours.length} open ${TRADE_SOURCE} position(s) the bot is NOT tracking (from before this start): ${ours.map(p => `${p.symbol} ${p.qty}`).join(", ")} — close them in Alpaca if unwanted`);
+  } catch (e) { console.warn("[Bot] could not list open positions:", e.message); }
+}
+
+if (UNSUPPORTED_ACTIVE().length) {
+  console.warn(`[Router] no live evaluator for: ${UNSUPPORTED_ACTIVE().join(", ")} — these never fire live (backtest-only)`);
+}
+writeHeartbeat();   // record the warm-up
 
 const streams = [];
 
