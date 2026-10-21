@@ -254,7 +254,7 @@
         </div>
       </div>
       <div style="font-size:11px;color:var(--muted);margin-left:auto;line-height:1.5">
-        Stocks are added to your Alpaca watchlist.<br>
+        Stocks are saved to the bot's <code>symbols.json</code>.<br>
         Crypto is saved to <code>bot-config.json</code>.<br>
         Options trades use whichever stock symbol fires.
       </div>
@@ -494,7 +494,7 @@
     </div>
     <div>
       <div style="font-size:11px;color:var(--muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:.6px">Symbols (optional override)</div>
-      <input id="ds-symbols" type="text" class="inp" style="width:280px" placeholder="leave blank to use Alpaca watchlist">
+      <input id="ds-symbols" type="text" class="inp" style="width:280px" placeholder="leave blank to use the bot's symbols">
     </div>
     <button class="btn btn-primary" onclick="runDailySignals()">Generate Signals</button>
   </div>
@@ -578,6 +578,7 @@
     <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
       <button class="btn btn-primary"  onclick="bootstrapRouter()">Bootstrap from Backtest</button>
       <button class="btn btn-green"    onclick="runYearOptions()">Year Backtest (Options)</button>
+      <button class="btn btn-primary"  onclick="runReplay()" title="The live router over a year of history: every active strategy, the router's choice, predictor gate, exits and limits together">Full-System Replay</button>
       <button class="btn btn-hermes"   onclick="optimizeByRegime()">Optimize All by Regime</button>
       <button class="btn btn-outline"  onclick="loadRouterState()">Refresh</button>
     </div>
@@ -596,6 +597,11 @@
   </div>
 
   <div id="router-msg" style="font-size:12px;color:var(--muted);padding:8px 14px"></div>
+
+  <div id="replay-results" class="section" style="display:none;padding:14px 18px">
+    <div class="section-header">Full-System Replay (the live router over the past year, 1-minute bars)</div>
+    <div id="replay-body" style="padding:10px;overflow-x:auto"></div>
+  </div>
 
   <div id="year-options-results" class="section" style="display:none;padding:14px 18px">
     <div class="section-header">Year-long Options Backtest — Summary by Strategy</div>
@@ -632,6 +638,20 @@
     </div>
     <div id="screener-status" style="font-size:12px;color:var(--muted);padding:6px 14px"></div>
     <div id="screener-body" class="tbl-wrap" style="padding:6px"></div>
+  </div>
+
+  <div class="section" style="margin-top:12px">
+    <div class="section-header" style="display:flex;align-items:center;justify-content:space-between">
+      <span>🔎 Strategy-Fit Screener (hybrid10 · vwap-reclaim)</span>
+      <span>
+        <label style="font-size:11px;color:var(--muted);margin-right:8px"><input type="checkbox" id="sfs-actives"> + today's most-active</label>
+        <button class="btn btn-primary" onclick="runStrategyScreener()">Run (takes minutes)</button>
+        <button class="btn btn-outline" onclick="loadStrategyScreener()">Refresh</button>
+      </span>
+    </div>
+    <div style="font-size:12px;color:var(--muted);padding:6px 14px">Backtests each strategy on ~2 years of 5m bars per symbol. A symbol <strong>fits</strong> only if the strategy was profitable after a 0.02% round-trip cost in <em>both</em> the older and the newer year (≥20 trades each) — picking on one period alone mostly finds luck. 0DTE columns: expiries in the next 7 days and the median near-the-money option spread (indicative quotes, so an estimate).</div>
+    <div id="sfs-status" style="font-size:12px;color:var(--muted);padding:6px 14px"></div>
+    <div id="sfs-body" class="tbl-wrap" style="padding:6px"></div>
   </div>
 
   <!-- Live bot view: what the model saw on the last bar, in the bot process -->
@@ -2202,7 +2222,7 @@ async function loadBotControls() {
     document.getElementById("cfg-consensus").value   = cfg.consensusMin || 1;
     document.getElementById("cfg-max").value         = cfg.maxConcurrentPositions || 5;
     document.getElementById("cfg-options").checked   = !!cfg.optionsMode;
-    document.getElementById("cfg-opt-dte").value     = cfg.optionsDte || 7;
+    document.getElementById("cfg-opt-dte").value     = cfg.optionsDte ?? 7;
     const hint = document.getElementById("cfg-router-hint");
     if (cfg.routerEnabled) {
       hint.textContent  = `ON · ${(cfg.activeStrategies||[]).join(', ')}`;
@@ -2267,9 +2287,9 @@ async function addStock() {
     const r = await fetch("/api/watchlist/add", { method: "POST", headers: { "Content-Type":"application/json" }, body: JSON.stringify({ symbol: sym }) }).then(r => r.json());
     if (r.error) return flashStatus("Add failed: " + r.error);
     document.getElementById("add-stock").value = "";
-    flashStatus(r.created
-      ? `${sym} added · created a new watchlist for the bot · restart bot-stream service to apply`
-      : `${sym} added to watchlist · restart bot-stream service to apply`);
+    flashStatus(r.added
+      ? `${sym} added · restart bot-stream service to apply`
+      : `${sym} is already in the list`);
     loadActiveSymbols();
   } catch (e) { flashStatus("Error: " + e.message); }
 }
@@ -2287,7 +2307,7 @@ async function addCrypto() {
 }
 
 async function removeStock(sym) {
-  if (!confirm(`Remove ${sym} from your Alpaca watchlist?`)) return;
+  if (!confirm(`Remove ${sym} from the bot's symbols?`)) return;
   try {
     const r = await fetch("/api/watchlist/" + encodeURIComponent(sym), { method: "DELETE" }).then(r => r.json());
     if (r.error) return flashStatus("Remove failed: " + r.error);
@@ -2319,7 +2339,7 @@ async function loadActiveSymbols(botState) {
 
   const syms = data.perSymbol || [];
   if (syms.length === 0) {
-    target.innerHTML = '<div style="color:var(--muted);font-size:13px;padding:8px">No symbols configured. Add a watchlist in Alpaca or set CRYPTO_SYMBOLS on Railway.</div>';
+    target.innerHTML = '<div style="color:var(--muted);font-size:13px;padding:8px">No symbols configured. Add a stock above, or set SYMBOLS / CRYPTO_SYMBOLS in .env.</div>';
     summary.textContent = "";
     return;
   }
@@ -2398,6 +2418,38 @@ async function loadRouterState() {
 }
 
 // ─── Screener (price-target model) ───────────────────────────────────────────
+// ─── Strategy-fit screener (strategy-screener.js) ─────────────────────────────
+let _sfsPoll = null;
+async function runStrategyScreener() {
+  const mostActives = document.getElementById('sfs-actives').checked ? 30 : 0;
+  const r = await fetch('/api/strategy-screener/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mostActives }) }).then(r => r.json());
+  document.getElementById('sfs-status').textContent = r.error ? 'Error: ' + r.error : 'Running… (first run downloads 2 years of bars per symbol)';
+  clearInterval(_sfsPoll);
+  _sfsPoll = setInterval(loadStrategyScreener, 15000);
+}
+
+async function loadStrategyScreener() {
+  const status = document.getElementById('sfs-status'), body = document.getElementById('sfs-body');
+  let d;
+  try { d = await fetch('/api/strategy-screener').then(r => r.json()); } catch (e) { status.textContent = 'Error: ' + e.message; return; }
+  if (d.running) status.textContent = `Running since ${new Date(d.running.startedAt).toLocaleTimeString()}…`;
+  else { clearInterval(_sfsPoll); status.textContent = d.lastError ? 'Last run failed: ' + d.lastError : ''; }
+  const res = d.result;
+  if (!res) { if (!d.running) body.innerHTML = '<div style="color:var(--muted);padding:8px">No results yet — click Run.</div>'; return; }
+  if (!d.running) status.textContent = `Last run ${new Date(res.generatedAt).toLocaleString()} · ${res.rows.length} symbols screened`;
+  const n = v => v == null ? '—' : (v > 0 ? '+' : '') + v.toFixed(3) + 'R';
+  const tables = res.params.strategies.map(s => {
+    const fits = res.rows.filter(x => x.strategies[s].fits).sort((a, b) => b.strategies[s].test.netR - a.strategies[s].test.netR);
+    const v = res.validation[s];
+    const rows = fits.map(x => { const st = x.strategies[s];
+      return `<tr><td><strong>${x.symbol}</strong></td><td>${n(st.selection.netR)} <span style="color:var(--muted)">(${st.selection.trades})</span></td><td>${n(st.test.netR)} <span style="color:var(--muted)">(${st.test.trades})</span></td><td>${st.test.winRate}%</td><td>${x.options.expiriesPerWeek}/wk</td><td>${x.options.atmSpreadPct ?? '?'}%</td><td><button class="btn btn-outline" style="font-size:11px;padding:2px 8px" onclick="document.getElementById('add-stock').value='${x.symbol}';addStock()">Add</button></td></tr>`; }).join('');
+    return `<div style="margin:6px 0 14px"><div style="font-weight:600;margin-bottom:4px">${s} — ${fits.length} fit</div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Does picking on the older year work? Symbols positive then averaged <strong>${n(v.newerYearNetR_picked)}</strong> the next year (${v.pickedOnOlderYear}); the others ${n(v.newerYearNetR_notPicked)} (${v.notPicked}).</div>
+      <table class="tbl"><thead><tr><th>Symbol</th><th>Older year (net)</th><th>Newer year (net)</th><th>Win</th><th>0DTE</th><th>ATM spread</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="7" style="color:var(--muted)">No symbol was profitable after costs in both years.</td></tr>'}</tbody></table></div>`;
+  }).join('');
+  body.innerHTML = tables;
+}
+
 async function loadScreener() {
   const status = document.getElementById('screener-status');
   const body   = document.getElementById('screener-body');
@@ -2646,6 +2698,42 @@ function renderRouterState(d) {
     return `<tr><td><strong>${strat}</strong></td>${cells}</tr>`;
   }).join('');
   document.getElementById('router-heatmap').innerHTML = `<table style="border-collapse:collapse;width:100%"><thead>${head}</thead><tbody>${rows}</tbody></table>`;
+}
+
+async function runReplay() {
+  const msg = document.getElementById('router-msg');
+  document.getElementById('router-loading').style.display = '';
+  msg.textContent = 'Replaying the live router over a year of 1-minute bars, with the predictor gate on and off — the first run downloads the data and takes a few minutes…';
+  try {
+    const data = await fetch('/api/backtest/replay', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(r => r.json());
+    document.getElementById('router-loading').style.display = 'none';
+    if (data.error) { msg.textContent = 'Replay failed: ' + data.error; return; }
+    msg.textContent = '';
+    const a = data.gateOn, b = data.gateOff;
+    const money = v => (v < 0 ? '-$' : '$') + Math.abs(v).toFixed(2);
+    const rows = [
+      ['Period', `${a.from} · ${a.tradingDays} days · ${a.mode}`, `${b.from} · ${b.tradingDays} days · ${b.mode}`],
+      ['Trades', `${a.trades} (${a.tradesPerDay}/day)`, `${b.trades} (${b.tradesPerDay}/day)`],
+      ['Win rate', a.winRate + '%', b.winRate + '%'],
+      ['Expectancy', a.expectancyR + 'R', b.expectancyR + 'R'],
+      ['Total P&L', money(a.totalPnlUSD), money(b.totalPnlUSD)],
+      ['Profit factor', a.profitFactor ?? '—', b.profitFactor ?? '—'],
+      ['Max drawdown', money(a.maxDrawdownUSD), money(b.maxDrawdownUSD)],
+      ['Sharpe (daily)', a.sharpe ?? '—', b.sharpe ?? '—'],
+      ['Vetoed by predictor', a.vetoedByPredictor, '—'],
+    ].map(([k, x, y]) => `<tr><td style="padding:4px 10px;color:var(--muted)">${k}</td><td style="padding:4px 10px">${x}</td><td style="padding:4px 10px">${y}</td></tr>`).join('');
+    const strat = Object.entries(a.byStrategy).map(([k, v]) =>
+      `<tr><td style="padding:4px 10px">${k}</td><td style="padding:4px 10px">${v.trades}</td><td style="padding:4px 10px">${v.winRate}%</td><td style="padding:4px 10px">${v.expectancyR}R</td><td style="padding:4px 10px">${money(v.pnlUSD)}</td></tr>`).join('');
+    document.getElementById('replay-body').innerHTML = `
+      <div style="font-size:12px;color:var(--muted);margin-bottom:8px">Strategies: ${a.activeStrategies.join(', ')} · model: ${a.model}. Router stats are walk-forward (only trades closed before each moment). Not simulated: the LLM agent debate, the LLM options planner (options priced with Black-Scholes, no bid/ask spread), slippage and commissions.</div>
+      <table style="border-collapse:collapse;margin-bottom:14px"><thead><tr><th></th><th style="padding:4px 10px;text-align:left">Predictor gate ON</th><th style="padding:4px 10px;text-align:left">Gate OFF</th></tr></thead><tbody>${rows}</tbody></table>
+      <div style="font-size:12px;color:var(--muted);margin:6px 0">By strategy (gate ON)</div>
+      <table style="border-collapse:collapse"><thead><tr><th style="padding:4px 10px;text-align:left">Strategy</th><th style="padding:4px 10px;text-align:left">Trades</th><th style="padding:4px 10px;text-align:left">Win</th><th style="padding:4px 10px;text-align:left">Expectancy</th><th style="padding:4px 10px;text-align:left">P&amp;L</th></tr></thead><tbody>${strat}</tbody></table>`;
+    document.getElementById('replay-results').style.display = '';
+  } catch (e) {
+    document.getElementById('router-loading').style.display = 'none';
+    msg.textContent = 'Replay failed: ' + e.message;
+  }
 }
 
 async function bootstrapRouter() {

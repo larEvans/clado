@@ -10,22 +10,30 @@ $ROOT           = $PSScriptRoot
 $CDP_PORT       = 9222
 $DASHBOARD_PORT = "3000"
 
-# Load .env
+# Read .env only for the values this script needs (port, dashboard token).
+# Deliberately NOT copied into the process environment: bot-stream.js and
+# dashboard.js load .env themselves via dotenv, which never overrides an
+# already-set variable - exporting here would freeze .env at launch time, so
+# later edits wouldn't apply when start.js restarts a child.
+$dotenv  = @{}
 $envFile = Join-Path $ROOT ".env"
 if (Test-Path $envFile) {
   Get-Content $envFile | ForEach-Object {
-    if ($_ -match "^\s*([^#=]+?)\s*=\s*(.*)$") {
-      $n = $matches[1].Trim()
+    if ($_ -match "^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$") {
       $v = $matches[2].Trim()
-      if (-not [System.Environment]::GetEnvironmentVariable($n, "Process")) {
-        [System.Environment]::SetEnvironmentVariable($n, $v, "Process")
-      }
+      if ($v -match '^"([^"]*)"' -or $v -match "^'([^']*)'") { $v = $matches[1] }  # quoted value
+      else { $v = ($v -replace '\s+#.*$', '').Trim() }                              # strip inline comment
+      $dotenv[$matches[1]] = $v
     }
   }
-  if ($env:DASHBOARD_PORT) { $DASHBOARD_PORT = $env:DASHBOARD_PORT }
 }
+if ($dotenv["DASHBOARD_PORT"]) { $DASHBOARD_PORT = $dotenv["DASHBOARD_PORT"] }
+$DASHBOARD_TOKEN = $dotenv["DASHBOARD_TOKEN"]
 
 $DASHBOARD_URL = "http://localhost:$DASHBOARD_PORT/dashboard.html"
+# The token in the URL makes the server set its auth cookie, so the page loads
+# instead of returning 401.
+$DASHBOARD_OPEN_URL = if ($DASHBOARD_TOKEN) { "http://localhost:$DASHBOARD_PORT/?token=$([uri]::EscapeDataString($DASHBOARD_TOKEN))" } else { $DASHBOARD_URL }
 
 Write-Host ""
 Write-Host "  Trading Dashboard Launcher" -ForegroundColor White
@@ -158,7 +166,7 @@ if ($WithClaude) {
 # ---- Open browser -------------------------------------------------------------
 Write-Host ""
 Write-Host "  Opening dashboard at $DASHBOARD_URL" -ForegroundColor Cyan
-Start-Process $DASHBOARD_URL
+Start-Process $DASHBOARD_OPEN_URL
 
 Write-Host ""
 Write-Host "  Dashboard : $DASHBOARD_URL" -ForegroundColor White

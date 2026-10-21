@@ -21,6 +21,8 @@ import { meta as gapFillMeta }        from "./strategies/gap-fill.js";
 import { meta as vwapReclaimMeta }    from "./strategies/vwap-reclaim.js";
 import { meta as firstHourFadeMeta }  from "./strategies/first-hour-fade.js";
 import { meta as smcMeta, checkSignal as smcSignal } from "./strategies/smc.js";
+import { meta as predictorMeta, evaluatePrediction } from "./strategies/predictor-strat.js";
+import { modelInfo } from "./ml/predictor.js";
 import { classifyRegime }              from "./regime.js";
 
 // ─── Market data ──────────────────────────────────────────────────────────────
@@ -33,6 +35,37 @@ import { classifyRegime }              from "./regime.js";
  * a full year (or longer) of data for sub-hour timeframes. Pagination cap
  * scales accordingly.
  */
+/**
+ * fetchCandles with a same-day on-disk cache in DATA_DIR/cache, for the big
+ * pulls replay.js and ml/export-dataset.js make (a year of 1m bars).
+ */
+export async function cachedCandles(symbol, interval, opts = {}) {
+  const { mkdirSync, existsSync, readFileSync, writeFileSync } = await import("fs");
+  const { dataPath } = await import("./state.js");
+  const dir = dataPath("cache");
+  mkdirSync(dir, { recursive: true });
+  const file = `${dir}/${symbol.replace("/", "-")}-${interval}-${opts.days || "default"}d-${new Date().toISOString().slice(0, 10)}.json`;
+  if (existsSync(file)) return JSON.parse(readFileSync(file, "utf8"));
+  const candles = await fetchCandles(symbol, interval, opts);
+  writeFileSync(file, JSON.stringify(candles));
+  return candles;
+}
+
+/** GET with a 30 s timeout, retried (1 s, 2 s, 4 s) on timeouts, network
+ *  errors, 429 and 5xx — long multi-page pulls hit the odd slow page. */
+async function fetchRetry(url, headers, attempts = 4) {
+  for (let i = 0; ; i++) {
+    try {
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(30_000) });
+      if ((res.status === 429 || res.status >= 500) && i < attempts - 1) throw new Error(`HTTP ${res.status}`);
+      return res;
+    } catch (e) {
+      if (i >= attempts - 1) throw e;
+      await new Promise(r => setTimeout(r, 1000 * 2 ** i));
+    }
+  }
+}
+
 export async function fetchCandles(symbol, interval, opts = {}) {
   const tfMap  = { "1m":"1Min","5m":"5Min","15m":"15Min","30m":"30Min","1H":"1Hour","4H":"4Hour","1D":"1Day" };
   const tf     = tfMap[interval] || "1Hour";
@@ -42,7 +75,8 @@ export async function fetchCandles(symbol, interval, opts = {}) {
 
   const shortDays = { "1Min":7,"5Min":60,"15Min":60,"30Min":60,"1Hour":365,"4Hour":365,"1Day":730 };
   const yearDays  = { "1Min":30,"5Min":365,"15Min":365,"30Min":365,"1Hour":730,"4Hour":730,"1Day":1825 };
-  const days = envDays
+  // opts.days wins over everything (used by the live warm-up and replay.js).
+  const days = opts.days || envDays
     || (yearWindow ? (yearDays[tf] || 365) : (shortDays[tf] || 60));
 
   const start = new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
@@ -56,7 +90,9 @@ export async function fetchCandles(symbol, interval, opts = {}) {
   // Crypto symbols (BTC/USD, ETH/USD…) use a different historical endpoint
   // and parameter set: /v1beta3/crypto/us/bars?symbols=BTC/USD&timeframe=…
   const isCrypto = symbol.includes("/");
-  const candleCap = (yearWindow || envDays) ? 30_000 : 5_000;
+  // Pages run forward from `start`, so the cap trims the NEWEST bars — callers
+  // that need recent data over a long window must raise it (opts.cap).
+  const candleCap = opts.cap || ((yearWindow || envDays) ? 30_000 : 5_000);
 
   const candles = [];
   let nextToken = null;
@@ -71,7 +107,7 @@ export async function fetchCandles(symbol, interval, opts = {}) {
         sort:      "asc",
         ...(nextToken && { page_token: nextToken }),
       });
-      const res = await fetch(`${BASE}/v1beta3/crypto/us/bars?${qs}`, { headers, signal: AbortSignal.timeout(30_000) });
+      const res = await fetchRetry(`${BASE}/v1beta3/crypto/us/bars?${qs}`, headers);
       if (!res.ok) throw new Error(`Alpaca crypto bars ${res.status} for ${symbol} — check the symbol format (e.g. BTC/USD)`);
       const json = await res.json();
       const bars = json.bars?.[symbol] || [];
@@ -81,7 +117,7 @@ export async function fetchCandles(symbol, interval, opts = {}) {
   } else {
     do {
       const qs = new URLSearchParams({ timeframe: tf, start, limit: "10000", adjustment: "split", feed: "iex", ...(nextToken && { page_token: nextToken }) });
-      const res = await fetch(`${BASE}/v2/stocks/${symbol}/bars?${qs}`, { headers, signal: AbortSignal.timeout(30_000) });
+      const res = await fetchRetry(`${BASE}/v2/stocks/${symbol}/bars?${qs}`, headers);
       if (!res.ok) throw new Error(`Alpaca bars ${res.status} for ${symbol} — check the ticker`);
       const json = await res.json();
       for (const b of (json.bars || [])) candles.push({ time: new Date(b.t).getTime(), open: b.o, high: b.h, low: b.l, close: b.c, volume: b.v });
@@ -118,7 +154,7 @@ function atmStrike(price, interval = 1) {
   return Math.round(price / interval) * interval;
 }
 
-function optionPremium(stockPrice, strike, daysRemaining, iv, type) {
+export function optionPremium(stockPrice, strike, daysRemaining, iv, type) {
   const T = Math.max(daysRemaining, 0.001) / 365;
   return Math.max(bsPrice(stockPrice, strike, T, iv, type), 0);
 }
@@ -972,6 +1008,8 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
     closeRangePct     = 25,
     overnightStopMult = 1.5,
     atrPeriod         = 14,
+    minRelVol         = 0,
+    relVolDays        = 14,
   } = { ...hybridMeta.params, ...params };
   const { mode = "stock", iv = 0.18, dteDays = 7, numContracts = 1, strikeInterval = 1, forceDaily = false } = opts;
   const atrArr = holdOvernight ? atrArray(allCandles, atrPeriod) : null;
@@ -984,6 +1022,7 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
 
   const sessions = groupByDay(allCandles);
   const trades   = [];
+  const openVols = [];   // opening-range volume per session, for the relative-volume filter
   // Position persists across sessions when holdOvernight is true and the
   // EOD gap-continuation setup triggers.
   let openTrade = null;
@@ -1013,6 +1052,13 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
 
     const sessCandles = candles.filter(c => c.time >= open && c.time < open + 7 * 3600_000);
     if (sessCandles.length < 4) continue;
+
+    // Relative volume of this opening range vs the previous relVolDays
+    // (recorded for every session, before the carried-over-trade skip).
+    const orbVol  = sessCandles.filter(c => c.time < orbEnd).reduce((s, c) => s + c.volume, 0);
+    const priorOV = openVols.slice(-relVolDays).filter(v => v > 0);
+    const relVol  = priorOV.length >= relVolDays / 2 ? orbVol / (priorOV.reduce((a, b) => a + b, 0) / priorOV.length) : null;
+    openVols.push(orbVol);
 
     // ── Carried-over trade: just manage exits this session, no new entries ──
     if (openTrade) {
@@ -1056,6 +1102,7 @@ function runHybridBacktest(allCandles, params = {}, opts = {}) {
 
     const mid = (orb.orbHigh + orb.orbLow) / 2;
     if ((orb.orbRange / mid) * 100 >= maxRangePct) continue;
+    if (minRelVol > 0 && !(relVol >= minRelVol)) continue;   // not "in play" today
 
     const postOrb      = sessCandles.filter(c => c.time >= orbEnd);
     let tradeEntered   = false;
@@ -1713,9 +1760,19 @@ function runFirstHourFadeBacktest(allCandles, params = {}, opts = {}) {
 }
 
 
+// Entry-side option fields (ATM contract), shared shape with the other runners.
+function makeOptionInfo(side, price, opts = {}) {
+  if (opts.mode !== "options") return {};
+  const optionType   = side === "buy" ? "call" : "put";
+  const optionStrike = atmStrike(price, opts.strikeInterval || 1);
+  const entryDTE     = opts.dteDays || 7;
+  return { optionType, optionStrike, entryPremium: optionPremium(price, optionStrike, entryDTE, opts.iv || 0.25, optionType), entryDTE };
+}
+
 function runSMCBacktest(allCandles, params = {}, opts = {}) {
   const p = { ...smcMeta.params, ...params };
   const days = groupByDay(allCandles);
+  const idxOf = new Map(allCandles.map((c, i) => [c, i]));
   const trades = [];
   for (const { date, candles } of days) {
     if (candles.length < 20) continue;
@@ -1723,7 +1780,8 @@ function runSMCBacktest(allCandles, params = {}, opts = {}) {
     let openTrade = null;
     for (let i = 0; i < candles.length; i++) {
       const bar = candles[i];
-      const hist = allCandles.filter(c => c.time <= bar.time).slice(-120);
+      const idx  = idxOf.get(bar);
+      const hist = allCandles.slice(Math.max(0, idx - 119), idx + 1);
       if (!openTrade && hist.length >= Math.max(50, p.htfEmaPeriod || 48)) {
         const sig = smcSignal(hist, p);
         if (sig) {
@@ -1762,6 +1820,91 @@ function runSMCBacktest(allCandles, params = {}, opts = {}) {
 }
 
 // ─── Metrics ──────────────────────────────────────────────────────────────────
+
+// ─── Predictor (XGBoost price-target) Backtest ───────────────────────────────
+//
+// Replays strategies/predictor-strat.js bar by bar with the live router's rules
+// (bot-stream.js onRouterBar): entries from 9:45 ET, at most one predictor
+// trade per symbol per day, one position at a time; exits on stop, target,
+// near-target, or the 3:45 ET EOD close. The model sees only the last
+// `lookback` bars up to and including the current one — the live buffer size.
+//
+// opts.oosStartMs: ignore entries before this time. runBacktest sets it to the
+// trained model's test_start so the model is only scored on data it never saw.
+
+const ET_MARKET_OPEN = 9 * 60 + 30, ET_ENTRY_READY = 9 * 60 + 45, ET_EOD_CLOSE = 15 * 60 + 45, ET_MARKET_CLOSE = 16 * 60;
+
+function etMinutes(ms) {
+  const d = new Date(ms - (isEDT(ms) ? 4 : 5) * 3600000);
+  return d.getUTCHours() * 60 + d.getUTCMinutes();
+}
+
+function runPredictorBacktest(allCandles, params = {}, opts = {}) {
+  const p = { ...predictorMeta.params, ...params };
+  const {
+    mode = "stock", iv = 0.18, dteDays = 7, numContracts = 1, strikeInterval = 1,
+    oosStartMs = null, lookback = 500, nearTargetPct = DEFAULT_NEAR_TARGET_PCT,
+  } = opts;
+
+  const trades = [];
+  let openTrade = null, tradedDay = null;
+
+  for (let i = 0; i < allCandles.length; i++) {
+    const bar  = allCandles[i];
+    const mins = etMinutes(bar.time);
+    if (mins < ET_MARKET_OPEN || mins >= ET_MARKET_CLOSE) continue;   // live acts on RTH bars only
+    const day = etDateKey(bar.time);
+
+    if (openTrade) {
+      let exitPrice = null, exitReason = null;
+      if (mins >= ET_EOD_CLOSE) { exitPrice = bar.close; exitReason = "eod"; }
+      else {
+        if (openTrade.side === "buy") {
+          if (bar.low  <= openTrade.stop)   { exitPrice = openTrade.stop;   exitReason = "stop";   }
+          if (bar.high >= openTrade.target) { exitPrice = openTrade.target; exitReason = "target"; }
+        } else {
+          if (bar.high >= openTrade.stop)   { exitPrice = openTrade.stop;   exitReason = "stop";   }
+          if (bar.low  <= openTrade.target) { exitPrice = openTrade.target; exitReason = "target"; }
+        }
+        if (!exitReason) {
+          const nt = nearTargetTrigger(openTrade.side, openTrade.entry, openTrade.target, bar, nearTargetPct);
+          if (nt != null) { exitPrice = nt; exitReason = "near-target"; }
+        }
+      }
+      if (exitReason) {
+        const risk   = Math.abs(openTrade.entry - openTrade.stop);
+        const pnlUSD = openTrade.side === "buy" ? exitPrice - openTrade.entry : openTrade.entry - exitPrice;
+        let optResult = {};
+        if (mode === "options" && openTrade.entryPremium != null) {
+          const elapsed     = (bar.time - openTrade.entryTime) / 86_400_000;
+          const exitPremium = optionPremium(exitPrice, openTrade.optionStrike, Math.max(openTrade.entryDTE - elapsed, 0.01), iv, openTrade.optionType);
+          const optPnL      = (exitPremium - openTrade.entryPremium) * 100 * numContracts;
+          optResult = { optionType: openTrade.optionType, optionStrike: openTrade.optionStrike, entryPremium: openTrade.entryPremium, exitPremium, optionsPnL: optPnL, optionsPnLPct: openTrade.entryPremium > 0 ? ((exitPremium - openTrade.entryPremium) / openTrade.entryPremium) * 100 : 0, optionDTE: openTrade.entryDTE };
+        }
+        trades.push({ date: openTrade.date, entryTime: openTrade.entryTime, exitTime: bar.time, side: openTrade.side, entry: openTrade.entry, stop: openTrade.stop, target: openTrade.target, exit: exitPrice, exitReason, pnlR: risk > 0 ? pnlUSD / risk : 0, pnlPct: (pnlUSD / openTrade.entry) * 100, prediction: openTrade.prediction, ...optResult });
+        openTrade = null;
+      }
+      continue;   // live: a bar that manages a position never also opens one
+    }
+
+    if (tradedDay === day || mins < ET_ENTRY_READY) continue;
+    if (oosStartMs != null && bar.time < oosStartMs) continue;
+
+    const ev = evaluatePrediction(allCandles.slice(Math.max(0, i - lookback + 1), i + 1), p);
+    if (!ev.signal) continue;
+    const { side, entry, stop, target, prediction } = ev.signal;
+
+    let optInfo = {};
+    if (mode === "options") {
+      const optionType   = side === "buy" ? "call" : "put";
+      const optionStrike = atmStrike(entry, strikeInterval);
+      optInfo = { optionType, optionStrike, entryPremium: optionPremium(entry, optionStrike, dteDays, iv, optionType), entryDTE: dteDays };
+    }
+    openTrade = { date: day, side, entry, stop, target, entryTime: bar.time, prediction, ...optInfo };
+    tradedDay = day;
+  }
+  return trades;
+}
 
 export function calcMetrics(trades, mode = "stock") {
   if (trades.length === 0) return { totalTrades: 0, message: "No trades found in backtest window" };
@@ -1825,17 +1968,64 @@ export function calcMetrics(trades, mode = "stock") {
   return result;
 }
 
+// ─── Strategies defined only in signals.js ───────────────────────────────────
+//
+// Run one strategy through replay.js's engine (the live router's code) on this
+// symbol's 5m bars: same entries, exits and session rules as live, with no
+// router competition, stats or predictor gate. Imported lazily because
+// signals.js / replay.js import this module.
+const SIGNALS_ONLY = ["late-momentum", "noise-momentum", "ict-2024", "sd-mtf", "dip-buy"];
+
+async function runSignalsBacktest(strategyId, symbol, candles, params = {}, opts = {}) {
+  const { simulate } = await import("./replay.js");
+  const { etInfo } = await import("./signals.js");
+  const data = { symbols: [symbol], base: "5m", baseMinutes: 5, statTrades: [], bars: { [symbol]: candles.map(c => ({ ...c, symbol })) } };
+  const { trades } = simulate(data, {
+    mode: opts.mode || "stock", iv: opts.iv, tradeUSD: 100, warmupDays: 21,
+    cfg: { activeStrategies: [strategyId], predictorEnabled: false, predictorSignalEnabled: false, maxConcurrentPositions: 1, optionsDte: opts.dteDays ?? 7 },
+    strategyParams: { [strategyId]: params },
+  });
+  return trades.map(t => ({
+    date: etInfo(t.entryTime).day, entryTime: t.entryTime, exitTime: t.exitTime, side: t.side,
+    entry: t.entry, stop: t.stop, target: t.target, exit: t.exit, exitReason: t.exitReason,
+    pnlR: t.pnlR, pnlPct: t.pnlPct, regime: t.regime,
+    ...(t.option ? { optionType: t.option.type, optionStrike: t.option.strike, entryPremium: t.option.entryPremium, exitPremium: t.option.exitPremium, optionsPnL: t.pnlUSD, optionDTE: t.option.dte } : {}),
+  }));
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export async function runBacktest(strategyId, symbol, opts = {}) {
-  const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m", reversal: "5m", "hybrid-reversal": "5m", hybrid10: "5m", "gap-fill": "5m", "vwap-reclaim": "5m", "first-hour-fade": "5m", smc: "15m" };
-  const timeframe  = TIMEFRAMES[strategyId] || "1H";
+  const TIMEFRAMES = { orb: "5m", vwap: "1H", trend: "1D", meanrev: "1D", momentum: "1D", hybrid: "5m", reversal: "5m", "hybrid-reversal": "5m", hybrid10: "5m", "gap-fill": "5m", "vwap-reclaim": "5m", "first-hour-fade": "5m", smc: "15m", predictor: process.env.PREDICTOR_INTERVAL || "5m", "late-momentum": "5m", "noise-momentum": "5m", "ict-2024": "5m", "sd-mtf": "5m", "dip-buy": "5m" };
+  // The predictor can be replayed on another bar size (e.g. 1m, what the live
+  // stream feeds it) via opts.timeframe; other strategies keep their native one.
+  const timeframe  = (strategyId === "predictor" && opts.timeframe) || TIMEFRAMES[strategyId] || "1H";
   console.log(`Backtesting ${strategyId.toUpperCase()} on ${symbol} (${timeframe}) — mode: ${opts.mode || "stock"}`);
   const candles = opts._candles || await fetchCandles(symbol, timeframe, { yearWindow: !!opts.yearWindow });
   if (!opts._candles) console.log(`  Got ${candles.length} candles`);
 
   const params = opts.params || {};
   let trades;
+  let modelNote = null;
+  if (strategyId === "predictor") {
+    // Only score a trained model on bars after its training data ended
+    // (model.json split.test_start_ms, written by ml/train.py).
+    const info  = modelInfo();
+    const split = info?.split || null;
+    const oos   = !!split?.test_start_ms && !opts.includeInSample;
+    modelNote = {
+      source:        info ? "xgboost" : "heuristic",
+      trainedAt:     info?.trained_at || null,
+      split,
+      outOfSampleOnly: oos,
+      warning: !info ? "No ml/model.json - this tests the heuristic baseline, not XGBoost."
+             : !split?.test_start_ms ? "Model has no time-split record (old train.py or --refit-all) - results are IN-SAMPLE and optimistic."
+             : !oos ? "includeInSample set - results include bars the model trained on."
+             : null,
+    };
+    if (oos) opts = { ...opts, oosStartMs: split.test_start_ms };
+    if (modelNote.warning) console.warn(`  [predictor] ${modelNote.warning}`);
+  }
   if      (strategyId === "orb")      trades = runORBBacktest(candles, params, opts);
   else if (strategyId === "vwap")     trades = runVWAPBacktest(candles, params, opts);
   else if (strategyId === "trend")    trades = runTrendBacktest(candles, params, opts);
@@ -1849,6 +2039,8 @@ export async function runBacktest(strategyId, symbol, opts = {}) {
   else if (strategyId === "vwap-reclaim")    trades = runVWAPReclaimBacktest(candles, params, opts);
   else if (strategyId === "first-hour-fade") trades = runFirstHourFadeBacktest(candles, params, opts);
   else if (strategyId === "smc")             trades = runSMCBacktest(candles, params, opts);
+  else if (strategyId === "predictor")       trades = runPredictorBacktest(candles, params, opts);
+  else if (SIGNALS_ONLY.includes(strategyId)) trades = await runSignalsBacktest(strategyId, symbol, candles, params, opts);
   else throw new Error(`Unknown strategy: ${strategyId}`);
 
   // Tag each trade with the market regime at its entry time. Same classifier
@@ -1872,6 +2064,17 @@ export async function runBacktest(strategyId, symbol, opts = {}) {
   }
 
   const metrics = calcMetrics(trades, opts.mode || "stock");
+  if (modelNote) {
+    metrics.model = modelNote;
+    metrics.timeframe = timeframe;
+    const days = new Set(candles.filter(c => !opts.oosStartMs || c.time >= opts.oosStartMs).map(c => etDateKey(c.time))).size;
+    metrics.tradingDays  = days;
+    metrics.tradesPerDay = days ? +(trades.length / days).toFixed(2) : 0;
+    if (trades.length) {
+      metrics.expectancyR  = (trades.reduce((sum, t) => sum + t.pnlR, 0) / trades.length).toFixed(3) + "R";
+      metrics.avgPnlPct    = (trades.reduce((sum, t) => sum + t.pnlPct, 0) / trades.length).toFixed(3) + "%";
+    }
+  }
 
   // Return a candle sample for chart rendering (max 3000 bars)
   const sample = candles.length > 3000 ? candles.slice(-3000) : candles;
@@ -1892,11 +2095,26 @@ if (process.argv.find(a => a.startsWith("--strategy"))) {
                    ? (process.argv.find(a => a.startsWith("--force-daily="))?.split("=")[1] !== "false")
                    : false;
 
-  runBacktest(stratArg, symArg, { mode: modeArg, iv: ivArg, dteDays: dteArg, forceDaily: forceArg }).then(results => {
+  const tfArg     = process.argv.find(a => a.startsWith("--timeframe="))?.split("=")[1];
+  const paramsArg = process.argv.find(a => a.startsWith("--params="))?.slice("--params=".length);
+  const yearArg   = process.argv.includes("--year");
+  const inSample  = process.argv.includes("--include-in-sample");
+
+  runBacktest(stratArg, symArg, {
+    mode: modeArg, iv: ivArg, dteDays: dteArg, forceDaily: forceArg,
+    timeframe: tfArg, yearWindow: yearArg, includeInSample: inSample,
+    params: paramsArg ? JSON.parse(paramsArg) : undefined,
+  }).then(results => {
     const { trades, equityCurve, candles, ...summary } = results;
     console.log("\n══ Backtest Results ══════════════════════════════════\n");
     for (const [k,v] of Object.entries(summary)) {
       if (typeof v !== "object") console.log(`  ${k.padEnd(16)}: ${v}`);
+    }
+    if (summary.model) {
+      const m = summary.model;
+      console.log(`  ${"model".padEnd(16)}: ${m.source}${m.trainedAt ? ` (trained ${m.trainedAt})` : ""}` +
+        (m.outOfSampleOnly ? ` · out-of-sample from ${m.split.test_start_iso}` : ""));
+      if (m.warning) console.log(`  ${"WARNING".padEnd(16)}: ${m.warning}`);
     }
     if (summary.optionsMetrics) {
       console.log("\n── Options P&L ─────────────────────────────────────");

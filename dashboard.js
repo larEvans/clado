@@ -22,6 +22,11 @@ import { meta as gapFillMeta }         from "./strategies/gap-fill.js";
 import { meta as vwapReclaimMeta }     from "./strategies/vwap-reclaim.js";
 import { meta as firstHourFadeMeta }   from "./strategies/first-hour-fade.js";
 import { meta as smcMeta }             from "./strategies/smc.js";
+import { meta as predictorMeta }       from "./strategies/predictor-strat.js";
+import { meta as lateMomentumMeta }    from "./strategies/late-momentum.js";
+import { meta as noiseMomentumMeta }   from "./strategies/noise-momentum.js";
+import { meta as ict2024Meta }         from "./strategies/ict-2024.js";
+import { meta as dipBuyMeta }          from "./strategies/dip-buy.js";
 import { fetchChain, fetchExpiryDates, fetchContracts, getLiveOptionsParams } from "./options.js";
 import { AlpacaStream } from "./stream.js";
 import { loadAllLearning, getAllRegimeStats, saveRegimeParams, getRegimeStats, getOptionsHistoryStats, suggestEarlyExitPct } from "./learner.js";
@@ -31,6 +36,11 @@ import { modelInfo } from "./ml/predictor.js";
 import { checkSignal as smcCheckSignal } from "./strategies/smc.js";
 import { runHermesAnalysis, loadAllInsights, suggestParamChanges, explainTrades, deriveWinOnlyFilters } from "./hermes.js";
 import { dataPath, DATA_DIR } from "./state.js";
+import { loadReplayData, simulate as simulateReplay } from "./replay.js";
+import { screenStrategyFit, mostActives, CORE_UNIVERSE, SCREENER_FILE } from "./strategy-screener.js";
+import { loadRuntimeConfig } from "./runtime-config.js";
+import { SUPPORTED_STRATEGIES } from "./signals.js";
+import { loadSymbols, addSymbol, removeSymbol, normalizeSymbol } from "./symbols.js";
 import { TV_ENABLED, TV_MAX_AGE_SEC, secretMatches, parseTvAlert, appendTvAlert, readTvAlerts, alertAgeSec } from "./tradingview.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -211,7 +221,10 @@ app.patch("/api/config", (req, res) => {
   if (patch.consensusMin !== undefined)           patch.consensusMin = Math.max(1, parseInt(patch.consensusMin) || 1);
   if (patch.maxConcurrentPositions !== undefined) patch.maxConcurrentPositions = Math.max(1, parseInt(patch.maxConcurrentPositions) || 5);
   if (patch.optionsMode !== undefined)            patch.optionsMode = !!patch.optionsMode;
-  if (patch.optionsDte !== undefined)             patch.optionsDte  = Math.max(0, parseInt(patch.optionsDte) || 7);
+  if (patch.optionsDte !== undefined) {            // 0 = same-day expiry (0DTE), so no `|| 7`
+    const dte = parseInt(patch.optionsDte);
+    patch.optionsDte = Number.isFinite(dte) ? Math.max(0, dte) : 7;
+  }
   if (Array.isArray(patch.activeStrategies))      patch.activeStrategies = patch.activeStrategies.map(s => String(s).trim().toLowerCase()).filter(Boolean);
   if (Array.isArray(patch.cryptoSymbols))         patch.cryptoSymbols    = patch.cryptoSymbols.map(s => String(s).trim().toUpperCase()).filter(Boolean);
 
@@ -225,55 +238,26 @@ app.patch("/api/config", (req, res) => {
   res.json({ ok: true, config: next, restartRequired, changed: Object.keys(patch) });
 });
 
-// Add a stock to the user's Alpaca watchlist (first watchlist for now).
-// If the account has no watchlist yet via the /v2/watchlists REST resource
-// (e.g. a list built in Alpaca's newer web UI doesn't always show up here),
-// create one automatically instead of erroring out — the dashboard becomes
-// the reliable source of truth rather than depending on Alpaca's UI quirks.
+// Add / remove a stock in the bot's own symbol list (symbols.json — see
+// symbols.js). No Alpaca watchlist involved; Alpaca is only asked whether the
+// symbol is a real, tradable asset so typos don't reach the stream.
 app.post("/api/watchlist/add", async (req, res) => {
-  const symbol = String(req.body?.symbol || "").trim().toUpperCase();
-  if (!symbol) return res.status(400).json({ error: "symbol required" });
-  if (symbol.includes("/")) return res.status(400).json({ error: "Crypto symbols (with /) belong in the Crypto Symbols section, not the stock watchlist" });
+  const symbol = normalizeSymbol(req.body?.symbol);
+  if (String(req.body?.symbol || "").includes("/")) return res.status(400).json({ error: "Crypto symbols (with /) belong in the Crypto Symbols section, not the stock list" });
+  if (!symbol) return res.status(400).json({ error: "valid stock symbol required" });
   try {
-    const lists = await alpaca("/v2/watchlists");
-    if (!lists?.length) {
-      // No watchlist visible via the Trading API — create one now.
-      const r = await fetch(`${ALPACA_BASE}/v2/watchlists`, {
-        method: "POST",
-        headers: ALPACA_HEADERS,
-        body:    JSON.stringify({ name: "Bot Watchlist", symbols: [symbol] }),
-      });
-      const data = await r.json();
-      if (!r.ok) return res.status(r.status).json({ error: data?.message || JSON.stringify(data) });
-      return res.json({ ok: true, symbol, watchlistId: data.id, created: true, restartRequired: true });
-    }
-    const wlId = lists[0].id;
-    const r = await fetch(`${ALPACA_BASE}/v2/watchlists/${wlId}`, {
-      method: "POST",
-      headers: ALPACA_HEADERS,
-      body:    JSON.stringify({ symbol }),
-    });
-    const data = await r.json();
-    if (!r.ok) return res.status(r.status).json({ error: data?.message || JSON.stringify(data) });
-    res.json({ ok: true, symbol, watchlistId: wlId, restartRequired: true });
+    const asset = await alpaca(`/v2/assets/${encodeURIComponent(symbol)}`).catch(() => null);
+    if (!asset)          return res.status(404).json({ error: `${symbol} is not an Alpaca asset` });
+    if (!asset.tradable) return res.status(400).json({ error: `${symbol} is not tradable on Alpaca` });
+    const { symbols, added } = addSymbol(symbol);
+    res.json({ ok: true, symbol, added, symbols, restartRequired: added });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete("/api/watchlist/:symbol", async (req, res) => {
-  const symbol = String(req.params.symbol || "").trim().toUpperCase();
+app.delete("/api/watchlist/:symbol", (req, res) => {
   try {
-    const lists = await alpaca("/v2/watchlists");
-    if (!lists?.length) return res.status(404).json({ error: "No Alpaca watchlist exists" });
-    const wlId = lists[0].id;
-    const r = await fetch(`${ALPACA_BASE}/v2/watchlists/${wlId}/${symbol}`, {
-      method: "DELETE",
-      headers: ALPACA_HEADERS,
-    });
-    if (!r.ok && r.status !== 422 && r.status !== 404) {
-      const text = await r.text();
-      return res.status(r.status).json({ error: text });
-    }
-    res.json({ ok: true, symbol, restartRequired: true });
+    const { symbols, removed } = removeSymbol(req.params.symbol);
+    res.json({ ok: true, symbol: String(req.params.symbol).toUpperCase(), removed, symbols, restartRequired: removed });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -471,12 +455,13 @@ app.get("/api/strategies", (req, res) => {
     hybridMeta, hybridReversalMeta, hybrid10Meta,
     reversalMeta, vwapMeta, vwapReclaimMeta,
     gapFillMeta, firstHourFadeMeta, smcMeta,
-    orbMeta, trendMeta, meanrevMeta, momentumMeta,
+    orbMeta, trendMeta, meanrevMeta, momentumMeta, predictorMeta,
+    lateMomentumMeta, noiseMomentumMeta, ict2024Meta, dipBuyMeta,
   ];
   if (req.query?.all === "1") return res.json(all);
   // Hybrid family + Reversal + VWAP family + new ≥50% strategies active by default.
   const whitelist = (process.env.ACTIVE_STRATEGIES ||
-    "hybrid,hybrid-reversal,hybrid10,smc,reversal,vwap,vwap-reclaim,gap-fill,first-hour-fade")
+    "hybrid,hybrid-reversal,hybrid10,smc,reversal,vwap,vwap-reclaim,gap-fill,first-hour-fade,predictor")
     .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
   const active = all
     .filter(m => whitelist.includes(m.id))
@@ -736,29 +721,17 @@ function broadcastSSE(obj) {
 
 // ─── Watchlist ────────────────────────────────────────────────────────────────
 
-app.get("/api/watchlist", async (req, res) => {
-  try {
-    const lists = await alpaca("/v2/watchlists");
-    if (!lists?.length) return res.json([]);
-    const detail = await alpaca(`/v2/watchlists/${lists[0].id}`);
-    res.json((detail.assets || []).map(a => a.symbol));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+app.get("/api/watchlist", (req, res) => {
+  res.json(loadSymbols());
 });
 
 // ─── Live price stream (skipped when bot-stream.js owns the connection) ───────
 
 if (!process.env.NO_DASHBOARD_STREAM && process.env.ALPACA_API_KEY && process.env.ALPACA_SECRET_KEY) {
   (async () => {
-    let symbols = [];
-    try {
-      const lists = await alpaca("/v2/watchlists");
-      if (lists?.length) {
-        const detail  = await alpaca(`/v2/watchlists/${lists[0].id}`);
-        const wl      = (detail.assets || []).map(a => a.symbol).filter(Boolean);
-        if (wl.length) { symbols = wl; console.log(`[Stream] Watchlist symbols: ${wl.join(", ")}`); }
-      }
-    } catch (e) { console.warn("[Stream] Watchlist fetch failed —", e.message); }
-    if (symbols.length === 0) { console.warn("[Stream] Alpaca watchlist is empty — no live price stream"); return; }
+    const symbols = loadSymbols();
+    if (symbols.length === 0) { console.warn("[Stream] no stock symbols configured — no live price stream"); return; }
+    console.log(`[Stream] Symbols: ${symbols.join(", ")}`);
 
     const liveStream = new AlpacaStream(symbols);
     liveStream.on("bar",          bar   => broadcastSSE({ type: "bar",   ...bar }));
@@ -881,19 +854,12 @@ app.get("/api/daily-signals", async (req, res) => {
     const meta     = STRATEGY_META[strategy];
     if (!meta) return res.status(400).json({ error: `Unknown strategy: ${strategy}` });
 
-    // Resolve watchlist
+    // Resolve symbols
     let symbols;
     if (req.query?.symbols) {
       symbols = String(req.query.symbols).split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
     } else {
-      try {
-        const lists = await alpaca("/v2/watchlists");
-        if (lists?.length) {
-          const detail = await alpaca(`/v2/watchlists/${lists[0].id}`);
-          symbols = (detail.assets || []).map(a => a.symbol).filter(Boolean);
-        }
-      } catch {}
-      if (!symbols?.length) symbols = [];  // watchlist is the only source — no env fallback
+      symbols = loadSymbols();
     }
 
     const tf = TIMEFRAMES[strategy] || "5m";
@@ -953,14 +919,7 @@ app.post("/api/backtest/year-options", async (req, res) => {
     const ivOverride  = req.body?.iv  != null ? parseFloat(req.body.iv) / 100 : null;
 
     if (!symbols) {
-      try {
-        const lists = await alpaca("/v2/watchlists");
-        if (lists?.length) {
-          const detail = await alpaca(`/v2/watchlists/${lists[0].id}`);
-          symbols = (detail.assets || []).map(a => a.symbol).filter(Boolean);
-        }
-      } catch {}
-      if (!symbols?.length) symbols = [];  // watchlist is the only source — no env fallback
+      symbols = loadSymbols();
     }
 
     console.log(`[YearOptions] ${strategies.length} strategies × ${symbols.length} symbols × 1y of 5m bars in options mode`);
@@ -1150,16 +1109,8 @@ const ACTIVE_FOR_ROUTER = () => (process.env.ACTIVE_STRATEGIES ||
 // Current regime per watchlist symbol + per-strategy×regime stats heatmap.
 app.get("/api/router/state", async (req, res) => {
   try {
-    // Resolve watchlist
-    let symbols;
-    try {
-      const lists = await alpaca("/v2/watchlists");
-      if (lists?.length) {
-        const detail = await alpaca(`/v2/watchlists/${lists[0].id}`);
-        symbols = (detail.assets || []).map(a => a.symbol).filter(Boolean);
-      }
-    } catch {}
-    if (!symbols?.length) symbols = [];  // watchlist is the only source — no env fallback
+    // Resolve symbols
+    const symbols = loadSymbols();
 
     // For each symbol, fetch recent 5m bars (~5 days) and classify regime
     const tf = "5m";
@@ -1206,16 +1157,8 @@ app.get("/api/router/state", async (req, res) => {
 // return × confidence and shows which strategy signals are firing alongside.
 app.get("/api/screener", async (req, res) => {
   try {
-    // Resolve watchlist (same source the router uses)
-    let symbols;
-    try {
-      const lists = await alpaca("/v2/watchlists");
-      if (lists?.length) {
-        const detail = await alpaca(`/v2/watchlists/${lists[0].id}`);
-        symbols = (detail.assets || []).map(a => a.symbol).filter(Boolean);
-      }
-    } catch {}
-    if (!symbols?.length) symbols = [];  // watchlist is the only source — no env fallback
+    // Resolve symbols (same source the router uses)
+    const symbols = loadSymbols();
 
     const interval = req.query.interval || process.env.PREDICTOR_INTERVAL || "5m";
     const rows = await Promise.all(symbols.map(async sym => {
@@ -1323,19 +1266,50 @@ app.get("/api/predictions", (req, res) => {
 // Run every active strategy across the watchlist for the historical window
 // available from Alpaca (~60 days of 5m bars). Saves trades into history so
 // the per-regime stats table populates. Required before going live.
+// Strategy-fit screener (strategy-screener.js). Runs take minutes, so POST
+// starts one in the background and GET reports progress + the last result.
+let strategyScreenerRun = null, strategyScreenerError = null;
+app.get("/api/strategy-screener", (req, res) => {
+  let result = null;
+  try { result = existsSync(SCREENER_FILE) ? JSON.parse(readFileSync(SCREENER_FILE, "utf8")) : null; } catch {}
+  res.json({ running: strategyScreenerRun, lastError: strategyScreenerError, result });
+});
+app.post("/api/strategy-screener/run", async (req, res) => {
+  if (strategyScreenerRun) return res.json({ started: false, running: strategyScreenerRun });
+  strategyScreenerRun = { startedAt: new Date().toISOString() };
+  strategyScreenerError = null;
+  res.json({ started: true });
+  try {
+    const extra = Math.max(0, parseInt(req.body?.mostActives) || 0);
+    const symbols = [...new Set([...CORE_UNIVERSE, ...(extra ? await mostActives(extra) : [])])];
+    await screenStrategyFit({ symbols, log: () => {} });
+  } catch (e) { strategyScreenerError = e.message; console.error("[StrategyScreener]", e.message); }
+  strategyScreenerRun = null;
+});
+
+// Full-system replay (replay.js): the live router over a year of history,
+// with the predictor gate on and off. Takes a minute or two.
+app.post("/api/backtest/replay", async (req, res) => {
+  try {
+    const cfg = loadRuntimeConfig();
+    const strategies = cfg.activeStrategies.filter(x => SUPPORTED_STRATEGIES.includes(x));
+    const data = await loadReplayData({ symbols: loadSymbols(), base: req.body?.base === "5m" ? "5m" : "1m", days: parseInt(req.body?.days) || 365, strategies, log: () => {} });
+    const mode = req.body?.mode === "stock" ? "stock" : req.body?.mode === "options" ? "options" : undefined;
+    const on  = simulateReplay(data, { mode, cfg: { predictorEnabled: true } });
+    const off = simulateReplay(data, { mode, cfg: { predictorEnabled: false }, tradeStartMs: on.tradeStart });
+    res.json({ gateOn: on.summary, gateOff: off.summary, recentTrades: on.trades.slice(-50) });
+  } catch (e) {
+    console.error("[Replay] error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/api/router/backtest-all", async (req, res) => {
   try {
     const strategies = req.body?.strategies || ACTIVE_FOR_ROUTER();
     let symbols      = req.body?.symbols;
     if (!symbols) {
-      try {
-        const lists = await alpaca("/v2/watchlists");
-        if (lists?.length) {
-          const detail = await alpaca(`/v2/watchlists/${lists[0].id}`);
-          symbols = (detail.assets || []).map(a => a.symbol).filter(Boolean);
-        }
-      } catch {}
-      if (!symbols?.length) symbols = [];  // watchlist is the only source — no env fallback
+      symbols = loadSymbols();
     }
 
     console.log(`[Router] bootstrap: ${strategies.length} strategies × ${symbols.length} symbols`);

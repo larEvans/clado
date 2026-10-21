@@ -33,5 +33,11 @@ export const meta = {
     closeRangePct:     25,     // close must be in top/bottom 25% of day's range
     overnightStopMult: 1.5,    // overnight stop = current stop − (ATR × this)
     atrPeriod:         14,
+    // Relative-volume ("Stocks in Play") filter — Zarattini, Barbon & Aziz
+    // (2024): only take the breakout when volume in the opening range is at
+    // least minRelVol × its average over the previous relVolDays sessions.
+    // 0 = off. (Volume here is Alpaca's IEX feed, a slice of the tape.)
+    minRelVol:     0,
+    relVolDays:    14,
   },
 };

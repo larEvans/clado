@@ -25,7 +25,7 @@
  *     { exit: boolean, reason: string }
  */
 
-import { fetchChain, fetchSnapshots }     from "./options.js";
+import { fetchChain, fetchSnapshots, fetchExpiryDates } from "./options.js";
 import { lookupOptionsBucketWinRate }     from "./learner.js";
 
 // ── Claude call ────────────────────────────────────────────────────────────────
@@ -310,15 +310,24 @@ export async function planOptionsTrade(signal, stockPrice, opts = {}) {
     const today = new Date(); today.setHours(0, 0, 0, 0);
     const targetExpiry = new Date(today.getTime() + dte * 86_400_000).toISOString().slice(0, 10);
 
-    const chain = await fetchChain(signal.symbol || opts.underlying, targetExpiry, stockPrice);
+    const underlying = signal.symbol || opts.underlying;
+    let expiry = targetExpiry;
+    let chain = await fetchChain(underlying, expiry, stockPrice);
     if (!chain || (!chain.calls?.length && !chain.puts?.length)) {
-      // Try a different expiry — look at all expiries within ±5 days of target
-      return null;
+      // Nothing listed for that date (e.g. TSLA/MSFT/META expire only
+      // Mon/Wed/Fri, so there is no 0DTE on Tue/Thu): use the nearest
+      // listed expiry after the target instead of skipping the trade.
+      const next = (await fetchExpiryDates(underlying)).find(d => d > targetExpiry);
+      if (!next) return null;
+      console.log(`[OptionsAgent] ${underlying}: no ${targetExpiry} expiry listed — using ${next}`);
+      expiry = next;
+      chain = await fetchChain(underlying, expiry, stockPrice);
+      if (!chain || (!chain.calls?.length && !chain.puts?.length)) return null;
     }
-    const actualDte = Math.max(1, Math.round((new Date(targetExpiry).getTime() - Date.now()) / 86_400_000));
+    const actualDte = Math.max(1, Math.round((new Date(expiry).getTime() - Date.now()) / 86_400_000));
     return await pickContract(signal, stockPrice, {
-      symbol: signal.symbol || opts.underlying,
-      expiry: targetExpiry,
+      symbol: underlying,
+      expiry,
       dte:    actualDte,
       chain,
     }, opts);

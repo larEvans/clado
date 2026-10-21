@@ -128,3 +128,20 @@ test("strict mode allows picks with enough samples", () => {
   });
   assert.equal(res.chosen.strategy, "orb");
 });
+
+test("expectancy scoring: profit per trade beats win rate, and losers are refused", () => {
+  const stats = lookupFrom({
+    grinder: { "range:normal-vol": { winRate: 0.70, sampleSize: 30, avgPnl: 0.01 } },
+    earner:  { "range:normal-vol": { winRate: 0.45, sampleSize: 30, avgPnl: 0.20 } },
+    loser:   { "range:normal-vol": { winRate: 0.60, sampleSize: 30, avgPnl: -0.10 } },
+  });
+  const base = { regime: "range:normal-vol", statsLookup: stats, todayState: noFired };
+  const both = [{ strategy: "grinder", signal: buy }, { strategy: "earner", signal: buy }];
+  assert.equal(chooseSignal({ ...base, candidates: both }).chosen.strategy, "grinder", "win-rate mode (default)");
+  assert.equal(chooseSignal({ ...base, candidates: both, scoreBy: "expectancy" }).chosen.strategy, "earner");
+  const onlyLoser = chooseSignal({ ...base, candidates: [{ strategy: "loser", signal: buy }], scoreBy: "expectancy" });
+  assert.equal(onlyLoser.chosen, null);
+  assert.match(onlyLoser.reason, /negative average P&L/);
+  const unknown = chooseSignal({ ...base, candidates: [{ strategy: "loser", signal: buy }, { strategy: "new", signal: sell }], scoreBy: "expectancy" });
+  assert.equal(unknown.chosen.strategy, "new", "no history (0) outranks a known loser");
+});
